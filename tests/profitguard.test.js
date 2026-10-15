@@ -1,0 +1,118 @@
+// Unit checks for the Profit Guard decision logic (profitguard.js). Run: node tests/profitguard.test.js
+const assert = require('assert');
+const G = require(process.env.RELAY_DIR ? process.env.RELAY_DIR + '/profitguard.js' : '../profitguard.js');
+let n = 0; const ok = m => console.log('  ok', ++n, m);
+const cfg = G.normalize({ mode: 'live' });
+const sw = cfg.swing, fast = cfg.fast;
+const L = (o) => G.decide({ side: 'Buy', entry: 100, initialSl: 90, curSl: 90, mark: 100, peak: 100, tick: 0.01, profile: sw, cfg, ...o });
+const S = (o) => G.decide({ side: 'Sell', entry: 100, initialSl: 110, curSl: 110, mark: 100, peak: 100, tick: 0.01, profile: sw, cfg, ...o });
+
+// defaults and cleaning
+assert.strictEqual(G.defaults().mode, 'off');
+assert.strictEqual(G.normalize(null).mode, 'off'); assert.strictEqual(G.normalize({ mode: 'bogus' }).mode, 'off');
+assert.strictEqual(G.normalize({ mode: 'shadow' }).mode, 'shadow');
+ok('off by default; garbage falls back safely');
+const c2 = G.normalize({ pollSec: 1, minGapPct: 99, swing: { beR: 0, ladder: [[4, 0.5], [2, 0.8], [9, 0.3], ['x', 1], [1, 5]] } });
+assert.strictEqual(c2.pollSec, 5); assert.strictEqual(c2.minGapPct, 0.25); assert.strictEqual(c2.swing.beR, 1);
+assert.deepStrictEqual(c2.swing.ladder, [[2, 0.8], [4, 0.8], [9, 0.8]]);
+ok('limits enforced, ladder sorted, a higher rung never keeps less than a lower one');
+
+// not yet
+assert.strictEqual(L({ peak: 100 }).action, 'none');
+assert.strictEqual(L({ peak: 105, mark: 105 }).action, 'none');          // 0.5R, below the 1R start
+ok('no action before the trade has earned 1R');
+
+// breakeven at 1R
+let d = L({ peak: 110, mark: 110 });
+assert.strictEqual(d.action, 'raise'); assert.strictEqual(d.label, 'breakeven'); assert.strictEqual(d.newSl, 100.1);
+ok('1R reached: stop to breakeven plus a small fee cushion');
+
+// ladder: swing 8R peak +80 -> keep 65% -> 152 ; example from the plan
+d = L({ peak: 180, mark: 178, initialSl: 90 }); // risk 10, peak dist 80 = 8R
+assert.strictEqual(d.action, 'raise'); assert.strictEqual(d.newSl, 152); assert.strictEqual(d.keepFrac, 0.65);
+ok('8R peak: keeps 65% of the best profit');
+d = L({ peak: 130, mark: 129 }); // 3R -> 35% rung (2R) -> 110.5
+assert.strictEqual(d.newSl, 110.5); assert.strictEqual(d.keepFrac, 0.35);
+d = L({ peak: 150, mark: 149 }); // 5R -> 55% rung -> 127.5
+assert.strictEqual(d.newSl, 127.5);
+ok('3R and 5R peaks land on the right rungs');
+
+// never loosens, never repeats
+assert.strictEqual(L({ peak: 150, mark: 149, curSl: 130 }).action, 'none');
+assert.strictEqual(L({ peak: 150, mark: 149, curSl: 127.5 }).action, 'none');
+assert.strictEqual(L({ peak: 150, mark: 149, curSl: 127.45 }).action, 'none');   // gain smaller than the minimum step
+ok('tighten only: a stop that is already as good is left alone');
+
+// held back from the price
+d = L({ peak: 150, mark: 127.6, curSl: 90 });   // target 127.5 but price 127.6: needs the 0.25% gap
+assert.strictEqual(d.action, 'raise'); assert(d.newSl <= 127.6 * (1 - 0.0025) + 1e-9, 'gap'); assert(/held back/.test(d.label));
+ok('the stop is held back from the current price by the minimum gap');
+
+// shorts mirror longs
+d = S({ peak: 20, mark: 22 });                 // peak price 20 = 8R below entry 100 (risk 10)
+assert.strictEqual(d.action, 'raise'); assert.strictEqual(d.newSl, 48); assert.strictEqual(d.keepFrac, 0.65);
+assert.strictEqual(S({ peak: 90, mark: 91, curSl: 100.3 }).action, 'none');          // 1R: BE target 99.9, but cur 100.3 is within the minimum step? 99.9 <= 100.3-1
+d = S({ peak: 90, mark: 91, curSl: 110 }); assert.strictEqual(d.newSl, 99.9);
+ok('shorts work the same way, mirrored');
+
+// bad inputs
+assert.strictEqual(L({ initialSl: 0 }).action, 'none');
+assert.strictEqual(L({ initialSl: 105 }).action, 'none');                    // "original stop" on the profit side
+assert.strictEqual(L({ mark: 0 }).action, 'none');
+ok('no usable original stop or price: does nothing');
+
+// peak tracking
+assert.strictEqual(G.updatePeak(100, 'Buy', 105, 100), 105); assert.strictEqual(G.updatePeak(105, 'Buy', 101, 100), 105);
+assert.strictEqual(G.updatePeak(100, 'Sell', 95, 100), 95); assert.strictEqual(G.updatePeak(95, 'Sell', 99, 100), 95);
+assert.strictEqual(G.updatePeak(0, 'Buy', 0, 100), 100);
+ok('peak only moves in the trade\'s favour');
+
+// clamp: a bot must never undo the guard
+assert.strictEqual(G.clampStop('Buy', 120, 130), 130); assert.strictEqual(G.clampStop('Buy', 135, 130), null);
+assert.strictEqual(G.clampStop('Sell', 80, 70), 70); assert.strictEqual(G.clampStop('Sell', 60, 70), null);
+assert.strictEqual(G.clampStop('Buy', 0, 130), 130); assert.strictEqual(G.clampStop('Buy', '', 130), 130);
+assert.strictEqual(G.clampStop('Buy', 90, 0), null);
+ok('a bot\'s looser stop is held at the guard\'s floor; a tighter one passes; removing the stop is refused');
+
+// swing bot detection
+assert(G.isSwingBot(cfg, 'ym oracle iv')); assert(!G.isSwingBot(cfg, 'YM ORACLE I')); assert(!G.isSwingBot(cfg, ''));
+ok('swing profile is chosen by the bot name');
+// ---- v2.7.0 ----
+// per-profile mode: the overall Off is a master switch
+const em = (o, p) => G.effMode(G.normalize(o), p);
+assert.strictEqual(em({ mode: 'off', swing: { mode: 'live' } }, 'swing'), 'off');
+assert.strictEqual(em({ mode: 'live' }, 'fast'), 'live'); assert.strictEqual(em({ mode: 'live', fast: { mode: 'shadow' } }, 'fast'), 'shadow');
+assert.strictEqual(em({ mode: 'shadow', swing: { mode: 'live' } }, 'swing'), 'live'); assert.strictEqual(em({ mode: 'shadow', swing: { mode: 'live' } }, 'fast'), 'shadow');
+assert.strictEqual(G.normalize({ mode: 'live', fast: { mode: 'weird' } }).fast.mode, 'inherit');
+ok('modes: overall Off is a master; a profile follows it or has its own; garbage falls back to follow');
+
+// scale-out settings and maths
+assert.strictEqual(G.defaults().swing.scale.on, false);
+assert.deepStrictEqual(G.normalize({ swing: { scale: { on: true, steps: [[3, 0.25], [6, 0.25]] } } }).swing.scale, { on: true, steps: [[3, 0.25], [6, 0.25]] });
+assert.deepStrictEqual(G.normalize({ swing: { scale: { on: true, steps: [[3, 0.5], [6, 0.5]] } } }).swing.scale.steps, [[3, 0.25]], 'more than 70% off in total falls back: a runner always stays');
+assert.deepStrictEqual(G.normalize({ swing: { scale: { steps: [[3, 0.9], [0.1, 0.2]] } } }).swing.scale.steps, []);
+assert.strictEqual(G.scaleDue([[2, 0.25], [4, 0.25]], 1.9, []), -1); assert.strictEqual(G.scaleDue([[2, 0.25], [4, 0.25]], 2.5, []), 0);
+assert.strictEqual(G.scaleDue([[2, 0.25], [4, 0.25]], 5, [0]), 1); assert.strictEqual(G.scaleDue([[2, 0.25]], 9, [0]), -1);
+assert.strictEqual(G.sliceQty(0.1, 0.25, 0.01, 0.01), 0.02); assert.strictEqual(G.sliceQty(0.02, 0.25, 0.01, 0.01), null);
+assert.strictEqual(G.sliceQty(0.03, 0.5, 0.01, 0.01), 0.01); assert.strictEqual(G.sliceQty(0.02, 1, 0.01, 0.01), null, 'must leave something tradable behind');
+assert.strictEqual(G.sliceQty(1.5, 0.3, 0.1, 0.1), 0.4); assert.strictEqual(G.sliceQty(0, 0.3, 0.1, 0.1), null);
+ok('scale-out: off by default, never more than 70% in total, each step once, quantity rounded down and only if both the slice and the runner stay tradable');
+
+// re-entry recorder
+const rc = G.defaults().reentry, T0 = 1_000_000;
+const W = () => ({ side: 'Buy', exit: 150, peak: 200, risk: 10, extreme: 150, cand: null, expiresAt: T0 + 3600000 });
+let w = W(), r = G.reentryStep(w, 140, T0, rc); assert(!r.events.length && !r.finished);
+r = G.reentryStep(w, 150, T0, rc); assert(!r.events.length, 'a pullback is not a resumption');
+r = G.reentryStep(w, 180, T0, rc); assert.strictEqual(r.events[0].type, 'would_reenter'); assert.strictEqual(r.events[0].stop, 140);
+r = G.reentryStep(w, 220, T0, rc); assert(!r.finished && !r.events.length);            // 1R so far (risk = 180-140)
+r = G.reentryStep(w, 260, T0, rc); assert.strictEqual(r.events[0].r, 2); assert(r.finished);
+w = W(); G.reentryStep(w, 140, T0, rc); G.reentryStep(w, 180, T0, rc);
+r = G.reentryStep(w, 139, T0, rc); assert.strictEqual(r.events[0].r, -1); assert(r.finished);
+w = W(); G.reentryStep(w, 140, T0, rc); G.reentryStep(w, 180, T0, rc);
+r = G.reentryStep(w, 190, T0 + 7200000, rc); assert.strictEqual(r.events[0].type, 'reentry_result'); assert.strictEqual(r.events[0].why, 'window ended'); assert(r.finished);
+w = W(); r = G.reentryStep(w, 145, T0 + 7200000, rc); assert.strictEqual(r.events[0].type, 'no_reentry'); assert(r.finished);
+w = { ...W(), exit: 198, extreme: 198 }; r = G.reentryStep(w, 199, T0, rc); assert(!r.events.length, 'a pullback smaller than the minimum is ignored');
+const ws = { side: 'Sell', exit: 50, peak: 0, risk: 10, extreme: 50, cand: null, expiresAt: T0 + 1e6 };   // a short that fell from 100 to 0, bounced then resumes down
+G.reentryStep(ws, 60, T0, rc); r = G.reentryStep(ws, 30, T0, rc); assert.strictEqual(r.events[0].type, 'would_reenter'); assert.strictEqual(r.events[0].stop, 60);
+ok('re-entry recorder: needs a real pullback, fires on the resume, ends on +target / stop / window, works for shorts');
+console.log('PASS ' + n);
