@@ -1284,7 +1284,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 125, ETHUSDT: 2000 };
     for (const kk of Object.keys(state.positions)) delete state.positions[kk];
     mu._test.pgState.clear(); mode = 'live'; halted = false; await call('/api/admin/profit-guard', 'POST', { mode: 'off' }, admin);   // a failed earlier run may have left it on
-    await db.query(`INSERT INTO signals(k,bot,symbol,side,entry,sl) VALUES('pgsig','YM ORACLE IV','BTCUSDT','Buy',100,90) ON CONFLICT (k) DO NOTHING`);
+    await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','swing',100,90) ON CONFLICT (k) DO NOTHING`);
     const P = (mark, sl) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl) }; };
     const G = () => call('/api/admin/profit-guard', 'GET', null, admin);
     const masterStops = () => state.stops.filter(x => x.k === 'ADMINK');
@@ -1343,7 +1343,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     {
       mu._test.pgState.clear(); mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 125, ETHUSDT: 2000 };
       await db.query('TRUNCATE profit_guard_log, pg_trades');
-      await db.query(`INSERT INTO signals(k,bot,symbol,side,entry,sl) VALUES('pgsig2','YM ORACLE I','ETHUSDT','Buy',100,90) ON CONFLICT (k) DO NOTHING`);
+      await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig2','YM ORACLE IV','ETHUSDT','BUY','fast',100,90) ON CONFLICT (k) DO NOTHING`);
       const PB = (mark, sl, size) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: String(size || 0.1), avgPrice: '100', markPrice: String(mark), stopLoss: String(sl) }; };
       const PE = (mark, sl) => { state.positions['ADMINK:ETHUSDT'] = { side: 'Buy', size: '1', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl) }; };
       const P2 = () => call('/api/admin/profit-guard', 'POST', {}, admin);
@@ -1407,6 +1407,16 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
       assert.strictEqual((await mu.guardFitClose({ symbol: 'BTCUSDT', side: 'Buy', qty: '0.1' })).qty, '0.1', 'opens are never touched');
       ok('profit guard scale-out: shadow records, live closes a slice on the master and the same share on each copy, once per step, and a later full close is fitted to what is left');
 
+      // no bot is special: the profile follows the trade's own engine tag
+      await call('/api/admin/profit-guard', 'POST', { mode: 'shadow', fast: { mode: 'inherit' }, swing: { mode: 'inherit', scale: { on: false } } }, admin);
+      await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig3','YM ORACLE IV','SOLUSDT','BUY','fast',100,90),('pgsig4','YM ORACLE II','XRPUSDT','SELL','swing',100,110) ON CONFLICT (k) DO NOTHING`);
+      mu._test.pgState.clear();
+      state.positions['ADMINK:SOLUSDT'] = { side: 'Buy', size: '1', avgPrice: '100', markPrice: '101', stopLoss: '90' };
+      state.positions['ADMINK:XRPUSDT'] = { side: 'Sell', size: '1', avgPrice: '100', markPrice: '99', stopLoss: '110' };
+      await mu._test.pgTick();
+      assert.strictEqual(mu._test.pgState.get('SOLUSDT|Buy').profile, 'fast', 'Oracle IV\'s own fast trade follows the fast profile');
+      assert.strictEqual(mu._test.pgState.get('XRPUSDT|Sell').profile, 'swing', 'a swing trade from Oracle II follows the swing profile');
+      ok('profit guard: the profile comes from the trade\'s engine tag, not from which bot sent it');
       await call('/api/admin/profit-guard', 'POST', { mode: 'off' }, admin);
       for (const kk of Object.keys(state.positions)) delete state.positions[kk]; mu._test.pgState.clear(); mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.tickers = {}; state.closedPnl.ADMINK = [];
       await db.query(`DELETE FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch')`);

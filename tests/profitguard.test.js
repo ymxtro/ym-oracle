@@ -75,8 +75,12 @@ assert.strictEqual(G.clampStop('Buy', 90, 0), null);
 ok('a bot\'s looser stop is held at the guard\'s floor; a tighter one passes; removing the stop is refused');
 
 // swing bot detection
-assert(G.isSwingBot(cfg, 'ym oracle iv')); assert(!G.isSwingBot(cfg, 'YM ORACLE I')); assert(!G.isSwingBot(cfg, ''));
-ok('swing profile is chosen by the bot name');
+assert.deepStrictEqual(cfg.swingBots, [], 'no bot is special by default');
+assert.strictEqual(G.profileOf(cfg, 'swing', 'YM ORACLE I'), 'swing'); assert.strictEqual(G.profileOf(cfg, 'fast', 'YM ORACLE IV'), 'fast');
+assert.strictEqual(G.profileOf(cfg, null, 'YM ORACLE IV'), 'fast'); assert.strictEqual(G.profileOf(cfg, undefined, ''), 'fast');
+assert.strictEqual(G.profileOf(G.normalize({ swingBots: ['ym oracle iii'] }), null, 'YM ORACLE III'), 'swing', 'the optional name list only matters when a signal has no engine tag');
+assert.strictEqual(G.profileOf(G.normalize({ swingBots: ['ym oracle iii'] }), 'fast', 'YM ORACLE III'), 'fast');
+ok('the profile comes from the trade\'s own engine tag (fast or swing), whichever bot sent it; no bot is special');
 // ---- v2.7.0 ----
 // per-profile mode: the overall Off is a master switch
 const em = (o, p) => G.effMode(G.normalize(o), p);
