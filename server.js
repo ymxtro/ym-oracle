@@ -115,7 +115,10 @@ const fleetStatus = {}; // { "YM ORACLE I": epochMs, ... }
 const fleetInfo = {}; // { "YM ORACLE I": { uptimeMin, resetReason, freeHeap, build } }
 const HEARTBEAT_INTERVAL_SEC = 180;
 const HEARTBEAT_LATE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 1.5;      // 270s
-const HEARTBEAT_OFFLINE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 2.5;   // 450s
+// 4 beats (720s), was 2.5 (450s). The manager forwards each bot's alive-signal over a home Wi-Fi link to here; losing two in a row there is routine
+// (a measured 3-hour run lost about a third of them), so 2.5 beats raised a false "gone offline" every half hour or so. Override: HEARTBEAT_OFFLINE_FACTOR.
+const HEARTBEAT_OFFLINE_FACTOR = Math.min(10, Math.max(2.5, Number(process.env.HEARTBEAT_OFFLINE_FACTOR) || 4));
+const HEARTBEAT_OFFLINE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * HEARTBEAT_OFFLINE_FACTOR;   // 720s by default
 const HEARTBEAT_OFFLINE_THRESHOLD_MS = HEARTBEAT_OFFLINE_AFTER_SEC * 1000;
 // REAL BUG FOUND, and it is the actual root cause of offline alerts never firing: there is ALSO a constant
 // literally named ACTIVE_BOT_NAMES down inside public/dashboard.html -- but that one is CLIENT-SIDE
