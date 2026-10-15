@@ -263,12 +263,12 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
     ok('authenticator on: the password alone is refused for status/halt/master key, the console session works, the manager still reads balance and positions'); s5.kill(); }
 
   // 11c. THE WHOLE PIPELINE: bot -> Render -> Telegram, with the manager's order arriving at the real server and a fake Bybit/Telegram
-  { const P6 = P1 + 1900; const tg = []; let tgFail = 0;
-    const tgSrv = http.createServer((rq, rs) => { let d = ''; rq.on('data', c => d += c); rq.on('end', () => { if (tgFail > 0) { tgFail--; rs.statusCode = 500; return rs.end('{"ok":false}'); } try { tg.push(JSON.parse(d).text); } catch { tg.push('?'); } rs.setHeader('Content-Type', 'application/json'); rs.end('{"ok":true}'); }); });
+  { const P6 = P1 + 1900; const tg = [], tgc = []; let tgFail = 0;
+    const tgSrv = http.createServer((rq, rs) => { let d = ''; rq.on('data', c => d += c); rq.on('end', () => { if (tgFail > 0) { tgFail--; rs.statusCode = 500; return rs.end('{"ok":false}'); } try { const j = JSON.parse(d); tg.push(j.text); tgc.push({ chat: String(j.chat_id), text: j.text }); } catch { tg.push('?'); } rs.setHeader('Content-Type', 'application/json'); rs.end('{"ok":true}'); }); });
     await new Promise(r => tgSrv.listen(0, r));
-    const s6 = boot(P6, { ...dbEnv, DEVICE_API_KEY: 'devkey-123', DEVICE_KEY_MODE: 'enforce', ALERT_TELEGRAM_BOT_TOKEN: 'T0KEN', ALERT_TELEGRAM_CHAT_ID: '42',
+    const s6 = boot(P6, { ...dbEnv, DEVICE_API_KEY: 'devkey-123', DEVICE_KEY_MODE: 'enforce', ALERT_TELEGRAM_BOT_TOKEN: 'T0KEN', ALERT_TELEGRAM_CHAT_ID: '42', ALERT_TELEGRAM_PRIVATE_CHAT_ID: '777',
       YM_TEST_ALERT_URL: 'http://127.0.0.1:' + tgSrv.address().port, YM_TEST_TIMERS: '1', ALERT_SWEEP_MS: '500', SIGNAL_ALARM_SECONDS: '3', TRADE_ALERT_HOLD_S: '2' });
-    await db.query('TRUNCATE signals, bot_msgs'); await waitUp(P6); const E = mk(P6); await sleep(1200);
+    await db.query('TRUNCATE signals, bot_msgs'); await db.query(`DELETE FROM meta WHERE k='alert_routes'`); await waitUp(P6); const E = mk(P6); await sleep(1200);
     const DK = { 'X-Device-Key': 'devkey-123' };
     const ev = (o) => E.post('/api/bot-event', { v: 1, bot: 'YM ORACLE 1', ...o }, DK);
     const waitFor = async (fn, ms) => { for (let i = 0; i < ms / 100; i++) { if (fn()) return true; await sleep(100); } return false; };
@@ -318,6 +318,49 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
     tg.length = 0; const ta = await ev({ ev: 'test' }); assert.strictEqual(ta.s, 200); assert(await waitFor(() => has(/Test alert/).length >= 1, 3000));
     assert.strictEqual((await ev({ ev: 'test' })).s, 429, 'test button is rate limited');
     ok('pipeline: the bot test button reaches Telegram and is rate-limited');
+    // (f) routing: the group gets signals and updates, your DM gets zones and warnings; Dev mode keeps the group silent; Off silences all but warnings; Live restores
+    const lg = await E.post('/api/admin/login', { password: 'dash-pass' }); assert(lg.j.success && lg.j.token, JSON.stringify(lg.j));
+    const AD = { Authorization: 'Bearer ' + lg.j.token };
+    const chatOf = re => { const x = tgc.find(t => re.test(t.text)); return x ? x.chat : null; };
+    tg.length = 0; tgc.length = 0;
+    await ev({ ev: 'msg', k: 'm-f1', kind: 'mgmt', sym: 'LTCUSDT', text: 'ROUTE-UPDATE-1' });
+    await ev({ ev: 'msg', k: 'm-f2', kind: 'zone', sym: 'LTCUSDT', priv: true, text: 'ROUTE-ZONE-1' });
+    assert(await waitFor(() => has(/ROUTE-UPDATE-1/).length && has(/ROUTE-ZONE-1/).length, 5000), 'both delivered: ' + JSON.stringify(tgc));
+    assert.strictEqual(chatOf(/ROUTE-UPDATE-1/), '42', 'a trade update goes to the group'); assert.strictEqual(chatOf(/ROUTE-ZONE-1/), '777', 'a zone alert goes to your DM');
+    assert.strictEqual((await E.get('/api/admin/alert-routes')).s, 401, 'the routing panel needs the console sign-in');
+    const cur = await E.get('/api/admin/alert-routes', AD); assert(cur.j.success && cur.j.mode === 'live' && cur.j.groupSet && cur.j.dmSet && cur.j.cats.length === 6, JSON.stringify(cur.j));
+    assert.strictEqual((await E.post('/api/admin/alert-routes', { mode: 'banana' }, AD)).s, 400); assert.strictEqual((await E.post('/api/admin/alert-routes', { routes: { signals: 'moon' } }, AD)).s, 400);
+    assert.strictEqual((await E.post('/api/admin/alert-routes', { dmChat: 'not a chat' }, AD)).s, 400);
+    // dev mode
+    tg.length = 0; tgc.length = 0;
+    const dv = await E.post('/api/admin/alert-routes', { mode: 'dev', hours: 1 }, AD); assert(dv.j.success && dv.j.mode === 'dev' && dv.j.until > Date.now(), JSON.stringify(dv.j));
+    await ev({ ev: 'msg', k: 'm-f3', kind: 'entry', sym: 'LTCUSDT', text: 'DEV-ENTRY-1' });
+    assert(await waitFor(() => has(/DEV-ENTRY-1/).length, 5000)); assert.strictEqual(chatOf(/DEV-ENTRY-1/), '777', 'in dev mode the group-bound alert lands in your DM'); assert(/DEV/.test(tg.find(t => /DEV-ENTRY-1/.test(t))), 'and is tagged');
+    assert.strictEqual(tgc.filter(t => t.chat === '42').length, 0, 'nothing reached the group in dev mode');
+    const gt = await E.post('/api/admin/test-alert', { target: 'group' }, AD); assert(gt.j.success, JSON.stringify(gt.j)); assert(tgc.some(t => t.chat === '42' && /GROUP/.test(t.text)), 'the explicit group test still reaches the group');
+    ok('routing: updates go to the group, zones to your DM; Dev mode keeps the group silent (tagged copies to your DM); the group test button still works');
+    // off mode: signals silent and NOT replayed later; warnings still reach the DM
+    tg.length = 0; tgc.length = 0;
+    await E.post('/api/admin/alert-routes', { mode: 'off' }, AD);
+    await ev({ ev: 'msg', k: 'm-f4', kind: 'entry', sym: 'LTCUSDT', text: 'OFF-ENTRY-1' });
+    await ev({ ev: 'open', k: 'k-f5', sym: 'DOTUSDT', side: 'BUY', eng: 'fast', entry: 5, sl: 4, tp: 6, lev: 5, m: 20, relay: 'SENT', rid: 'RIDF5', t: 9 });
+    assert(await waitFor(() => has(/🚨/).length >= 1, 9000), 'a lost-order warning still reaches you while Telegram is off: ' + JSON.stringify(tgc));
+    assert.strictEqual(chatOf(/🚨/), '777', 'the warning goes to the DM'); assert.strictEqual(has(/OFF-ENTRY-1/).length, 0, 'the signal stayed silent');
+    const mrow = (await db.query(`SELECT sent_at, last_result FROM bot_msgs WHERE k='m-f4'`)).rows[0]; assert(mrow.sent_at && /muted/.test(mrow.last_result), 'recorded as muted, not pending: ' + JSON.stringify(mrow));
+    // back to live: the muted message is NOT sent later
+    tg.length = 0; tgc.length = 0;
+    const lv = await E.post('/api/admin/alert-routes', { mode: 'live' }, AD); assert(lv.j.mode === 'live' && lv.j.until === 0);
+    await sleep(2500); assert.strictEqual(has(/OFF-ENTRY-1/).length, 0, 'muted alerts are not replayed when you switch back');
+    await ev({ ev: 'msg', k: 'm-f6', kind: 'entry', sym: 'LTCUSDT', text: 'LIVE-ENTRY-1' }); assert(await waitFor(() => has(/LIVE-ENTRY-1/).length, 5000)); assert.strictEqual(chatOf(/LIVE-ENTRY-1/), '42');
+    assert.strictEqual((await db.query(`SELECT v FROM meta WHERE k='alert_routes'`)).rowCount, 1, 'the setting is saved in the database');
+    ok('routing: Off silences everything but warnings (which still reach your DM), muted alerts are never replayed later, Live puts signals back in the group, settings are saved');
+    // custom per-category routing
+    await E.post('/api/admin/alert-routes', { routes: { updates: 'dm', signals: 'both' } }, AD); tg.length = 0; tgc.length = 0;
+    await ev({ ev: 'msg', k: 'm-f7', kind: 'mgmt', sym: 'LTCUSDT', text: 'CUSTOM-UPD' }); await ev({ ev: 'msg', k: 'm-f8', kind: 'result', sym: 'LTCUSDT', text: 'CUSTOM-SIG' });
+    assert(await waitFor(() => tgc.filter(t => /CUSTOM/.test(t.text)).length >= 3, 6000), JSON.stringify(tgc));
+    assert.deepStrictEqual(tgc.filter(t => /CUSTOM-UPD/.test(t.text)).map(t => t.chat), ['777']); assert.deepStrictEqual(tgc.filter(t => /CUSTOM-SIG/.test(t.text)).map(t => t.chat).sort(), ['42', '777']);
+    await E.post('/api/admin/alert-routes', { routes: { updates: 'group', signals: 'group' } }, AD);
+    ok('routing: per-category choices are honoured (updates to DM only, signals to both)');
     s6.kill(); tgSrv.close(); }
 
   // 11b. master sizing end to end (MASTER_FOLLOWS_PLAN): the order that reaches Bybit carries the plan's quantity, closes are untouched

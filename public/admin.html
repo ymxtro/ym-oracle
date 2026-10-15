@@ -225,7 +225,7 @@ function jq(path){return j(path).catch(function(){return null})}   // a card tha
 /* ---------- state ---------- */
 var TABS=['overview','trading','bots','users','plan','activity','payments','settings'];
 var TITLES={overview:'Overview',trading:'Trading',bots:'Bots & alerts',users:'Users',plan:'Plan & risk',activity:'Activity',payments:'Payments',settings:'Settings'};
-var S={tab:'overview',tr:null,ping:null,mk:{info:null,open:false,env:'live',key:'',sec:'',msg:null,busy:false,confirm:false,arm:false},liveAsk:false,liveTxt:'',users:[],pausedAll:false,dryAll:false,planVersion:null,plan:null,ov:null,period:30,series:null,bots:null,signals:null,sec:null,
+var S={ar:null,arHours:4,tab:'overview',tr:null,ping:null,mk:{info:null,open:false,env:'live',key:'',sec:'',msg:null,busy:false,confirm:false,arm:false},liveAsk:false,liveTxt:'',users:[],pausedAll:false,dryAll:false,planVersion:null,plan:null,ov:null,period:30,series:null,bots:null,signals:null,sec:null,
   filter:'all',q:'',ofilter:'all',ouser:'',orders:null,audit:null,openId:null,planDraft:null,planPreview:null,planCounts:null,hist:null,drySummary:null,hash:'',timer:null,drawerMsg:''};
 var HOLD={};
 
@@ -272,6 +272,7 @@ function loadTab(){
   if(t==='bots'){
     jobs.push(jq('/api/admin/bots').then(function(r){S.bots=r&&r.success?r.bots:null}));
     jobs.push(jq('/api/admin/alerts').then(function(r){S.alerts=r&&r.success?r:S.alerts}));
+    jobs.push(jq('/api/admin/alert-routes').then(function(r){S.ar=r&&r.success?r:S.ar}));
     jobs.push(jq('/api/admin/signal-ledger?hours=24&limit=1').then(function(r){S.ledger=r&&r.success?r:S.ledger}));
   }
   if(t==='settings'){
@@ -674,6 +675,34 @@ function pingFleet(){
     },1000);
   }).catch(function(){S.ping=null;render()});
 }
+/* ---------- Telegram alert control ---------- */
+function arPost(body,msg){return j('/api/admin/alert-routes','POST',body).then(function(r){if(r.success){S.ar=r;toast(msg||'Saved');render()}else toast(r.message||'Could not save');return r}).catch(function(){toast('Could not reach the server')})}
+function alertCard(){
+  var A=S.ar,h='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0 0 4px">Telegram alert control</h2>';
+  if(!A)return h+'</div><p class="mist small">Loading…</p><div class="btns"><button class="btn pri" data-act="testAlert">Send test alert</button></div></div>';
+  var until=A.until?' · until '+clock(A.until):'';
+  h+=(A.mode==='live'?'<span class="chip long">LIVE</span>':A.mode==='dev'?'<span class="chip warn">DEV · group silent'+until+'</span>':'<span class="chip short">OFF'+until+'</span>')+'</div>';
+  h+='<p class="mist small" style="margin:0 0 10px">'+(A.mode==='live'?'Alerts go where the table below says. Switch to Dev while you are working so the public group stays quiet.'
+    :A.mode==='dev'?'Dev mode: nothing reaches the group. Everything meant for the group arrives in your DM instead, tagged DEV. The table below is paused until this ends.'
+    :'Telegram is silent'+(A.keepOps?' (warnings such as a lost trade or a bot offline still reach your DM)':' (including warnings)')+'. The table below is paused until this ends.')+'</p>';
+  h+='<div class="seg" role="group" aria-label="Alert mode">'+[['live','Live'],['dev','Dev (DM only)'],['off','Off']].map(function(m){return '<button data-act="arMode" data-v="'+m[0]+'" aria-pressed="'+(A.mode===m[0])+'">'+m[1]+'</button>'}).join('')+'</div>';
+  h+='<div style="margin-top:8px"><span class="mist small">When you pick Dev or Off, keep it for </span><div class="seg" role="group" aria-label="Timer" style="margin-top:4px">'+[[1,'1 hour'],[4,'4 hours'],[12,'12 hours'],[0,'Until I change it']].map(function(m){return '<button data-act="arHours" data-v="'+m[0]+'" aria-pressed="'+(Number(S.arHours)===m[0])+'">'+m[1]+'</button>'}).join('')+'</div></div>';
+  if(A.mode==='off')h+='<div style="margin-top:8px"><label class="small"><input type="checkbox" data-arkeep'+(A.keepOps?' checked':'')+'> Still send warnings (lost trade, bot offline) to my DM</label></div>';
+  h+='<h3 style="margin:16px 0 4px;font-size:13px">Where each alert goes</h3>';
+  var dests=[['group','Group'],['dm','My DM'],['both','Both'],['off','Off']];
+  h+=A.cats.map(function(c){return '<div class="line"><span style="min-width:0"><b>'+esc(c.label)+'</b><br><span class="hint2">'+esc(c.hint)+'</span></span><select data-arcat="'+c.id+'" style="width:auto;min-width:96px" aria-label="'+esc(c.label)+'">'+dests.map(function(d){return '<option value="'+d[0]+'"'+(A.routes[c.id]===d[0]?' selected':'')+'>'+d[1]+'</option>'}).join('')+'</select></div>'}).join('');
+  h+='<h3 style="margin:16px 0 4px;font-size:13px">Chats</h3>'
+    +'<label class="l" for="ar-group">Group chat id'+(A.groupSet?' <span class="chip long">set'+(A.groupFromEnv?' on Render':'')+'</span>':' <span class="chip warn">not set</span>')+'</label><input type="text" id="ar-group" autocomplete="off" spellcheck="false" value="'+esc(A.groupChat||'')+'" placeholder="'+(A.groupFromEnv?'Using the Render setting (type to override)':'e.g. -1001234567890')+'">'
+    +'<label class="l" for="ar-dm">My DM chat id'+(A.dmSet?' <span class="chip long">set'+(A.dmFromEnv?' on Render':'')+'</span>':' <span class="chip warn">not set</span>')+'</label><input type="text" id="ar-dm" autocomplete="off" spellcheck="false" value="'+esc(A.dmChat||'')+'" placeholder="'+(A.dmFromEnv?'Using the Render setting (type to override)':'e.g. 123456789')+'">'
+    +'<div class="btns" style="margin-top:8px"><button class="btn" data-act="arChats">Save chat ids</button></div>'
+    +'<p class="mist small" style="margin-top:6px">To find a chat id: add your alert bot to the chat, send a message there, then open <code>api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code> and read <code>chat → id</code>. Groups usually start with -100. For your DM, message the bot first.</p>';
+  if(!A.tokenSet)h+='<div class="box red" style="margin-top:8px">No Telegram bot token on Render (ALERT_TELEGRAM_BOT_TOKEN), so nothing can be sent yet.</div>';
+  else if(!A.dmSet)h+='<div class="box" style="margin-top:8px">No DM chat id yet: private alerts use the main chat until you add one, and Dev mode needs it.</div>';
+  if(A.tradeAlerts===false)h+='<div class="box red" style="margin-top:8px">TRADE_ALERTS=off is set on Render, which silences the trade alerts completely.</div>';
+  h+='<div class="btns" style="margin-top:12px"><button class="btn pri" data-act="testAlert" data-to="group">Test the group</button><button class="btn pri" data-act="testAlert" data-to="dm">Test my DM</button><button class="btn" data-act="testAlert">Test as routed</button></div>'
+    +'<p class="mist small" style="margin-top:8px">The group and DM tests always go to that chat. "Test as routed" follows the mode and table above. Setup notes: ALERTS-FROM-RENDER.md in the package.</p></div>';
+  return h;
+}
 function viewBots(){
   var h='<div class="g2"><div class="stack">';
   h+=S.bots?botsCard():'<div class="card"><p class="mist" style="padding:6px 0">Loading…</p></div>';
@@ -684,10 +713,7 @@ function viewBots(){
     else if(r.timeout){txt='Timeout';c='short'}else{txt=r.ms+' ms';c='long'}
     return '<div class="line"><span>'+esc(n.replace('YM ORACLE ','Oracle '))+'</span><span class="'+c+'">'+txt+'</span></div>'}).join('');
   h+='</div></div><div class="stack">';
-  h+='<div class="card"><h2 style="margin:0 0 4px">Trade alerts</h2>'
-    +'<p class="mist small" style="margin:0 0 8px">Render sends one Telegram message (and an email, if set up) when a bot opens a trade and one when it closes. It also warns you if a bot goes offline or a trade never reaches the relay.</p>'
-    +'<div class="btns"><button class="btn pri" data-act="testAlert">Send test alert</button></div>'
-    +'<p class="mist small" style="margin-top:8px">Setup and how to switch the bots\' own alerts off: ALERTS-FROM-RENDER.md in the package.</p></div>';
+  h+=alertCard();
   if(S.alerts){var A=S.alerts;h+='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><h2 style="margin:0 0 4px">Recent alerts from the bots</h2>'+(A.undelivered?'<span class="chip warn">'+A.undelivered+' not delivered yet</span>':'<span class="chip long">All delivered</span>')+'</div>'
     +(A.alerts.length?A.alerts.map(function(a){return '<div class="row3"><div style="min-width:0"><span class="mist small">'+esc(String(a.bot).replace('YM ORACLE ','Oracle '))+' · '+esc(a.kind)+'</span><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(a.text)+'</div></div><div class="r"><span class="tag '+(a.sent?'ok':a.tries>=8?'bad':'dry')+'">'+(a.sent?'Delivered':a.tries>=8?'Gave up':'Retrying')+'</span><div class="hint2">'+ago(a.at)+'</div></div></div>'}).join(''):'<p class="mist" style="padding:10px 0">Nothing yet. Alerts the bots compose (zones, trade management, daily summary) show here once the bots are on the new firmware.</p>')+'</div>';}
   if(S.ledger&&S.ledger.bots&&S.ledger.bots.length)h+='<div class="card"><h2 style="margin:0 0 4px">Last report from each bot</h2>'+S.ledger.bots.map(function(b){return '<div class="line"><span>'+esc(String(b.bot).replace('YM ORACLE ','Oracle '))+(b.build?' <span class="mist small">'+esc(b.build)+'</span>':'')+'</span><span class="mist">'+ago(b.at)+'</span></div>'}).join('')+'</div>';
@@ -806,7 +832,10 @@ document.addEventListener('click',function(e){
   if(a==='resetPlan'){S.planDraft=draftFrom(S.planCounts.plan);S.planPreview=null;S.planDirty=false;S.planEditing=false;render();return}
   if(a==='sync'){t.textContent='Syncing…';j('/api/admin/sync-now','POST').then(function(){t.textContent='Sync PnL';toast('PnL synced');refreshAll(true)});return}
   if(a==='csv'){exportCsv();return}
-  if(a==='testAlert'){t.textContent='Sending…';j('/api/admin/test-alert','POST').then(function(r){t.textContent='Send test alert';toast(!r.configured?'No alert channel is set up on Render yet (Telegram token and chat id)':r.success?'Test alert sent'+(r.telegram==='sent'?' to Telegram':'')+(r.email==='sent'?' and email':''):'Sending failed: Telegram '+r.telegram+(r.email!=='off'?', email '+r.email:''))}).catch(function(){t.textContent='Send test alert';toast('Could not reach the server')});return}
+  if(a==='testAlert'){var to=t.getAttribute('data-to')||'',lab=t.textContent;t.textContent='Sending…';j('/api/admin/test-alert','POST',to?{target:to}:{}).then(function(r){t.textContent=lab;toast(!r.configured?'No alert channel is set up on Render yet (Telegram token and chat id)':r.muted?'Muted by your alert settings ('+(r.reason||'see the panel')+'): nothing was sent':r.success?'Test sent'+(to==='group'?' to the group':to==='dm'?' to your DM':'')+(r.telegram&&r.telegram.indexOf('sent')===0?'':'')+(r.email==='sent'?' and email':''):'Sending failed: Telegram '+r.telegram+(r.email!=='off'?', email '+r.email:''))}).catch(function(){t.textContent=lab;toast('Could not reach the server')});return}
+  if(a==='arMode'){var m=t.getAttribute('data-v');arPost({mode:m,hours:m==='live'?0:Number(S.arHours)},m==='live'?'Live: alerts go where the table says':m==='dev'?'Dev mode: the group is silent':'Telegram is off');return}
+  if(a==='arHours'){S.arHours=Number(t.getAttribute('data-v'));if(S.ar&&S.ar.mode!=='live')arPost({mode:S.ar.mode,hours:S.arHours},'Timer updated');else render();return}
+  if(a==='arChats'){arPost({groupChat:($('#ar-group')||{}).value||'',dmChat:($('#ar-dm')||{}).value||''},'Chat ids saved');return}
   if(a==='backup'){t.textContent='Sending…';j('/api/admin/backup-now','POST').then(function(r){t.textContent='Backup to Telegram';toast(r.sent?'Backup sent to Telegram':(r.reason||'Failed'))});return}
 });
 document.addEventListener('keydown',function(e){
@@ -825,6 +854,8 @@ document.addEventListener('input',function(e){
 });
 document.addEventListener('change',function(e){
   var t=e.target;
+  if(t.hasAttribute&&t.hasAttribute('data-arcat')){var rb={};rb[t.getAttribute('data-arcat')]=t.value;arPost({routes:rb},'Saved');return}
+  if(t.hasAttribute&&t.hasAttribute('data-arkeep')){arPost({keepOps:t.checked},'Saved');return}
   if(t.id==='swDry'||t.hasAttribute('data-dryplan')){
     var on=t.checked;j('/api/admin/dry-run','POST',{enabled:on}).then(function(r){if(r.success){toast(on?'Dry run on. Nothing will be sent.':'Dry run off. Trading for real.');refreshAll(true)}else toast(r.message||'Failed')});return}
   if(t.id==='swPause'){var p=t.checked;j('/api/admin/pause-all','POST',{paused:p}).then(function(r){if(r.success){toast(p?'New trades paused for all users':'Trading resumed');refreshAll(true)}else toast(r.message||'Failed')});return}
