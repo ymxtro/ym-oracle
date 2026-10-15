@@ -1,0 +1,20 @@
+{
+  "name": "ym-oracle",
+  "version": "2.4.2",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "bybit-api": "latest",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "https-proxy-agent": "^7.0.4",
+    "pg": "^8.11.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

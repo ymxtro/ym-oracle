@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="dark">
+<title>YM Oracle – Join</title>
+<style>
+  :root{--bg:#0a0c10;--panel:#161a22;--inset:#0f1218;--line:#242938;--mist:#8891a3;--paper:#eef1f6;--long:#22c55e;--short:#ef4444;--signal:#8b5cf6;--pending:#f2b134;color-scheme:dark}
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--paper);font-family:Arial,Helvetica,sans-serif;margin:0 auto;max-width:440px;padding:20px 16px 20px;font-size:14px;line-height:1.45}
+  h1{font-size:17px;margin:0;font-weight:700} h2{font-size:16px;margin:0 0 8px}
+  p{margin:0} button,input,select{font-family:inherit}
+  .long{color:var(--long)}.short{color:var(--short)}.mist{color:var(--mist)}.warn{color:var(--pending)}.small{font-size:11px}.num{font-variant-numeric:tabular-nums}
+  [hidden]{display:none!important}
+  :focus-visible{outline:2px solid var(--signal);outline-offset:2px}
+  .card{background:var(--panel);border-radius:16px;padding:16px;margin-bottom:12px}
+  .btn{background:transparent;border:1px solid var(--line);color:var(--mist);border-radius:10px;padding:10px 14px;font-size:13px;cursor:pointer;line-height:1.2}
+  .btn:hover{color:var(--paper);border-color:var(--mist)} .btn[disabled]{opacity:.45;cursor:not-allowed}
+  .btn.pri{background:var(--signal);border-color:var(--signal);color:#fff}
+  .btn.go{background:var(--long);border-color:var(--long);color:#04210f;font-weight:700}
+  .btn.danger{color:var(--short);border-color:#5a2a30}
+  .btn.block{width:100%;padding:12px 14px;margin-top:12px}
+  .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;padding:2px;gap:2px;background:var(--bg)}
+  .seg button{border:0;background:transparent;color:var(--mist);padding:6px 12px;border-radius:8px;font-size:12px;cursor:pointer}
+  .seg button[aria-pressed="true"]{background:var(--signal);color:#fff}
+  .chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:11px;color:var(--mist);white-space:nowrap}
+  .chip.long{color:var(--long);border-color:#1d5a37}.chip.warn{color:var(--pending);border-color:#6b5320}.chip.short{color:var(--short);border-color:#6b2a2a}
+  .new{font-size:9px;letter-spacing:.5px;text-transform:uppercase;color:var(--signal);border:1px solid #4b3a8a;border-radius:5px;padding:0 5px;margin-left:6px;vertical-align:2px}
+  .ttl{font-size:11px;color:var(--mist);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px}
+  .sw{position:relative;width:38px;height:22px;flex:none}
+  .sw input{position:absolute;inset:0;opacity:0;margin:0;cursor:pointer;z-index:1}
+  .sw i{position:absolute;inset:0;border-radius:999px;background:var(--line);transition:background .15s}
+  .sw i::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:var(--paper);transition:transform .15s}
+  .sw input:checked+i{background:var(--signal)}.sw input:checked+i::after{transform:translateX(16px);background:#fff}
+  .sw input:focus-visible+i{outline:2px solid var(--signal);outline-offset:2px}
+  .line{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--line);font-size:13px}.line:first-child{border-top:0}
+  .line>span:last-child{text-align:right}
+  label.l{display:block;font-size:11px;color:var(--mist);margin:12px 0 4px}
+  input[type=text],input[type=password],input[type=number],input:not([type]),select{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:11px 12px;color:var(--paper);font-size:14px}
+  input[type=range]{width:100%;accent-color:var(--signal)} input[type=checkbox]{accent-color:var(--signal)}
+  .box{border-radius:10px;padding:10px 12px;font-size:12px;line-height:1.5;background:rgba(242,177,52,.12);color:var(--pending);border:1px solid rgba(242,177,52,.35);margin-bottom:10px}
+  .box.red{background:rgba(239,68,68,.1);color:var(--short);border-color:rgba(239,68,68,.35)}
+  .box.plain{background:var(--inset);color:var(--mist);border-color:var(--line)}
+  .msg{font-size:12px;margin-top:10px;line-height:1.5;min-height:0}.msg.err{color:var(--short)}.msg.ok{color:var(--long)}.msg.warn{color:var(--pending)}
+  .hint{font-size:11px;color:var(--mist);line-height:1.5;margin-top:6px}
+  code{background:var(--bg);padding:3px 7px;border-radius:6px;font-size:13px;user-select:all;word-break:break-all}
+  a{color:var(--signal)}
+
+  .tabs2{display:flex;gap:8px;margin:14px 0 12px}.tabs2 button{flex:1}
+  .steps{display:flex;gap:6px;margin-bottom:14px}.steps i{flex:1;height:4px;border-radius:3px;background:var(--line)}.steps i.on{background:var(--signal)}
+  .perm{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-top:1px solid var(--line);font-size:13px}
+
+  .uh{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+  .big{font-size:32px;font-weight:500;letter-spacing:-.5px;margin:4px 0 2px}
+  .spark{width:100%;height:auto;display:block}
+  .spark .ln{fill:none;stroke:var(--long);stroke-width:2;vector-effect:non-scaling-stroke;stroke-linejoin:round}
+  .spark .area{fill:rgba(34,197,94,.14)}.spark .dot{fill:var(--long);stroke:var(--panel);stroke-width:2}
+  .spark.dn .ln{stroke:var(--short)}.spark.dn .area{fill:rgba(239,68,68,.12)}.spark.dn .dot{fill:var(--short)}
+  .spark .g{stroke:var(--line);stroke-dasharray:3 4;stroke-width:1;vector-effect:non-scaling-stroke}
+  .kp{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}
+  .stat{background:var(--inset);border-radius:12px;padding:10px}.stat .k{font-size:10px;color:var(--mist);margin-bottom:4px}.stat .v{font-size:16px;font-weight:500}
+  .bar{height:6px;border-radius:4px;background:var(--bg);overflow:hidden}.bar i{display:block;height:100%;border-radius:4px;background:var(--long);transition:width .2s,background .2s}.bar.w i{background:var(--pending)}.bar.b i{background:var(--short)}
+
+  .hz{height:10px;background:repeating-linear-gradient(45deg,#f2b134 0 10px,#1a1406 10px 20px)}
+  .cockpit.manual{border:4px solid transparent;background:linear-gradient(var(--panel),var(--panel)) padding-box,repeating-linear-gradient(45deg,#f2b134 0 12px,#1a1406 12px 24px) border-box}
+  .aph{display:flex;align-items:center;gap:12px}.aph b{font-size:13px;letter-spacing:.8px;display:block}.aph div span{display:block;margin-top:3px;line-height:1.4}.chip.warn{color:var(--pending);border-color:#5a4720}
+  .lamp{width:14px;height:14px;border-radius:50%;background:var(--long);box-shadow:0 0 0 3px rgba(34,197,94,.18),0 0 12px var(--long);flex:none}
+  .cockpit.manual .lamp{background:var(--pending);box-shadow:0 0 0 3px rgba(242,177,52,.2),0 0 12px var(--pending);animation:blink 1.4s ease-in-out infinite}
+  @keyframes blink{50%{opacity:.35}}
+  @media (prefers-reduced-motion: reduce){.cockpit.manual .lamp{animation:none}}
+  .warnband{border-radius:10px;overflow:hidden;margin:12px 0 0;background:#241c08}.warnband p{padding:10px 12px;font-size:12px;line-height:1.55;color:#f6d99a}
+  .gl{display:flex;justify-content:space-between;font-size:11px;color:var(--mist);margin:14px 0 6px}.gl b{font-size:14px;color:var(--paper)}
+  .gauge .bar{height:10px}
+  .dflt{font-size:10px;color:var(--mist);border:1px solid var(--line);border-radius:6px;padding:1px 5px;margin-left:6px;text-transform:none}.dflt.custom{color:var(--pending);border-color:#4a3d1a}
+  .otr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 10px;padding:11px 0;border-top:1px solid var(--line)}.otr:first-child{border-top:0}
+  .tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 10px;padding:11px 0;border-top:1px solid var(--line)}.tr:first-child{border-top:0}
+  .ring{width:46px;height:46px;border-radius:50%;display:grid;place-items:center;flex:none}
+  .ring b{width:36px;height:36px;border-radius:50%;background:var(--panel);display:grid;place-items:center;font-size:11px}
+  details.acc{border-top:1px solid var(--line)}details.acc:first-of-type{border-top:0}
+  details.acc summary{list-style:none;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 0;cursor:pointer;font-size:13px}
+  details.acc summary::-webkit-details-marker{display:none}
+  details.acc[open] summary{padding-bottom:4px}
+  details.acc .in{padding:0 0 12px}
+
+  .hold{position:relative;overflow:hidden;width:100%;border-radius:10px;border:1px solid #5a2a30;background:rgba(239,68,68,.08);color:var(--short);padding:13px 14px;font-size:12px;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:none;margin-top:10px}
+  .hold.amber{border-color:#6b5320;background:rgba(242,177,52,.1);color:var(--pending)}
+  .hold .hf{position:absolute;left:0;top:0;bottom:0;width:0;background:repeating-linear-gradient(45deg,rgba(242,177,52,.55) 0 10px,rgba(242,177,52,.25) 10px 20px)}
+  .hold span{position:relative}.hold[disabled]{opacity:.45;cursor:not-allowed}
+
+  .nav{position:sticky;bottom:0;margin:16px -16px 0;padding:8px 16px calc(8px + env(safe-area-inset-bottom,0px));background:var(--bg);border-top:1px solid var(--line)}
+  .nav .in{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+  .nav button{background:transparent;border:0;color:var(--mist);padding:10px;border-radius:10px;font-size:13px;cursor:pointer}.nav button[aria-current="page"]{background:var(--panel);color:var(--paper)}
+  .over{position:fixed;inset:0;background:rgba(5,6,9,.82);display:flex;align-items:flex-end;justify-content:center;z-index:50}
+  .sheet{background:var(--panel);width:100%;max-width:440px;border-radius:18px 18px 0 0;overflow:auto;max-height:92%;padding-bottom:env(safe-area-inset-bottom,0px)}
+  .sheet .in{padding:16px 16px 20px}
+  .sheet p{font-size:12px;line-height:1.6;color:var(--mist);margin:0 0 8px}
+  #toast{position:fixed;left:50%;bottom:calc(76px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--paper);color:var(--bg);padding:10px 16px;border-radius:10px;font-size:12px;z-index:80;max-width:calc(100vw - 32px);opacity:0;pointer-events:none;transition:opacity .2s}
+  #toast.on{opacity:1}
+</style>
+</head>
+<body>
+
+<div id="authView" hidden>
+  <h1>YM Oracle</h1>
+  <p class="mist small" style="margin:4px 0 0;line-height:1.5">Automated trading on your own Bybit account. You keep control of your funds: the key you give us can trade but never withdraw.</p>
+  <div class="tabs2"><div class="seg" style="width:100%"><button id="tabSignup" style="flex:1" aria-pressed="true">Sign up</button><button id="tabLogin" style="flex:1" aria-pressed="false">Log in</button></div></div>
+  <div id="signupBox"></div>
+  <div id="loginBox" class="card" hidden>
+    <label class="l" for="liUser">Username</label><input id="liUser" autocomplete="username">
+    <label class="l" for="liPass">Password</label><input id="liPass" type="password" autocomplete="current-password">
+    <div id="liTotpBox" hidden><label class="l" for="liTotp">6-digit code from your authenticator app</label><input id="liTotp" inputmode="numeric" autocomplete="one-time-code"></div>
+    <button class="btn pri block" id="loginBtn">Log in</button>
+    <div id="liMsg" class="msg" role="alert"></div>
+  </div>
+</div>
+
+<div id="appView" hidden>
+  <div id="mustChange" class="card" hidden>
+    <div class="ttl">Choose a new password</div>
+    <p class="mist small">An admin reset your password. Pick a new one that only you know before continuing.</p>
+    <label class="l" for="mcCur">Temporary password</label><input id="mcCur" type="password" autocomplete="current-password">
+    <label class="l" for="mcNew">New password (10+ characters)</label><input id="mcNew" type="password" autocomplete="new-password">
+    <button class="btn pri block" id="mcBtn">Save new password</button>
+    <div id="mcMsg" class="msg" role="alert"></div>
+  </div>
+  <div id="main" hidden>
+    <div id="page"></div>
+    <nav class="nav" aria-label="App"><div class="in" id="nav">
+      <button data-ut="home" aria-current="page">Home</button><button data-ut="trades">Trades</button><button data-ut="settings">Settings</button>
+    </div></nav>
+  </div>
+</div>
+
+<div class="over" id="sheet" hidden><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="mmTitle" id="sheetBody"></div></div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function(){
+'use strict';
+function $(s,r){return (r||document).querySelector(s)}
+function $$(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s))}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function money(n,d){n=Number(n)||0;var a=Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:d==null?2:d,maximumFractionDigits:d==null?2:d});return (n>=0?'+$':'-$')+a}
+function cls(n){return n>=0?'long':'short'}
+function ago(t){if(!t)return '';var s=Math.max(0,Math.round((Date.now()-new Date(t).getTime())/1000));return s<60?s+'s ago':(s<3600?Math.round(s/60)+'m ago':(s<86400?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago'))}
+var toastT;function toast(m){var t=$('#toast');t.textContent=m;t.classList.add('on');clearTimeout(toastT);toastT=setTimeout(function(){t.classList.remove('on')},2800)}
+function copy(txt,msg){try{navigator.clipboard.writeText(txt).then(function(){toast(msg||'Copied')},function(){toast('Select the text to copy')})}catch(e){toast('Select the text to copy')}}
+function tok(){try{return localStorage.getItem('ym_user_token')||''}catch(e){return ''}}
+function setTok(v){try{if(v)localStorage.setItem('ym_user_token',v);else localStorage.removeItem('ym_user_token')}catch(e){}}
+function call(path,method,body){
+  var h={'Content-Type':'application/json'};if(tok())h['Authorization']='Bearer '+tok();
+  return fetch(path,{method:method||'GET',headers:h,body:body?JSON.stringify(body):undefined}).then(function(r){return r.json().catch(function(){return {}}).then(function(j){j._status=r.status;return j})}).catch(function(){return {success:false,message:'Could not reach the server.',_status:0}});
+}
+function msg(id,text,c){var el=$('#'+id);if(!el)return;el.textContent=text;el.className='msg '+(c||'')}
+
+var S={ut:'home',m:null,period:30,series:null,open:null,openErr:'',form:null,limDirty:false,suStep:0,su:{invite:'',user:'',pass:'',key:'',secret:'',env:'live',pct:'20',ack:false,confirmHigh:false},ipHelp:'',tgCode:null,tfaSetup:null,tgPoll:null,openT:null,poll:null};
+var HOLD={};
+
+/* ---------- hold to confirm ---------- */
+function bindHold(btn){
+  var key=btn.getAttribute('data-hold'),f=btn.querySelector('.hf'),D=1300,t0=0,raf=0,on=false;
+  function step(ts){if(!t0)t0=ts;var p=Math.min(1,(ts-t0)/D);f.style.width=(p*100)+'%';if(p>=1){stop();if(HOLD[key])HOLD[key](btn)}else raf=requestAnimationFrame(step)}
+  function start(){if(btn.disabled||on)return;on=true;t0=0;raf=requestAnimationFrame(step)}
+  function stop(){on=false;cancelAnimationFrame(raf);t0=0;f.style.width='0'}
+  btn.addEventListener('pointerdown',function(e){e.preventDefault();start()});
+  ['pointerup','pointerleave','pointercancel'].forEach(function(ev){btn.addEventListener(ev,stop)});
+  btn.addEventListener('keydown',function(e){if((e.key===' '||e.key==='Enter')&&!e.repeat){e.preventDefault();start()}});
+  btn.addEventListener('keyup',function(e){if(e.key===' '||e.key==='Enter')stop()});
+}
+function bindHolds(root){$$('[data-hold]',root).forEach(function(b){if(!b.__h){b.__h=1;bindHold(b)}})}
+function holdBtn(key,label,extra,cl){return '<button class="hold '+(cl||'')+'" data-hold="'+key+'"'+(extra||'')+'><span class="hf"></span><span>'+label+'</span></button>'}
+function arm(btn,label,fn){ // two-tap confirm for smaller actions
+  if(!btn.__armed){btn.__armed=1;btn.dataset.old=btn.textContent;btn.textContent=label;setTimeout(function(){if(btn.__armed){btn.__armed=0;btn.textContent=btn.dataset.old}},3500);return}
+  btn.__armed=0;btn.textContent=btn.dataset.old;fn();
+}
+
+/* ---------- charts ---------- */
+function spark(d,w,h){
+  if(!d||d.length<2)return '';
+  var mn=Math.min.apply(null,d.concat([0])),mx=Math.max.apply(null,d.concat([0])),r=(mx-mn)||1,p=6;
+  function x(i){return p+i*(w-p*2)/(d.length-1)} function y(v){return h-p-(v-mn)/r*(h-p*2)}
+  var pts=d.map(function(v,i){return x(i).toFixed(1)+','+y(v).toFixed(1)}).join(' ');
+  return '<svg class="spark '+(d[d.length-1]>=0?'':'dn')+'" viewBox="0 0 '+w+' '+h+'" role="img" aria-label="Your net result over time"><line class="g" x1="0" x2="'+w+'" y1="'+y(0).toFixed(1)+'" y2="'+y(0).toFixed(1)+'"/><polygon class="area" points="'+p+','+h+' '+pts+' '+(w-p)+','+h+'"/><polyline class="ln" points="'+pts+'"/><circle class="dot" cx="'+x(d.length-1).toFixed(1)+'" cy="'+y(d[d.length-1]).toFixed(1)+'" r="4"/></svg>';
+}
+
+/* ---------- auth ---------- */
+function authTab(w){
+  $('#signupBox').hidden=w!=='signup';$('#loginBox').hidden=w!=='login';
+  $('#tabSignup').setAttribute('aria-pressed',w==='signup');$('#tabLogin').setAttribute('aria-pressed',w==='login');
+}
+function renderSignup(){
+  var s=S.suStep,u=S.su,h='<div class="steps">'+[0,1,2,3].map(function(i){return '<i class="'+(i<=s?'on':'')+'"></i>'}).join('')+'</div>';
+  if(s===0)h+='<div class="card"><b>1. Create your account</b><label class="l" for="su1">Invite code</label><input id="su1" data-su="invite" autocomplete="off" value="'+esc(u.invite)+'"><label class="l" for="su2">Username</label><input id="su2" data-su="user" autocomplete="username" value="'+esc(u.user)+'"><label class="l" for="su3">Password (10+ characters)</label><input id="su3" data-su="pass" type="password" autocomplete="new-password" value="'+esc(u.pass)+'"><button class="btn pri block" data-sunext="1">Continue</button><div id="suMsg" class="msg" role="alert"></div></div>';
+  if(s===1){var dm=u.env==='demo';
+    h+='<div class="card"><b>2. '+(dm?'Make a demo key on Bybit':'Make a trade-only key on Bybit')+'</b>'
+    +(S.demoKeys!==false?'<div class="seg" role="group" aria-label="Account type" style="margin:10px 0 4px"><button type="button" data-suenv="live" aria-pressed="'+(!dm)+'">Live account</button><button type="button" data-suenv="demo" aria-pressed="'+(dm)+'">Demo (practice)</button></div>':'')
+    +(dm?'<div class="box" style="margin:10px 0 0">Demo uses Bybit practice money, so nothing real is at risk. In Bybit, switch to <b>Demo Trading</b> (account menu, top left), then open <b>API</b> and create a demo key. You can move to a live key later in Settings.</div>'
+        +'<p class="mist small" style="margin:10px 0 10px;line-height:1.5">Demo balances are often much larger than a real account, so trade sizes can look bigger than they would live.</p>'
+       :'<p class="mist small" style="margin:10px 0 10px;line-height:1.5">A separate sub-account keeps your own trades apart from the bot.'+esc(S.ipHelp)+'</p>'
+        +[['Contract / Derivatives trading','long','Tick'],['Reading balances','long','Tick'],['Withdrawals','short','Leave off'],['Transfers','short','Leave off']].map(function(p){return '<div class="perm"><span>'+p[0]+'</span><span class="chip '+p[1]+'">'+p[2]+'</span></div>'}).join('')
+        +'<div class="box red" style="margin-top:10px;margin-bottom:0">Keys with withdrawal permission are rejected.</div>')
+    +'<div class="btns"><button class="btn" data-sunext="0">Back</button><button class="btn pri" style="flex:1" data-sunext="2">I made the key</button></div></div>';}
+  if(s===2)h+='<div class="card"><b>3. Paste your '+(u.env==='demo'?'demo ':'')+'key</b><label class="l" for="su4">Bybit API key</label><input id="su4" data-su="key" autocomplete="off" value="'+esc(u.key)+'"><label class="l" for="su5">Bybit API secret</label><input id="su5" data-su="secret" type="password" autocomplete="off" value="'+esc(u.secret)+'"><p class="hint">We check the permissions with Bybit before saving. The secret is stored encrypted.</p><div class="btns"><button class="btn" data-sunext="1">Back</button><button class="btn pri" style="flex:1" data-sunext="3">Continue</button></div><div id="suMsg" class="msg" role="alert"></div></div>';
+  if(s===3){var pc=Number(u.pct)||0,ex=500*pc/100;
+    h+='<div class="card"><b>4. Choose how much each trade uses</b><p class="hint" style="margin-top:8px">Every trade uses a percent of <b>your own</b> balance. The leverage, stop loss and take profit come from each signal, exactly as the bot sends them.</p>'
+    +'<div class="seg" role="group" aria-label="Quick picks" style="margin:10px 0">'+[5,10,20].map(function(p){return '<button type="button" data-supct="'+p+'" aria-pressed="'+(pc===p)+'">'+p+'%'+(p===20?' · standard':'')+'</button>'}).join('')+'</div>'
+    +'<label class="l" for="su6">Or type your own percent (1 to 30)</label><input id="su6" data-su="pct" type="number" min="1" max="30" value="'+esc(u.pct)+'">'
+    +'<p class="hint" id="suPrev">'+(pc>0?'On a $500 account, '+pc+'% means about $'+(ex<10?ex.toFixed(2):Math.round(ex))+' of your own money on each trade (about $'+Math.round(ex*10)+' of position at 10x).':'Enter a percent between 1 and 30.')+'</p>'
+    +'<div class="box red" id="suHigh"'+(pc>20?'':' hidden')+'><b>More than 20% is aggressive.</b><label style="display:flex;gap:10px;align-items:flex-start;margin-top:8px;font-size:13px"><input type="checkbox" id="suConfirmHigh"'+(u.confirmHigh?' checked':'')+' style="margin-top:2px"> I understand and want this</label></div>'
+    +'<div class="box plain" style="margin-top:10px"><b style="color:var(--paper)">Safety rails on every account:</b> at most 3 trades open at once, new trades stop for the day if you are down 10% of your starting balance, and trading pauses if your balance falls 30% below its peak.</div>'
+    +'<label style="display:flex;gap:10px;align-items:flex-start;margin-top:12px;font-size:13px;color:var(--paper)"><input type="checkbox" id="suAck"'+(u.ack?' checked':'')+' style="margin-top:2px"> I understand trading can lose money, including more than one trade in a row, and past results do not promise future ones.</label>'
+    +'<div class="btns"><button class="btn" data-sunext="2">Back</button><button class="btn go" style="flex:1" id="suGo">Check and create account</button></div><div id="suMsg" class="msg" role="alert"></div></div>';}
+  $('#signupBox').innerHTML=h;
+}
+function suNext(n){
+  var u=S.su;
+  if(n===1&&S.suStep===0){
+    if(!u.invite.trim()||!u.user.trim()){msg('suMsg','Enter your invite code and a username.','err');return}
+    if(u.pass.length<10){msg('suMsg','Your password needs at least 10 characters.','err');return}
+  }
+  if(n===3&&S.suStep===2&&(!u.key.trim()||!u.secret.trim())){msg('suMsg','Paste both the API key and the secret.','err');return}
+  S.suStep=n;renderSignup();
+}
+function doSignup(){
+  var u=S.su,pc=Number(u.pct);
+  if(!(pc>=1&&pc<=30)){msg('suMsg','Choose a percent between 1 and 30.','err');return}
+  if(pc>20&&!u.confirmHigh){msg('suMsg','Please confirm you want more than 20% per trade.','err');return}
+  if(!u.ack){msg('suMsg','Please tick the box to confirm you understand the risk.','err');return}
+  msg('suMsg','Checking your key with Bybit…','warn');
+  call('/api/auth/signup','POST',{inviteCode:u.invite,username:u.user,password:u.pass,apiKey:u.key,apiSecret:u.secret,env:u.env||'live',sizeMode:'percent',sizePct:pc,confirmHigh:pc>20?true:undefined,riskAck:true}).then(function(r){
+    if(!r.success){msg('suMsg',r.message||'Signup failed','err');return}
+    setTok(r.token);S.su={invite:'',user:'',pass:'',key:'',secret:'',env:'live',pct:'20',ack:false,confirmHigh:false};S.suStep=0;show();
+  });
+}
+function doLogin(){
+  call('/api/auth/login','POST',{username:$('#liUser').value,password:$('#liPass').value,totp:$('#liTotp').value}).then(function(r){
+    if(r.needTotp){$('#liTotpBox').hidden=false;msg('liMsg',r.message||'',$('#liTotp').value?'err':'warn');$('#liTotp').focus();return}
+    if(!r.success){msg('liMsg',r.message||'Login failed','err');return}
+    setTok(r.token);$('#liPass').value='';$('#liTotp').value='';show();
+  });
+}
+function logout(){call('/api/auth/logout','POST').then(function(){setTok('');stopPolls();show()})}
+
+/* ---------- loading ---------- */
+function stopPolls(){clearInterval(S.poll);clearInterval(S.openT);S.poll=S.openT=null}
+function show(){
+  if(!tok()){$('#authView').hidden=false;$('#appView').hidden=true;renderSignup();return}
+  return call('/api/me').then(function(m){
+    if(m.mustChangePassword){$('#authView').hidden=true;$('#appView').hidden=false;$('#mustChange').hidden=false;$('#main').hidden=true;return}
+    if(m._status===401||!m.success){setTok('');stopPolls();$('#authView').hidden=false;$('#appView').hidden=true;renderSignup();return}
+    $('#authView').hidden=true;$('#appView').hidden=false;$('#mustChange').hidden=true;$('#main').hidden=false;
+    S.m=m;
+    if(!S.limDirty)S.form=formFrom(m);
+    var jobs=[loadSeries()];if(S.ut==='home')jobs.push(loadOpen());if(S.ut==='trades')jobs.push(loadAct());
+    return Promise.all(jobs).then(function(){render();startPolls()});
+  });
+}
+function startPolls(){
+  if(!S.poll)S.poll=setInterval(function(){if(!document.hidden&&!S.busy)show()},30000);
+  if(!S.openT)S.openT=setInterval(function(){if(!document.hidden&&S.ut==='home'&&S.m)loadOpen().then(function(){var el=$('#openList');if(el)el.innerHTML=openHtml()})},15000);
+}
+function loadSeries(){return call('/api/me/series?days='+(S.period===0?365:S.period)).then(function(r){S.series=r.success?r.points.map(function(p){return p.net}):null})}
+function loadOpen(){
+  return call('/api/me/open').then(function(r){
+    if(r.success){S.open=r.open;S.openErr=''}else if(r._status===404){S.open=null}else{S.openErr=r.message||'Could not load your open trades.'}
+  });
+}
+
+/* ---------- plan helpers (same formula as the server) ---------- */
+var STDX={pct:20,max:30,confirmAbove:20};
+function formFrom(m){var L=m.limits;return {sizeMode:L.sizeMode==='fixed'?'fixed':'percent',sizeUsd:L.sizeUsd==null?'':String(L.sizeUsd),sizePct:L.sizePct==null?'':String(L.sizePct),dailyLossLimitUsd:L.dailyLossLimitUsd==null?'':String(L.dailyLossLimitUsd),confirmHigh:false}}
+/* what the chosen size means in dollars, from the balance on screen (same rule as the server: balance x percent, capped, then the signal's leverage) */
+function sizePreview(){
+  var f=S.form,m=S.m,eq=Number(m.equity)||0,cap=Number((m.rails&&m.rails.maxTradeUsd)||(m.limits&&m.limits.ceilings&&m.limits.ceilings.maxTradeUsd))||0,usd;
+  usd=f.sizeMode==='fixed'?Number(f.sizeUsd):eq*Number(f.sizePct)/100;
+  if(!(usd>0))return 'Enter an amount to see what each trade would use.';
+  var capped=cap&&usd>cap;if(capped)usd=cap;
+  var txt='Each trade would use about $'+(usd<10?usd.toFixed(2):Math.round(usd).toLocaleString())+' of your money'+(capped?' (the most any trade can use is $'+cap+')':'')+'. Leverage comes from the signal, so at 10x that controls about $'+Math.round(usd*10).toLocaleString()+'.';
+  if(f.sizeMode==='percent'&&eq>0&&Number(f.sizePct)>0){var lossPct=Number(f.sizePct)*0.5;txt+=' If the stop is hit you could lose a few percent of your balance on that one trade.'}
+  return txt;
+}
+function amtHint(){return sizePreview()}
+function gaugeNow(){var h=$('#amtHint');if(h)h.textContent=sizePreview();var c=$('#highWarn');if(c&&S.form)c.hidden=!(S.form.sizeMode==='percent'&&Number(S.form.sizePct)>STDX.confirmAbove)}
+function formState(){return S.form}
+
+/* ---------- screens ---------- */
+function statusChip(m){
+  if(!m.hasKey)return ['No key','warn'];
+  if(m.keyStatus==='error')return ['Key problem','short'];
+  if(m.paused||m.globalPause)return ['Paused','warn'];
+  return ['Active','long'];
+}
+function openHtml(){
+  if(S.openErr&&!S.open)return '<p class="mist small" style="padding:10px 0">'+esc(S.openErr)+'</p>';
+  if(!S.open||!S.open.length)return '<p class="mist" style="padding:10px 0">No open trades.</p>';
+  return S.open.map(function(o){
+    var pct=o.entry>0&&o.leverage?((o.side==='SHORT'?(o.entry-o.mark):(o.mark-o.entry))/o.entry*100*o.leverage):null;
+    return '<div class="otr"><span><b>'+esc(o.symbol.replace('USDT',''))+'</b> <span class="'+(o.side==='LONG'?'long':'short')+'">'+o.side+'</span> <span class="mist small">'+(o.leverage?o.leverage+'x':'')+'</span></span><b class="num '+cls(o.pnl)+'">'+money(o.pnl)+(pct!==null?' <span class="small">('+(pct>=0?'+':'')+pct.toFixed(1)+'%)</span>':'')+'</b><span class="mist small">'+(o.stop?'Stop '+o.stop:'No stop set')+(o.target?' · Target '+o.target:'')+'</span><span class="mist small num" style="text-align:right">'+(o.mark!=null?o.mark:'-')+'</span></div>';
+  }).join('');
+}
+function cockpitHtml(m){
+  var f=S.form,L=m.limits,R=m.rails||{},mx=L.pctMax||STDX.max;
+  var h='<div class="card cockpit" style="margin-top:12px"><div class="aph"><span class="lamp"></span><div><b>YOUR TRADE SIZE</b><span class="mist small">Every trade is sized from your own balance. Leverage and stops come from the signal.</span></div></div>';
+  if(m.notice)h+='<div class="box" id="noticeBox"><b>Change to your account.</b> '+esc(m.notice)+'<div class="btns" style="margin-top:8px"><button class="btn" data-act="dismissNotice">Got it</button></div></div>';
+  h+='<label class="l">How should each trade be sized?</label><div class="seg" role="group" aria-label="Size mode">'+[['percent','% of my balance'],['fixed','Fixed amount']].map(function(o){return '<button data-sm="'+o[0]+'" aria-pressed="'+(f.sizeMode===o[0])+'">'+o[1]+'</button>'}).join('')+'</div>';
+  if(f.sizeMode==='percent'){
+    h+='<label class="l" for="limPct">Percent of your balance on each trade <span class="mist">(1 to '+mx+')</span></label><div class="seg" role="group" aria-label="Quick picks" style="margin-bottom:8px">'+[5,10,20].map(function(p){return '<button data-preset="'+p+'" aria-pressed="'+(Number(f.sizePct)===p)+'">'+p+'%'+(p===STDX.pct?' · standard':'')+'</button>'}).join('')+'</div><input id="limPct" data-f="sizePct" type="number" min="1" max="'+mx+'" placeholder="e.g. 20" value="'+esc(f.sizePct)+'">';
+    h+='<div class="box red" id="highWarn" style="margin-top:10px"'+(Number(f.sizePct)>STDX.confirmAbove?'':' hidden')+'><b>More than '+STDX.confirmAbove+'% is aggressive.</b> One losing signal can take a big bite out of your balance.<label style="display:flex;gap:10px;align-items:flex-start;margin-top:8px;font-size:13px"><input type="checkbox" id="limConfirm"'+(f.confirmHigh?' checked':'')+' style="margin-top:2px"> I understand and want this</label></div>';
+  } else {
+    h+='<label class="l" for="limUsd">Amount you put in on each trade (USD)</label><input id="limUsd" data-f="sizeUsd" type="number" placeholder="e.g. 20" value="'+esc(f.sizeUsd)+'">';
+  }
+  h+='<p class="hint" id="amtHint">'+esc(sizePreview())+'</p>';
+  h+='<label class="l" for="limLoss">Extra: daily loss limit in USD (optional). New trades stop for the day once reached.</label><input id="limLoss" data-f="dailyLossLimitUsd" type="number" placeholder="None" value="'+esc(f.dailyLossLimitUsd)+'">';
+  h+='<div class="box plain" style="margin-top:12px"><b style="color:var(--paper)">Safety rails for everyone</b><br>At most '+(R.maxOpenTrades||'a few')+' trades open at once · New trades stop for the day if you are down '+(R.dailyLossPct||10)+'% of the balance you started the day with · Trading pauses if your balance falls '+(R.drawdownStopPct||30)+'% below its highest point'+(R.maxTradeUsd?' · No trade uses more than $'+R.maxTradeUsd:'')+'. If a coin\'s smallest allowed order is bigger than your amount, that trade is skipped (or rounded up when it is close and safe), and Activity says why.</div>';
+  h+='<div class="btns"><button class="btn pri" data-act="saveLimits">Save my settings</button><button class="btn" data-act="restorePlan">Back to standard ('+STDX.pct+'%)</button></div><div id="limMsg" class="msg" role="status"></div>';
+  return h+'</div>';
+}
+function viewHome(){
+  var m=S.m,st=statusChip(m),net=m.pnl+m.funding;
+  var pts=S.series,shown=pts?pts[pts.length-1]:net;if(S.period===0)shown=net;
+  var h='<div class="uh"><div><h1>'+esc(m.username)+'</h1><div class="mist small">Welcome back</div></div><span class="chip '+st[1]+'">'+st[0]+'</span></div>';
+  if(m.hasKey&&m.env==='demo')h+='<div class="box"><b>Demo account.</b> You are copying trades with Bybit practice money. Nothing real is traded. When you are ready, open Settings, Bybit key, choose Live and paste your live key. Your demo results are kept apart from your live ones.</div>';
+  if(!m.hasKey)h+='<div class="box">Add your Bybit key in Settings to start trading.</div>';
+  if(m.keyStatus==='error')h+='<div class="box red">Your API key stopped working ('+esc(m.keyError||'unknown')+'). Trading is off until you replace it in Settings.</div>';
+  if(m.dry)h+='<div class="box">Test mode. The admin is testing the plan. Trades are worked out for your account but <b>no orders are being placed</b> right now. Anything already open is managed as normal.</div>';
+  if(m.globalPause)h+='<div class="box red">New trading is paused for everyone by the admin. Your open trades are still managed and closed as normal.</div>';
+  h+='<div class="card"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px"><div><div class="mist small">Net result</div><div class="big num '+cls(shown)+'">'+money(shown)+'</div></div><div class="seg" role="group" aria-label="Period">'+[[7,'7d'],[30,'30d'],[0,'All']].map(function(k){return '<button data-period="'+k[0]+'" aria-pressed="'+(S.period===k[0])+'">'+k[1]+'</button>'}).join('')+'</div></div>'+spark(pts,320,70)
+   +'<div class="kp"><div class="stat"><div class="k">Win rate</div><div class="v num">'+(m.trades?Math.round(m.wins/m.trades*100)+'%':'-')+'</div></div><div class="stat"><div class="k">Trades</div><div class="v num">'+m.trades+'</div></div><div class="stat"><div class="k">Balance</div><div class="v num">'+(m.equity===null?'-':'$'+Number(m.equity).toLocaleString(undefined,{maximumFractionDigits:0}))+'</div></div></div>'
+   +(m.funding?'<p class="hint">All-time net '+money(net)+', including '+money(m.funding)+' of funding fees.</p>':'')+'</div>';
+  h+=cockpitHtml(m);
+  if(m.lossLimit>0){
+    var used=Math.max(0,-m.todayPnl),pc=Math.min(100,used/m.lossLimit*100);
+    h+='<div class="card"><div style="display:flex;justify-content:space-between"><span class="mist small">Today\'s loss limit<span class="new">New</span></span><span class="num small">'+(m.todayPnl>=0?'Up '+money(m.todayPnl)+' today':'$'+used.toFixed(2)+' of $'+m.lossLimit+' lost')+'</span></div><div class="bar '+(pc>70?(pc>=100?'b':'w'):'')+'" style="margin-top:8px"><i style="width:'+pc+'%"></i></div><p class="hint">'+(pc>=100?'You hit the limit. New trades resume tomorrow (00:00 UTC).':'New trades stop for the day when the limit is reached. It resets at 00:00 UTC.')+'</p></div>';
+  }
+  h+='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><span class="mist small" style="text-transform:uppercase;letter-spacing:.4px">Open now<span class="new">New</span></span><span class="mist small">Updates every 15s</span></div><div id="openList">'+openHtml()+'</div></div>';
+  h+='<div class="card"><div class="line"><span>Pause new trades<br><span class="mist small">Open trades still get stops and closes</span></span><label class="sw"><input type="checkbox" id="swPause" '+(m.paused?'checked':'')+' aria-label="Pause new trades"><i></i></label></div>'+holdBtn('closeMine','Hold to close all my trades')+'<button class="btn block" style="margin-top:8px;color:var(--short);border-color:#5a2a30" data-act="pauseClose">Pause and close everything</button><div id="ctlMsg" class="msg" role="status"></div></div>';
+  return h;
+}
+function loadAct(){return call('/api/me/activity?limit=30').then(function(r){S.act=r.success?r.items:null})}
+function actHtml(){
+  var a=S.act;
+  var h='<div class="uh" style="margin-top:18px"><h1>Signals for you</h1><span class="mist small">Latest 30</span></div><div class="card" id="actList">';
+  if(!a)return h+'<p class="mist" style="padding:10px 0">Loading…</p></div>';
+  if(!a.length)return h+'<p class="mist" style="padding:10px 0">No signals yet. Each one will show here: copied, or not copied and why.</p></div>';
+  return h+a.map(function(x){
+    var cl=x.outcome==='copied'?'long':x.outcome==='skipped'?'warn':x.outcome==='practice'?'':'short',lab=x.outcome==='copied'?'Copied':x.outcome==='skipped'?'Not copied':x.outcome==='practice'?'Practice':'Problem';
+    return '<div class="tr act"><span><b>'+esc(String(x.symbol||'').replace('USDT',''))+'</b> <span class="mist small">'+esc(x.side||'')+'</span><br><span class="mist small">'+esc(x.outcome==='copied'?(x.riskUsd!=null?'If the stop is hit you would lose about $'+x.riskUsd.toFixed(2)+(x.riskPct!=null?' ('+x.riskPct+'% of your balance)':''):'Placed on your account'):x.text)+'</span><br><span class="mist small">'+ago(x.at)+'</span></span><span class="chip '+cl+'" style="align-self:start">'+lab+'</span></div>';
+  }).join('')+'</div>';
+}
+function viewTrades(){
+  var l=S.m.ledger;
+  return actHtml()+'<div class="uh" style="margin-top:18px"><h1>Closed trades</h1><span class="mist small">Last '+l.length+'</span></div><div class="card">'+(l.length?l.map(function(t){return '<div class="tr"><span><b>'+esc(String(t.symbol).replace('USDT',''))+'</b> <span class="mist small">'+esc(t.side)+'</span></span><b class="num '+cls(t.pnl)+'">'+money(t.pnl)+'</b><span class="mist small">'+ago(t.at)+'</span><span class="mist small num" style="text-align:right">'+(t.qty?'qty '+t.qty:'')+'</span></div>'}).join(''):'<p class="mist" style="padding:10px 0">No closed trades yet.</p>')+'</div><p class="hint">Net result also includes funding fees, so it can differ slightly from the sum of these trades.</p>';
+}
+function viewSettings(){
+  var m=S.m,done=(m.hasKey&&m.keyStatus==='ok'?1:0)+(m.totpEnabled?1:0)+(m.telegram.linked?1:0),tot=m.telegram.available?3:2;
+  if(!m.telegram.available)done-=(m.telegram.linked?1:0);
+  var pcent=done/tot*100;
+  var h='<div class="uh"><h1>Settings</h1></div><div class="card" style="display:flex;gap:14px;align-items:center"><div class="ring" style="background:conic-gradient(var(--long) '+pcent+'%,var(--line) 0)"><b>'+done+'/'+tot+'</b></div><div><b>Account health</b><div class="mist small">'+(done===tot?'Everything is set up.':'Finish the steps below to protect your account.')+'</div></div></div>';
+  h+='<div class="card" style="margin-top:12px">';
+  /* key */
+  h+='<details class="acc"'+(S.keyOpen?' open':'')+'><summary><span>Bybit key<br><span class="mist small">Trade only, no withdrawals</span></span><span class="chip '+(!m.hasKey?'warn':m.keyStatus==='error'?'short':'long')+'">'+(!m.hasKey?'No key':m.keyStatus==='error'?'Problem':(m.env==='demo'?'Demo':'Live'))+'</span></summary><div class="in">'+(m.demoKeys!==false?'<div class="seg" role="group" aria-label="Account type" style="margin-bottom:8px"><button type="button" data-nkenv="live" aria-pressed="'+((S.nkEnv||m.env)!=='demo')+'">Live</button><button type="button" data-nkenv="demo" aria-pressed="'+((S.nkEnv||m.env)==='demo')+'">Demo</button></div>'+((S.nkEnv||m.env)!==m.env?'<div class="box" style="margin-top:0">Switching to <b>'+(S.nkEnv||m.env)+'</b>: your '+m.env+' results are filed away (kept, not deleted) and trading starts <b>paused</b> until you press Resume.</div>':''):'')+'<label class="l" for="nkKey">New API key</label><input id="nkKey" autocomplete="off"><label class="l" for="nkSecret">New API secret</label><input id="nkSecret" type="password" autocomplete="off"><div class="btns"><button class="btn pri" data-act="replaceKey">Update key</button>'+(m.hasKey?'<button class="btn danger" data-act="removeKey">Remove key and stop trading</button>':'')+'</div><div id="nkMsg" class="msg" role="status"></div></div></details>';
+  /* 2fa */
+  h+='<details class="acc"><summary><span>Two-factor login<br><span class="mist small">6-digit code at sign-in</span></span><span class="chip '+(m.totpEnabled?'long':'warn')+'">'+(m.totpEnabled?'On':'Recommended')+'</span></summary><div class="in">';
+  if(!m.totpEnabled){
+    h+='<p class="mist small" style="line-height:1.5">Adds a 6-digit code from an authenticator app (Google Authenticator, Authy, Microsoft Authenticator). Strongly recommended, since this account holds a trading key.</p>';
+    if(!S.tfaSetup)h+='<button class="btn pri block" data-act="tfaSetup">Turn on 2-factor login</button>';
+    else h+='<div class="box plain" style="margin-top:10px">In your authenticator app choose <b>Add account / Enter a setup key</b> and type this key:<br><br><code>'+esc(S.tfaSetup.secret)+'</code><br><br>On a phone you can also tap <a href="'+esc(S.tfaSetup.uri)+'">this link</a> to add it automatically.</div><label class="l" for="tfaCode">Enter the 6-digit code from the app to finish</label><input id="tfaCode" inputmode="numeric" autocomplete="one-time-code"><button class="btn pri block" data-act="tfaEnable">Confirm and turn on</button>';
+  }else h+='<label class="l" for="tfaDisPw">Password</label><input id="tfaDisPw" type="password" autocomplete="current-password"><label class="l" for="tfaDisCode">Current 6-digit code</label><input id="tfaDisCode" inputmode="numeric"><button class="btn danger block" data-act="tfaDisable">Turn off 2-factor login</button>';
+  h+='<div id="tfaMsg" class="msg" role="status"></div></div></details>';
+  /* telegram */
+  h+='<details class="acc"><summary><span>Telegram alerts<br><span class="mist small">Opens, closes, key problems</span></span><span class="chip '+(m.telegram.linked?'long':'')+'">'+(!m.telegram.available?'Not available':m.telegram.linked?'Connected':'Not connected')+'</span></summary><div class="in">';
+  if(!m.telegram.available)h+='<p class="mist small">Not available on this server yet.</p>';
+  else if(!m.telegram.linked){
+    h+='<p class="mist small" style="line-height:1.5">Get a message when a trade opens, when one closes with its profit or loss, and if your key stops working.</p>';
+    if(S.tgCode)h+='<div class="box plain" style="margin-top:10px">Open Telegram, find '+(S.tgCode.botUsername?'@'+esc(S.tgCode.botUsername):'the alerts bot')+', and send it this code within '+esc(S.tgCode.minutes)+' minutes:<br><br><code>'+esc(S.tgCode.code)+'</code>'+(S.tgCode.botUsername?'<br><br><a target="_blank" rel="noopener" href="https://t.me/'+encodeURIComponent(S.tgCode.botUsername)+'">Open the bot</a>':'')+'</div>';
+    else h+='<button class="btn pri block" data-act="tgLink">Connect Telegram</button>';
+  }else h+='<div class="line"><span>Send me alerts</span><label class="sw"><input type="checkbox" id="swTg" '+(m.telegram.notify?'checked':'')+' aria-label="Send me alerts"><i></i></label></div><div class="btns"><button class="btn" data-act="tgTest">Send a test alert</button><button class="btn danger" data-act="tgUnlink">Disconnect</button></div>';
+  h+='<div id="tgMsg" class="msg" role="status"></div></div></details>';
+  /* share */
+  h+='<details class="acc"><summary><span>Public monitoring link<br><span class="mist small">Results only, never your key</span></span><span class="chip '+(m.shareToken?'warn':'')+'">'+(m.shareToken?'On':'Off')+'</span></summary><div class="in"><div class="line"><span>Let anyone with my link see my results</span><label class="sw"><input type="checkbox" id="swShare" '+(m.shareToken?'checked':'')+' aria-label="Public monitoring link"><i></i></label></div>';
+  if(m.shareToken)h+='<div class="line"><span>Also show my balance</span><label class="sw"><input type="checkbox" id="swShareBal" '+(m.shareShowBalance?'checked':'')+' aria-label="Show my balance"><i></i></label></div><input id="shUrl" readonly style="margin-top:8px" value="'+esc(location.origin+'/s/'+m.shareToken)+'" aria-label="Public link"><div class="btns"><button class="btn" data-act="copyLink">Copy link</button><button class="btn" data-act="newLink">Make a new link</button></div><p class="hint">Anyone with this link sees your username, results and closed trades. Never your API key. Making a new link stops the old one working.</p>';
+  h+='<div id="shMsg" class="msg" role="status"></div></div></details>';
+  /* password */
+  h+='<details class="acc"><summary><span>Password</span><span class="mist small">Change</span></summary><div class="in"><label class="l" for="cpCur">Current password</label><input id="cpCur" type="password" autocomplete="current-password"><label class="l" for="cpNew">New password (10+ characters)</label><input id="cpNew" type="password" autocomplete="new-password"><button class="btn pri block" data-act="changePw">Change password</button><p class="hint">Changing it signs you out on every other device.</p><div id="cpMsg" class="msg" role="status"></div></div></details>';
+  h+='</div><button class="btn block" data-act="logout">Log out</button>';
+  return h;
+}
+function render(){
+  if(!S.m)return;
+  var page=$('#page'),y=window.scrollY;
+  var openIds=$$('details.acc[open]',page).map(function(d){return d.querySelector('summary span').textContent.slice(0,12)});
+  page.innerHTML=S.ut==='home'?viewHome():S.ut==='trades'?viewTrades():viewSettings();
+  if(S.ut==='settings')$$('details.acc',page).forEach(function(d){if(openIds.indexOf(d.querySelector('summary span').textContent.slice(0,12))>-1)d.open=true});
+  bindHolds(page);
+  $$('#nav button').forEach(function(b){if(b.getAttribute('data-ut')===S.ut)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')});
+  window.scrollTo(0,y);
+}
+
+/* ---------- (the autopilot / manual sheet was retired in Standard v1) ---------- */
+function closeSheet(){var s=$('#sheet');if(s)s.hidden=true}
+HOLD.closeMine=function(){
+  msg('ctlMsg','Closing your trades…','warn');S.busy=1;
+  call('/api/me/close-all','POST',{confirm:true}).then(function(r){
+    S.busy=0;msg('ctlMsg',r.success?(r.closed?'Closed '+r.closed+' trade(s).':'You had no open trades.')+(r.failed?' '+r.failed+' could not be closed. Check Bybit.':''):(r.message||'Failed'),r.success&&!r.failed?'ok':'warn');S.open=null;show();
+  });
+};
+
+/* ---------- events ---------- */
+function saveLimits(){
+  var f=S.form,num=function(v){v=String(v).trim();return v===''?null:Number(v)},body={sizeMode:f.sizeMode,dailyLossLimitUsd:num(f.dailyLossLimitUsd)};
+  if(f.sizeMode==='fixed')body.sizeUsd=num(f.sizeUsd);if(f.sizeMode==='percent'){body.sizePct=num(f.sizePct);if(f.confirmHigh)body.confirmHigh=true}
+  call('/api/me/limits','POST',body).then(function(r){if(r.success)S.limDirty=false;msg('limMsg',r.success?'Saved.':(r.message||'Failed'),r.success?'ok':'err');if(r.success)show()});
+}
+document.addEventListener('click',function(e){
+  var t=e.target.closest('button');if(!t)return;
+  if(t.id==='tabSignup'){authTab('signup');return}
+  if(t.id==='tabLogin'){authTab('login');return}
+  if(t.id==='loginBtn'){doLogin();return}
+  if(t.id==='mcBtn'){call('/api/me/password','POST',{current:$('#mcCur').value,next:$('#mcNew').value}).then(function(r){if(!r.success){msg('mcMsg',r.message||'Failed','err');return}$('#mcCur').value='';$('#mcNew').value='';show()});return}
+  if(t.id==='suGo'){doSignup();return}
+  if(t.hasAttribute('data-supct')){S.su.pct=t.getAttribute('data-supct');S.su.confirmHigh=false;renderSignup();return}
+  if(t.hasAttribute('data-suenv')){S.su.env=t.getAttribute('data-suenv');renderSignup();return}
+  if(t.hasAttribute('data-nkenv')){S.nkEnv=t.getAttribute('data-nkenv');S.keyOpen=true;show();return}
+  if(t.hasAttribute('data-sunext')){suNext(Number(t.getAttribute('data-sunext')));return}
+  if(t.hasAttribute('data-ut')){S.ut=t.getAttribute('data-ut');S.tgCode=null;if(S.ut==='home')loadOpen().then(render);else if(S.ut==='trades')loadAct().then(render);else render();window.scrollTo(0,0);return}
+  if(t.hasAttribute('data-sm')&&S.form){S.form.sizeMode=t.getAttribute('data-sm');S.limDirty=true;render();return}
+  if(t.hasAttribute('data-preset')&&S.form){S.form.sizePct=t.getAttribute('data-preset');S.form.confirmHigh=false;S.limDirty=true;render();return}
+  if(t.hasAttribute('data-period')){S.period=Number(t.getAttribute('data-period'));loadSeries().then(render);return}
+  var a=t.getAttribute('data-act');if(!a)return;
+  if(a==='dismissNotice'){call('/api/me/notice/dismiss','POST').then(function(){show()});return}
+  if(a==='closeSheet'){closeSheet();return}
+  if(a==='saveLimits'){saveLimits();return}
+  if(a==='restorePlan'){arm(t,'Tap again to restore',function(){call('/api/me/reset-defaults','POST').then(function(r){if(r.success)S.limDirty=false;msg('limMsg',r.success?'Back to the standard size.':(r.message||'Failed'),r.success?'ok':'err');show()})});return}
+  if(a==='pauseClose'){arm(t,'Tap again: pause and close everything',function(){msg('ctlMsg','Closing your trades…','warn');call('/api/me/pause','POST',{paused:true,closeAll:true}).then(function(r){if(!r.success){msg('ctlMsg',r.message||'Failed','err');return}msg('ctlMsg',r.closed?'Paused. Closed '+r.closed.closed+' trade(s)'+(r.closed.failed?', '+r.closed.failed+' could not be closed. Check Bybit.':'.'):'Paused.',r.closed&&r.closed.failed?'warn':'ok');S.open=null;show()})});return}
+  if(a==='replaceKey'){call('/api/me/key','POST',{apiKey:$('#nkKey').value,apiSecret:$('#nkSecret').value,env:S.nkEnv||undefined}).then(function(r){if(!r.success){msg('nkMsg',r.message||'Failed','err');return}$('#nkKey').value='';$('#nkSecret').value='';S.nkEnv=null;S.keyOpen=false;msg('nkMsg',r.switched?'Switched to '+r.env+'. Trading is paused, press Resume when you are ready.':'Key updated.','ok');show()});return}
+  if(a==='removeKey'){arm(t,'Tap again to remove your key',function(){call('/api/me/remove-key','POST').then(function(){show()})});return}
+  if(a==='tfaSetup'){call('/api/me/2fa/setup','POST').then(function(r){if(!r.success){msg('tfaMsg',r.message||'Failed','err');return}S.tfaSetup={secret:r.secret,uri:r.uri};render();var d=$$('details.acc')[1];if(d)d.open=true});return}
+  if(a==='tfaEnable'){call('/api/me/2fa/enable','POST',{code:$('#tfaCode').value}).then(function(r){if(!r.success){msg('tfaMsg',r.message||'Failed','err');return}S.tfaSetup=null;toast('2-factor login is on');show()});return}
+  if(a==='tfaDisable'){call('/api/me/2fa/disable','POST',{password:$('#tfaDisPw').value,code:$('#tfaDisCode').value}).then(function(r){if(!r.success){msg('tfaMsg',r.message||'Failed','err');return}toast('2-factor login is off');show()});return}
+  if(a==='tgLink'){call('/api/me/telegram/link','POST').then(function(r){if(!r.success){msg('tgMsg',r.message||'Failed','err');return}S.tgCode=r;render();var d=$$('details.acc')[2];if(d)d.open=true;var tries=0;clearInterval(S.tgPoll);S.tgPoll=setInterval(function(){tries++;call('/api/me').then(function(m){if((m.telegram&&m.telegram.linked)||tries>90){clearInterval(S.tgPoll);S.tgCode=null;show()}})},4000)});return}
+  if(a==='tgUnlink'){call('/api/me/telegram/unlink','POST').then(function(){show()});return}
+  if(a==='tgTest'){call('/api/me/telegram/test','POST').then(function(r){msg('tgMsg',r.success?'Test sent. Check Telegram.':(r.message||'Failed'),r.success?'ok':'err')});return}
+  if(a==='copyLink'){copy($('#shUrl').value,'Link copied');return}
+  if(a==='newLink'){arm(t,'Tap again: old link stops working',function(){call('/api/me/share','POST',{regenerate:true}).then(function(r){msg('shMsg',r.success?'New link ready. The old one no longer works.':(r.message||'Failed'),r.success?'ok':'err');show()})});return}
+  if(a==='changePw'){call('/api/me/password','POST',{current:$('#cpCur').value,next:$('#cpNew').value}).then(function(r){if(!r.success){msg('cpMsg',r.message||'Failed','err');return}$('#cpCur').value='';$('#cpNew').value='';msg('cpMsg','Password changed. Other devices were signed out.','ok')});return}
+  if(a==='logout'){logout();return}
+});
+document.addEventListener('input',function(e){
+  var t=e.target;
+  if(t.hasAttribute('data-su')){S.su[t.getAttribute('data-su')]=t.value;if(t.getAttribute('data-su')==='pct'){var pc=Number(t.value),ex=500*pc/100,pv=$('#suPrev'),hi=$('#suHigh');if(pv)pv.textContent=pc>0?'On a $500 account, '+pc+'% means about $'+(ex<10?ex.toFixed(2):Math.round(ex))+' of your own money on each trade (about $'+Math.round(ex*10)+' of position at 10x).':'Enter a percent between 1 and 30.';if(hi)hi.hidden=!(pc>20)}return}
+  if(t.hasAttribute('data-f')&&S.form){S.form[t.getAttribute('data-f')]=t.value;S.limDirty=true;gaugeNow()}
+});
+document.addEventListener('change',function(e){
+  var t=e.target;
+  if(t.id==='suAck'){S.su.ack=t.checked;return}
+  if(t.id==='suConfirmHigh'){S.su.confirmHigh=t.checked;return}
+  if(t.id==='limConfirm'&&S.form){S.form.confirmHigh=t.checked;return}
+  if(t.id==='swPause'){call('/api/me/pause','POST',{paused:t.checked}).then(function(){show()});return}
+  if(t.id==='swTg'){call('/api/me/telegram/notify','POST',{enabled:t.checked});return}
+  if(t.id==='swShare'||t.id==='swShareBal'){call('/api/me/share','POST',{enabled:$('#swShare').checked,showBalance:$('#swShareBal')?$('#swShareBal').checked:S.m.shareShowBalance}).then(function(r){if(!r.success)msg('shMsg',r.message||'Failed','err');show()});return}
+});
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape')closeSheet();
+  if(e.key==='Enter'&&(e.target.id==='liPass'||e.target.id==='liTotp'))doLogin();
+});
+$('#sheet').addEventListener('click',function(e){if(e.target===this)closeSheet()});
+authTab('signup');
+fetch('/api/public-info').then(function(r){return r.json()}).then(function(j){S.demoKeys=j.demoKeys!==false;if(j.outboundIps){S.ipHelp=' Whitelist this server IP on the key: '+j.outboundIps+'.';if(S.suStep===1)renderSignup()}}).catch(function(){});
+show();
+/* deep link from the landing page: /join#login or /join#signup opens that tab */
+try{var _h=(location.hash||'').replace('#','');if(_h==='login'||_h==='signup'){if(!$('#authView').hidden)authTab(_h);else{var _t=setInterval(function(){if(!$('#authView').hidden){clearInterval(_t);authTab(_h)}},100);setTimeout(function(){clearInterval(_t)},3000)}}}catch(e){}
+
+})();
+</script>
+</body>
+</html>

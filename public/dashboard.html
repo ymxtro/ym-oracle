@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="midnight">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YM Oracle</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script>
+// Applied before first paint so the saved theme never flashes. Preferences live in this browser only.
+(function () {
+  try {
+    var v = JSON.parse(localStorage.getItem('ym_dash_prefs') || '{}');
+    if (v && v.theme) document.documentElement.setAttribute('data-theme', v.theme);
+    if (v && v.layout) document.documentElement.setAttribute('data-layout', v.layout);
+  } catch (e) {}
+})();
+</script>
+<style>
+:root, :root[data-theme="midnight"] {
+  --bg:#0a0c10; --panel:#161a22; --line:#242938; --line2:#1f2430; --mist:#8891a3; --paper:#eef1f6;
+  --accent:#8b5cf6; --accentText:#a78bfa; --long:#22c55e; --short:#ef4444; --shortText:#f87171; --pending:#f2b134;
+  --hero:linear-gradient(135deg,#1e2436,#161a22); --longTint:#1a2e22; --shortTint:#2e1a1a;
+  --warnBg:#2a2416; --warnBorder:#4a3d1a; --failBg:#2a1a1e; --failBorder:#4a2a30; --chip:#1e222c;
+  --overlay:rgba(0,0,0,.6); --shadow:0 4px 12px rgba(0,0,0,.25); --shadowBig:0 8px 24px rgba(0,0,0,.35); --glow:rgba(34,197,94,.18);
+}
+:root[data-theme="graphite"] {
+  --bg:#0f1012; --panel:#1a1b1e; --line:#2a2c31; --line2:#232529; --mist:#9a9da6; --paper:#f1f2f4;
+  --accent:#e4e6eb; --accentText:#e4e6eb; --long:#4ade80; --short:#f87171; --shortText:#f87171; --pending:#f2b134;
+  --hero:linear-gradient(135deg,#25272c,#1a1b1e); --longTint:#1c2a21; --shortTint:#2b1d1d;
+  --warnBg:#2a2518; --warnBorder:#4a3f1f; --failBg:#2b1d1f; --failBorder:#4b2d31; --chip:#25272b;
+  --overlay:rgba(0,0,0,.6); --shadow:0 4px 12px rgba(0,0,0,.25); --shadowBig:0 8px 24px rgba(0,0,0,.35); --glow:rgba(74,222,128,.18);
+}
+:root[data-theme="daylight"] {
+  --bg:#f4f5f8; --panel:#ffffff; --line:#e2e5ec; --line2:#eceef3; --mist:#6a7285; --paper:#12151c;
+  --accent:#6d28d9; --accentText:#6d28d9; --long:#15803d; --short:#dc2626; --shortText:#dc2626; --pending:#b45309;
+  --hero:linear-gradient(135deg,#ffffff,#eceffa); --longTint:#dcfce7; --shortTint:#fee2e2;
+  --warnBg:#fef6e0; --warnBorder:#f3dfa2; --failBg:#fdecec; --failBorder:#f5c6c6; --chip:#eceef3;
+  --overlay:rgba(20,24,34,.35); --shadow:0 2px 10px rgba(30,40,70,.07); --shadowBig:0 8px 24px rgba(30,40,70,.10); --glow:rgba(21,128,61,.16);
+}
+:root[data-theme="aurora"] {
+  --bg:#070b14; --panel:#0e1626; --line:#1b2740; --line2:#16213a; --mist:#7f8fae; --paper:#e8f0ff;
+  --accent:#22d3ee; --accentText:#67e8f9; --long:#34d399; --short:#fb7185; --shortText:#fb7185; --pending:#fbbf24;
+  --hero:linear-gradient(135deg,#12223d,#0e1626); --longTint:#10291f; --shortTint:#2d1520;
+  --warnBg:#2a2414; --warnBorder:#4a3c19; --failBg:#2c1520; --failBorder:#4d2535; --chip:#16213a;
+  --overlay:rgba(0,4,12,.65); --shadow:0 4px 12px rgba(0,0,0,.3); --shadowBig:0 8px 24px rgba(0,0,0,.4); --glow:rgba(52,211,153,.2);
+}
+:root[data-theme="ember"] {
+  --bg:#0f0b09; --panel:#1b1411; --line:#2e231d; --line2:#251c17; --mist:#a29084; --paper:#f6ede6;
+  --accent:#fb923c; --accentText:#fdba74; --long:#4ade80; --short:#f87171; --shortText:#f87171; --pending:#facc15;
+  --hero:linear-gradient(135deg,#2a1c14,#1b1411); --longTint:#1b2a1d; --shortTint:#2e1a17;
+  --warnBg:#2b2312; --warnBorder:#4d3d17; --failBg:#2d1a18; --failBorder:#4e2c28; --chip:#251c17;
+  --overlay:rgba(8,4,2,.65); --shadow:0 4px 12px rgba(0,0,0,.3); --shadowBig:0 8px 24px rgba(0,0,0,.4); --glow:rgba(74,222,128,.18);
+}
+:root[data-theme="paper"] {
+  --bg:#f6f1e8; --panel:#fffdf8; --line:#e6dece; --line2:#eee7d8; --mist:#7d725f; --paper:#2a241a;
+  --accent:#b45309; --accentText:#b45309; --long:#2f7d4f; --short:#c2410c; --shortText:#c2410c; --pending:#a16207;
+  --hero:linear-gradient(135deg,#fffdf8,#f0e8d6); --longTint:#e3f1e6; --shortTint:#fbe6dc;
+  --warnBg:#fbf0d2; --warnBorder:#ead9a1; --failBg:#fbe9e2; --failBorder:#efc9bb; --chip:#eee7d8;
+  --overlay:rgba(40,30,15,.35); --shadow:0 2px 10px rgba(80,60,20,.08); --shadowBig:0 8px 24px rgba(80,60,20,.12); --glow:rgba(47,125,79,.16);
+}
+*{box-sizing:border-box}
+html{background:var(--bg)}
+body{margin:0;background:var(--bg);color:var(--paper);font-family:'IBM Plex Sans',Arial,sans-serif;font-size:14px;font-variant-numeric:tabular-nums;padding-bottom:56px;transition:background .35s,color .35s;-webkit-tap-highlight-color:transparent}
+button{font:inherit;color:inherit;cursor:pointer;background:transparent;border:0;padding:0}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.long{color:var(--long)} .short{color:var(--shortText)} .mist{color:var(--mist)}
+.lbl{font-size:11px;color:var(--mist);text-transform:uppercase;letter-spacing:.5px}
+.banner{background:#f2b134;color:#3a2a02;padding:8px 20px;font-size:12px;font-weight:500;display:flex;align-items:center;justify-content:center;gap:8px}
+.banner i{width:6px;height:6px;border-radius:50%;background:#3a2a02;display:inline-block}
+.wrap{max-width:1180px;margin:0 auto;padding:0 20px}
+.glance .wrap{max-width:560px}
+.top{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding-top:20px}
+.brand{display:flex;align-items:center;gap:10px;font-family:'IBM Plex Mono',monospace;font-size:15px;font-weight:500}
+.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pill{display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:8px 14px;font-size:12px;font-weight:500;min-height:36px}
+.pill .hint{color:var(--mist);font-weight:400}
+.dotc{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+.sw{width:40px;height:22px;border-radius:11px;position:relative;display:inline-block;flex:none;transition:background .2s}
+.sw b{position:absolute;top:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.4);transition:left .2s}
+.halt{padding:6px 12px 6px 14px;gap:10px}
+.gear{width:36px;height:36px;display:flex;align-items:center;justify-content:center;background:var(--panel);border:1px solid var(--line);border-radius:50%;color:var(--mist)}
+.syncline{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;font-size:12px;color:var(--mist);margin-top:12px}
+.cols{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;margin-top:16px}
+.col1{flex:999 1 600px;min-width:0;display:flex;flex-direction:column;gap:16px}
+.col2{flex:1 1 320px;min-width:0;display:flex;flex-direction:column;gap:16px}
+.card{background:var(--panel);border-radius:16px;padding:16px 18px;box-shadow:var(--shadow);transition:background .35s}
+.hero{background:var(--hero);border-radius:20px;padding:22px;box-shadow:var(--shadowBig)}
+.chead{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.count{background:var(--line);color:var(--paper);font-size:11px;border-radius:999px;padding:1px 8px}
+.link{color:var(--mist);font-size:12px;padding:8px 0 8px 12px;min-height:36px}
+.link.acc{color:var(--accentText);font-weight:500}
+.empty{padding:24px 0 8px;text-align:center;color:var(--mist);font-size:13px}
+.item{display:flex;flex-wrap:wrap;gap:8px 14px;justify-content:space-between;align-items:center;padding:13px 0 3px;margin-top:12px;border-top:1px solid var(--line)}
+.trow{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 0;border-top:1px solid var(--line2)}
+.av{border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600;flex:none}
+.av.long{background:var(--longTint);color:var(--long)} .av.short{background:var(--shortTint);color:var(--shortText)}
+.brow{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--line2)}
+.alert{padding:11px 0 4px;border-top:1px solid;margin-top:10px}
+.kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+.kpis small{display:block;font-size:11px;color:var(--mist);margin-bottom:4px}
+.kpis b{font-size:18px;font-weight:500}
+.chartbox{position:relative;margin-top:16px}
+.chartbox svg{width:100%;height:120px;display:block}
+.chartbox .dot{position:absolute;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;border-radius:50%;box-shadow:0 0 0 4px var(--glow)}
+/* glance */
+.gbal{text-align:center;padding:44px 0 8px}
+.gbal .big{font-size:56px;font-weight:500;letter-spacing:-1.5px;line-height:1}
+.gstat{text-align:center;padding:14px 8px 0;font-size:14px;line-height:1.55}
+.acc-wrap{margin-top:36px;border-top:1px solid var(--line2)}
+.acc-item{border-bottom:1px solid var(--line2)}
+.acc-head{width:100%;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:16px 0;min-height:56px;text-align:left}
+.acc-head .t{font-size:14px;font-weight:500}
+.acc-head .s{display:flex;align-items:center;gap:10px;font-size:12px}
+.acc-head .c{color:var(--mist);font-size:16px;line-height:1;width:12px;text-align:center}
+.acc-body{padding:0 0 12px}
+.abox{border-radius:12px;padding:12px 14px;margin-bottom:8px}
+/* overlays */
+.scrim{position:fixed;inset:0;background:var(--overlay);z-index:30}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(380px,100%);background:var(--panel);border-left:1px solid var(--line);box-shadow:-12px 0 32px rgba(0,0,0,.35);z-index:31;padding:22px 20px;overflow:auto}
+.navlink{display:flex;justify-content:space-between;align-items:center;padding:13px 0;border-top:1px solid var(--line);font-size:13px;color:var(--paper);text-decoration:none;min-height:48px}
+.navlink small{color:var(--mist);font-size:11px}
+.fld{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:11px 12px;color:var(--paper);font:inherit;font-size:13px;margin-bottom:10px}
+.opt{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:26px}
+.optb{background:var(--bg);border:1.5px solid var(--line);border-radius:14px;padding:12px;text-align:left;transition:border-color .2s}
+.optb.on{border-color:var(--accent)}
+.modal{position:fixed;inset:0;background:var(--overlay);display:flex;align-items:center;justify-content:center;padding:20px;z-index:40}
+.mbox{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:22px 20px;max-width:320px;width:100%;box-shadow:0 12px 32px rgba(0,0,0,.4)}
+.mbox input{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:11px 12px;color:var(--paper);font:inherit;font-size:14px;margin-bottom:16px}
+.mbtn{flex:1;border-radius:10px;padding:12px;font-size:13px;min-height:44px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="overlays"></div>
+
+<script>
+// ---------------------------------------------------------------------------------------------------------------------
+// Auth: same behaviour as before. One prompt per bad password, never a cascade (see HANDOFF.md).
+// ---------------------------------------------------------------------------------------------------------------------
+function getPassword(){ try { return localStorage.getItem('ym_dash_pw') || ''; } catch(e){ return ''; } }
+function setPassword(v){ try { localStorage.setItem('ym_dash_pw', v); } catch(e){} }
+let authDeclinedUntil = 0;
+async function api(path, opts){
+  opts = opts || {};
+  const sentPw = getPassword();
+  const headers = Object.assign({}, opts.headers || {}, {'Content-Type':'application/json','X-Dashboard-Password':sentPw});
+  const res = await fetch(path, Object.assign({}, opts, {headers}));
+  if(res.status === 401){
+    if(getPassword() !== sentPw) return api(path, opts);
+    if(Date.now() < authDeclinedUntil) throw new Error('Unauthorized');
+    const pw = prompt('Enter dashboard password:');
+    if(pw !== null){ setPassword(pw); return api(path, opts); }
+    authDeclinedUntil = Date.now() + 5000;
+    throw new Error('Unauthorized');
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Preferences (this browser only)
+// ---------------------------------------------------------------------------------------------------------------------
+const THEMES = [
+  {k:'midnight', name:'Midnight', note:'The default', bg:'#0a0c10', panel:'#161a22', accent:'#8b5cf6', long:'#22c55e', short:'#ef4444', mist:'#8891a3', paper:'#eef1f6', line:'#242938'},
+  {k:'graphite', name:'Graphite', note:'Neutral and quiet', bg:'#0f1012', panel:'#1a1b1e', accent:'#e4e6eb', long:'#4ade80', short:'#f87171', mist:'#9a9da6', paper:'#f1f2f4', line:'#2a2c31'},
+  {k:'daylight', name:'Daylight', note:'Light, for bright rooms', bg:'#f4f5f8', panel:'#ffffff', accent:'#6d28d9', long:'#15803d', short:'#dc2626', mist:'#6a7285', paper:'#12151c', line:'#e2e5ec'},
+  {k:'aurora', name:'Aurora', note:'Deep blue, cyan edge', bg:'#070b14', panel:'#0e1626', accent:'#22d3ee', long:'#34d399', short:'#fb7185', mist:'#7f8fae', paper:'#e8f0ff', line:'#1b2740'},
+  {k:'ember', name:'Ember', note:'Warm dark, easy at night', bg:'#0f0b09', panel:'#1b1411', accent:'#fb923c', long:'#4ade80', short:'#f87171', mist:'#a29084', paper:'#f6ede6', line:'#2e231d'},
+  {k:'paper', name:'Paper', note:'Warm light, low glare', bg:'#f6f1e8', panel:'#fffdf8', accent:'#b45309', long:'#2f7d4f', short:'#c2410c', mist:'#7d725f', paper:'#2a241a', line:'#e6dece'}
+];
+const prefs = {theme:'midnight', layout:'cockpit', hide:false};
+(function loadPrefs(){
+  try {
+    const v = JSON.parse(localStorage.getItem('ym_dash_prefs') || '{}');
+    if (v && THEMES.some(t => t.k === v.theme)) prefs.theme = v.theme;
+    if (v && (v.layout === 'glance' || v.layout === 'cockpit')) prefs.layout = v.layout;
+    prefs.hide = !!(v && v.hide);
+  } catch(e){}
+})();
+function savePrefs(){
+  try { localStorage.setItem('ym_dash_prefs', JSON.stringify(prefs)); } catch(e){}
+  document.documentElement.setAttribute('data-theme', prefs.theme);
+  document.documentElement.setAttribute('data-layout', prefs.layout);
+}
+document.documentElement.setAttribute('data-theme', prefs.theme);
+document.documentElement.setAttribute('data-layout', prefs.layout);
+
+// ---------------------------------------------------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------------------------------------------------
+const ACTIVE_BOT_NAMES = ['YM ORACLE I', 'YM ORACLE II', 'YM ORACLE III', 'YM ORACLE IV']; // all four bots (IV = the swing bot). Keep identical to SERVER_TRACKED_BOT_NAMES in server.js and the manager's PING_BOT_NAMES
+const PING_UI_WAIT_MS = 30000;   // manager poll 10s + reply window 15s + slack; keep >= those
+const LATE_AFTER_SECS = 270;     // fallback only; the real value comes from /api/fleet-status
+const S = {
+  loaded:false, mode:'paper', halted:false, balance:null, available:null,
+  positions:[], closed:[], bots:null, lateAfter:LATE_AFTER_SECS, exec:null, sync:null,
+  pingState:null, pingResults:null, pingStartedAt:0,
+  confirmHalt:false, confirmClear:false, testState:'idle', execOpen:false,
+  acct:null, acctOpen:false, acctEnv:'live', acctKey:'', acctSecret:'', acctMsg:null, acctBusy:false, acctConfirm:false, acctResetArm:false,
+  open:{}, settingsOpen:false, liveModal:false, liveText:'', liveErr:false, updatedAt:0
+};
+let timers = {};
+
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money = (n, d) => Number(n).toLocaleString('en-US', {minimumFractionDigits: d == null ? 2 : d, maximumFractionDigits: d == null ? 2 : d});
+const signed = n => (n >= 0 ? '+$' : '−$') + money(Math.abs(n));
+const mk = x => (prefs.hide ? '••••' : x);
+const cls = n => (n >= 0 ? 'long' : 'short');
+const shortBot = n => String(n).replace('YM ORACLE ', 'Oracle ');
+const updTxt = () => (S.updatedAt ? ago((Date.now() - S.updatedAt) / 1000) + ' ago' : '…');
+const ago = secs => secs < 60 ? Math.round(secs) + 's' : (secs < 3600 ? Math.round(secs / 60) + 'm' : Math.round(secs / 3600) + 'h');
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Derived
+// ---------------------------------------------------------------------------------------------------------------------
+function derive(){
+  const closed = S.closed;
+  const total = closed.reduce((a, t) => a + (parseFloat(t.realizedPnl) || 0), 0);
+  const wins = closed.filter(t => parseFloat(t.realizedPnl) > 0).length;
+  const avgRoi = closed.length ? closed.reduce((a, t) => a + (parseFloat(t.roiPct) || 0), 0) / closed.length : 0;
+  const sorted = closed.slice().sort((a, b) => new Date(b.closedAt || 0) - new Date(a.closedAt || 0));
+  const dayAgo = Date.now() - 86400000;
+  const today = closed.filter(t => t.closedAt && new Date(t.closedAt).getTime() >= dayAgo).reduce((a, t) => a + (parseFloat(t.realizedPnl) || 0), 0);
+  const upl = S.positions.reduce((a, p) => a + (parseFloat(p.unrealisedPnl) || 0), 0);
+  // bots
+  const now = Date.now();
+  let bots = [];
+  if (S.bots) {
+    bots = ACTIVE_BOT_NAMES.map(name => {
+      const b = S.bots.find(x => x.name === name);
+      if (!b) return {name, state:'offline', sub:'No heartbeat yet'};
+      const secs = Math.round((now - b.lastSeenAt) / 1000);
+      const state = !b.online ? 'offline' : (secs > S.lateAfter ? 'late' : 'online');
+      return {name, state, sub: state === 'late' ? 'Late · ' + ago(secs) + ' ago' : (state === 'offline' ? 'Offline · ' + ago(secs) : ago(secs) + ' ago')};
+    });
+  }
+  if (S.pingState) {
+    bots = ACTIVE_BOT_NAMES.map(name => {
+      const r = S.pingResults && S.pingResults[name];
+      if (S.pingState === 'wait') {
+        if (!r) return {name, state:'late', sub:'Waiting… ' + Math.floor((now - S.pingStartedAt) / 1000) + 's'};
+        return r.timeout ? {name, state:'offline', sub:'Timeout'} : {name, state:'online', sub:r.ms + ' ms'};
+      }
+      if (!r) return {name, state:'offline', sub:'No response'};
+      return r.timeout ? {name, state:'offline', sub:'Timeout'} : {name, state:'online', sub:r.ms + ' ms'};
+    });
+  }
+  const nOff = bots.filter(b => b.state === 'offline').length, nLate = bots.filter(b => b.state === 'late').length;
+  const nOn = bots.length - nOff;
+  // alerts from the Bybit execution reports (same rule as before: red/amber since last dismissed)
+  let reports = [], alerts = [];
+  if (S.exec && S.exec.reports) {
+    reports = S.exec.reports.slice().sort((a, b) => b.at - a.at);
+    let since = 0; try { since = parseInt(localStorage.getItem('ymExecDismissedAt') || '0', 10) || 0; } catch(e){}
+    alerts = reports.filter(x => (x.sev === 'fail' || x.sev === 'warn') && x.at > since);
+  }
+  // sync sentence
+  let sync = {color:'var(--mist)', text:'Checking sync…'};
+  const y = S.sync;
+  if (S.mode === 'paper') sync = {color:'var(--mist)', text:'Paper mode: nothing is sent to Bybit'};
+  else if (y) {
+    if (y.lastError && (!y.lastOkAt || now - y.lastOkAt > 180000)) sync = {color:'var(--pending)', text:'Cannot check Bybit right now'};
+    else if (y.lastRecovered && now - y.lastRecovered.at < 3600000) sync = {color:'var(--pending)', text:'Bybit showed an open trade the log was missing (' + String(y.lastRecovered.symbol || '').replace(/USDT$/, '') + '). It was added automatically'};
+    else if (y.staleOpen > 0) sync = {color:'var(--pending)', text:y.staleOpen + ' logged open trade' + (y.staleOpen > 1 ? 's are' : ' is') + ' not open on Bybit'};
+    else if (y.masterOpen != null) sync = {color:'var(--long)', text:'In step with Bybit · ' + y.masterOpen + ' open, all logged'};
+  }
+  const problems = alerts.length + nOff + nLate + (sync.color === 'var(--pending)' ? 1 : 0);
+  let status;
+  if (S.mode === 'paper') status = {color:'var(--mist)', text:'Paper mode. Nothing is sent to Bybit.'};
+  else if (S.halted) status = {color:'var(--pending)', text:'Trading is halted. New signals are ignored.'};
+  else if (problems) {
+    const bits = [];
+    if (alerts.length) bits.push(alerts.length + (alerts.length > 1 ? ' order alerts' : ' order alert'));
+    if (nOff) bits.push(nOff + (nOff > 1 ? ' bots offline' : ' bot offline'));
+    if (nLate) bits.push(nLate + ' late');
+    if (!bits.length) bits.push(sync.text.toLowerCase());
+    status = {color:'var(--pending)', text:'Needs a look: ' + bits.join(', ') + '.'};
+  } else status = {color:'var(--long)', text:'All good. Every bot is online and the log is in step with Bybit.'};
+  return {closed, sorted, total, wins, avgRoi, today, upl, bots, nOff, nLate, nOn, reports, alerts, sync, status};
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Pieces
+// ---------------------------------------------------------------------------------------------------------------------
+function chartSvg(D, h, gid){
+  if (D.closed.length < 2) return {svg:'', dot:''};
+  const chron = D.closed.slice().sort((a, b) => new Date(a.closedAt || 0) - new Date(b.closedAt || 0));
+  let run = 0; const ser = chron.map(t => (run += parseFloat(t.realizedPnl) || 0));
+  const mn = Math.min(0, Math.min.apply(null, ser)), mx = Math.max(0, Math.max.apply(null, ser)), rg = (mx - mn) || 1;
+  const pts = ser.map((v, i) => [(i / (ser.length - 1)) * 600, (h - 8) - ((v - mn) / rg) * (h - 16)]);
+  const str = pts.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
+  const col = D.total >= 0 ? 'var(--long)' : 'var(--short)';
+  const svg = '<svg viewBox="0 0 600 ' + h + '" preserveAspectRatio="none" role="img" aria-label="Profit and loss since the log was last cleared">' +
+    '<defs><linearGradient id="' + gid + '" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="' + col + '" stop-opacity=".28"/><stop offset="1" stop-color="' + col + '" stop-opacity="0"/></linearGradient></defs>' +
+    '<path d="M0,' + h + ' L' + str.split(' ').join(' L') + ' L600,' + h + ' Z" fill="url(#' + gid + ')"/>' +
+    '<polyline points="' + str + '" fill="none" stroke="' + col + '" stroke-width="2" style="vector-effect:non-scaling-stroke"/></svg>';
+  const dot = '<span class="dot" style="left:100%;top:' + (pts[pts.length - 1][1] / h * 100).toFixed(1) + '%;background:' + col + '"></span>';
+  return {svg, dot};
+}
+function posView(p){
+  const upl = parseFloat(p.unrealisedPnl) || 0;
+  const margin = (parseFloat(p.positionValue) || 0) / (parseFloat(p.leverage) || 1);
+  const pct = margin > 0 ? (upl >= 0 ? '+' : '−') + Math.abs(upl / margin * 100).toFixed(1) + '%' : '';
+  const isLong = p.side === 'Buy';
+  return {sym:String(p.symbol || '').replace(/USDT$/, ''), isLong, dir:isLong ? 'LONG' : 'SHORT', upl, pct, size:p.size, lev:p.leverage, entry:p.entryPrice, mark:p.markPrice};
+}
+function tradeView(t){
+  const pnl = parseFloat(t.realizedPnl) || 0, roi = parseFloat(t.roiPct) || 0;
+  const secs = t.closedAt ? Math.max(0, (Date.now() - new Date(t.closedAt).getTime()) / 1000) : null;
+  return {sym:String(t.symbol || '').replace(/USDT$/, ''), isLong:t.side === 'Buy', pnl, roi, ago: secs == null ? '' : ago(secs)};
+}
+function posListCockpit(D){
+  if (!S.positions.length) return '<div class="empty">' + (S.mode === 'paper' ? 'Paper mode: nothing is open on Bybit.' : 'No open positions.') + '</div>';
+  return S.positions.map(posView).map(p =>
+    '<div class="item"><div class="row" style="gap:12px;min-width:150px;flex-wrap:nowrap"><div class="av ' + (p.isLong ? 'long' : 'short') + '" style="width:34px;height:34px;font-size:12px">' + (p.isLong ? 'L' : 'S') + '</div>' +
+    '<div><div style="font-weight:500">' + esc(p.sym) + ' <span class="' + (p.isLong ? 'long' : 'short') + '" style="font-size:12px">' + p.dir + '</span></div><div class="mist" style="font-size:11px;margin-top:2px">' + esc(p.size) + ' · ' + esc(p.lev) + 'x</div></div></div>' +
+    '<div class="mist" style="font-size:12px;flex:1 1 150px;min-width:0">' + esc(p.entry) + ' → <span style="color:var(--paper)">' + esc(p.mark) + '</span></div>' +
+    '<div style="text-align:right;min-width:90px"><div class="' + cls(p.upl) + '" style="font-weight:500">' + mk(signed(p.upl)) + '</div><div class="' + cls(p.upl) + '" style="font-size:11px;margin-top:2px">' + p.pct + '</div></div></div>').join('');
+}
+function tradeListCockpit(D){
+  if (!D.sorted.length) return '<div class="empty">No trades yet. Closed trades will appear here.</div>';
+  return D.sorted.slice(0, 6).map(tradeView).map(t =>
+    '<div class="trow"><div class="row" style="gap:12px;flex-wrap:nowrap"><div class="av ' + (t.isLong ? 'long' : 'short') + '" style="width:30px;height:30px;font-size:11px">' + (t.isLong ? 'L' : 'S') + '</div>' +
+    '<div><div style="font-weight:500;font-size:13px">' + esc(t.sym) + '</div><div class="mist" style="font-size:11px;margin-top:1px">' + (t.ago ? 'Closed ' + t.ago + ' ago' : 'Closed') + '</div></div></div>' +
+    '<div style="text-align:right"><div class="' + cls(t.pnl) + '" style="font-weight:500;font-size:13px">' + mk(signed(t.pnl)) + '</div><div class="mist" style="font-size:11px;margin-top:1px">' + (t.roi >= 0 ? '+' : '−') + Math.abs(t.roi).toFixed(1) + '% ROI</div></div></div>').join('');
+}
+function botListHtml(D, pad){
+  if (!D.bots.length) return '<div class="empty" style="padding:14px 0 4px">No heartbeats received yet</div>';
+  return D.bots.map(b => {
+    const c = b.state === 'offline' ? 'var(--short)' : b.state === 'late' ? 'var(--pending)' : 'var(--long)';
+    const tc = b.state === 'offline' ? 'var(--shortText)' : b.state === 'late' ? 'var(--pending)' : (S.pingState === 'done' || S.pingState === 'wait' ? 'var(--long)' : 'var(--mist)');
+    return '<div class="brow"><div class="row" style="gap:10px;flex-wrap:nowrap;min-width:0"><span class="dotc" style="background:' + c + '"></span><span style="font-size:13px;font-weight:500">' + esc(shortBot(b.name)) + '</span></div><span style="font-size:12px;color:' + tc + ';white-space:nowrap">' + esc(b.sub) + '</span></div>';
+  }).join('');
+}
+function execLine(x){
+  const nm = String(x.symbol || '?').replace(/USDT$/, '');
+  const dir = x.side === 'BUY' ? ' long' : (x.side === 'SELL' ? ' short' : '');
+  const kind = x.kind === 'SLTP' ? 'stop update' : (x.kind === 'CLOSE' ? 'close' : 'order');
+  return nm + dir + ' ' + kind;
+}
+function alertColor(sev){ return sev === 'fail' ? 'var(--shortText)' : (sev === 'warn' ? 'var(--pending)' : 'var(--mist)'); }
+function alertsInner(D, withDetail){
+  const rows = (S.execOpen ? D.reports.slice(0, 6) : D.alerts);
+  if (!rows.length) return '<div class="row" style="gap:10px;padding:14px 0 6px;color:var(--long);font-size:13px"><span class="dotc" style="background:var(--long)"></span>All clear. Every order went through.</div>';
+  return rows.map(x => {
+    const t = String(x.text || ''), more = (x.sev !== 'quiet' && x.detail) ? '. ' + String(x.detail).charAt(0).toUpperCase() + String(x.detail).slice(1) : '';
+    return '<div class="alert" style="border-color:' + (D.alerts.some(a => a.sev === 'fail') ? 'var(--failBorder)' : D.alerts.length ? 'var(--warnBorder)' : 'var(--line2)') + '">' +
+      '<div class="chead" style="font-size:13px;align-items:flex-start"><span><span style="color:' + alertColor(x.sev) + '">●</span> ' + esc(execLine(x)) + (x.sev === 'fail' ? ' failed' : '') + '</span><span class="mist" style="font-size:12px;white-space:nowrap">' + ago(Math.max(0, (Date.now() - x.at) / 1000)) + ' ago</span></div>' +
+      '<div style="font-size:12px;color:' + alertColor(x.sev) + ';margin:4px 0 0 16px;line-height:1.5">' + esc(t + more) + '</div></div>';
+  }).join('');
+}
+function testLabel(){ return {idle:['Send test alert','var(--mist)'], busy:['Sending…','var(--mist)'], sent:['Sent. Check Telegram','var(--long)'], none:['Not configured','var(--shortText)'], fail:['Failed','var(--shortText)']}[S.testState]; }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Header (both layouts)
+// ---------------------------------------------------------------------------------------------------------------------
+function headerHtml(D, withHalt){
+  const live = S.mode === 'live';
+  return '<div class="top"><a class="brand" href="/" aria-label="Home" style="color:inherit;text-decoration:none"><svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true"><path d="M11 2 20 11 11 20 2 11Z" fill="none" stroke="var(--accent)" stroke-width="1.6"/><path d="M11 7 15 11 11 15 7 11Z" fill="var(--accent)"/></svg>YM Oracle</a>' +
+    '<div class="row">' +
+    '<button class="pill" data-act="mode" aria-label="' + (live ? 'Switch to paper trading' : 'Switch to live trading') + '"><span class="dotc" style="background:' + (live ? 'var(--long)' : 'var(--pending)') + '"></span>' + (live ? 'Live' : 'Paper') + '<span class="hint">' + (live ? 'Switch to paper' : 'Go live') + '</span></button>' +
+    (withHalt ? haltBtn(false) : '') +
+    '<button class="gear" data-act="settings" aria-label="Appearance settings"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M2 4.5h7M12 4.5h2M2 11.5h2M7 11.5h7"/><circle cx="10.5" cy="4.5" r="1.6"/><circle cx="5.5" cy="11.5" r="1.6"/></svg></button>' +
+    '</div></div>';
+}
+function haltBtn(big){
+  const txt = S.confirmHalt ? 'Tap again to halt' : S.halted ? 'Trading halted' : 'Trading on';
+  const tc = S.confirmHalt ? 'var(--shortText)' : S.halted ? 'var(--pending)' : 'var(--paper)';
+  return '<button class="pill halt" data-act="halt" aria-pressed="' + (!S.halted) + '" style="border-color:' + (S.confirmHalt ? 'var(--short)' : 'var(--line)') + (big ? ';min-height:44px;font-size:13px;padding:8px 14px 8px 18px' : '') + '"><span style="color:' + tc + '">' + txt + '</span>' +
+    '<span class="sw" style="background:' + (S.halted ? 'var(--line)' : 'var(--long)') + '"><b style="left:' + (S.halted ? '2px' : '20px') + '"></b></span></button>';
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Layouts
+// ---------------------------------------------------------------------------------------------------------------------
+function cockpit(D){
+  const ch = chartSvg(D, 120, 'gC');
+  const bal = S.balance == null ? '—' : mk('$' + money(S.balance + 0));
+  const avail = S.available == null ? '—' : mk('$' + money(S.available));
+  const topFail = D.alerts.some(a => a.sev === 'fail');
+  const aBg = topFail ? 'var(--failBg)' : D.alerts.length ? 'var(--warnBg)' : 'var(--panel)';
+  const aBd = topFail ? 'var(--failBorder)' : D.alerts.length ? 'var(--warnBorder)' : 'var(--panel)';
+  const t = testLabel();
+  return headerHtml(D, true) +
+  '<div class="syncline"><span class="dotc" style="background:' + D.sync.color + ';width:6px;height:6px"></span><span style="color:' + D.sync.color + '">' + esc(D.sync.text) + '</span><span>·</span><span>Updated <span class="upd">' + updTxt() + '</span></span></div>' +
+  '<div class="cols"><div class="col1">' +
+    '<div class="hero"><div class="chead" style="flex-wrap:wrap;align-items:flex-end"><div><div class="mist" style="font-size:12px;margin-bottom:6px">Balance</div><div style="font-size:38px;font-weight:500;letter-spacing:-.5px;line-height:1">' + bal + '</div></div>' +
+    '<div class="mist" style="text-align:right;font-size:12px;line-height:1.7"><div>' + avail + ' available</div><div>Last 24h <span class="' + cls(D.today) + '" style="font-weight:500">' + (D.closed.length ? mk(signed(D.today)) : '—') + '</span></div></div></div>' +
+    '<div class="chartbox">' + ch.svg + ch.dot + '</div>' +
+    '<div class="kpis"><div><small>Win rate</small><b>' + (D.closed.length ? Math.round(D.wins / D.closed.length * 100) + '%' : '—') + '</b></div>' +
+    '<div><small>PnL</small><b class="' + cls(D.total) + '">' + (D.closed.length ? mk(signed(D.total)) : '—') + '</b></div>' +
+    '<div><small>Avg ROI</small><b class="' + cls(D.avgRoi) + '">' + (D.closed.length ? (D.avgRoi >= 0 ? '+' : '−') + Math.abs(D.avgRoi).toFixed(1) + '%' : '—') + '</b></div></div></div>' +
+    '<div class="card"><div class="chead"><div class="row"><span class="lbl">Open positions</span><span class="count">' + S.positions.length + '</span></div>' + (S.positions.length ? '<span class="' + cls(D.upl) + '" style="font-size:13px;font-weight:500">' + mk(signed(D.upl)) + '</span>' : '') + '</div>' + posListCockpit(D) + '</div>' +
+    '<div class="card"><div class="chead"><span class="lbl">Recent trades</span><button class="link" data-act="clear" style="color:' + (S.confirmClear ? 'var(--shortText)' : 'var(--mist)') + '">' + (S.confirmClear ? 'Tap again to clear' : 'Clear log') + '</button></div>' + tradeListCockpit(D) + '</div>' +
+  '</div><div class="col2">' +
+    '<div class="card"><div class="chead"><span class="lbl">Bots · ' + D.nOn + ' of ' + D.bots.length + ' online</span><button class="link acc" data-act="ping"' + (S.pingState === 'wait' ? ' disabled' : '') + '>' + (S.pingState === 'wait' ? 'Pinging…' : 'Ping') + '</button></div>' + botListHtml(D) + '</div>' +
+    '<div class="card" style="background:' + aBg + ';border:1px solid ' + aBd + '"><div class="chead"><span class="lbl">Order alerts · 24h</span><span class="row" style="gap:0"><button class="link" data-act="toggleExec">' + (S.execOpen ? 'Hide recent' : 'Recent orders') + '</button>' + (D.alerts.length ? '<button class="link" data-act="dismiss">Dismiss</button>' : '') + '</span></div>' + alertsInner(D) +
+    '<div class="chead" style="margin-top:10px;padding-top:6px;border-top:1px solid ' + aBd + '"><span class="mist" style="font-size:11px">Telegram offline alerts</span><button class="link" data-act="test" style="color:' + t[1] + '">' + t[0] + '</button></div></div>' +
+  '</div></div>';
+}
+function acc(key, title, summary, color, auto, body){
+  const open = S.open[key] != null ? S.open[key] : auto;
+  return '<div class="acc-item"><button class="acc-head" data-act="acc" data-key="' + key + '" data-open="' + (open ? 1 : 0) + '" data-auto="' + (auto ? 1 : 0) + '" aria-expanded="' + open + '"><span class="t">' + title + '</span><span class="s" style="color:' + color + '">' + esc(summary) + '<span class="c">' + (open ? '–' : '+') + '</span></span></button>' + (open ? '<div class="acc-body">' + body + '</div>' : '') + '</div>';
+}
+function glance(D){
+  const ch = chartSvg(D, 100, 'gG');
+  const bal = S.balance == null ? '—' : mk('$' + money(S.balance + 0));
+  const t = testLabel();
+  const topFail = D.alerts.some(a => a.sev === 'fail');
+  const alertsBody = (D.alerts.length ? D.alerts.map(x => '<div class="abox" style="background:' + (x.sev === 'fail' ? 'var(--failBg)' : 'var(--warnBg)') + '"><div class="chead" style="font-size:13px"><span>' + esc(execLine(x)) + (x.sev === 'fail' ? ' failed' : '') + '</span><span class="mist" style="font-size:12px;white-space:nowrap">' + ago(Math.max(0, (Date.now() - x.at) / 1000)) + ' ago</span></div><div style="font-size:12px;color:' + alertColor(x.sev) + ';margin-top:4px;line-height:1.5">' + esc(String(x.text || '') + (x.detail ? '. ' + String(x.detail).charAt(0).toUpperCase() + String(x.detail).slice(1) : '')) + '</div></div>').join('') : '<div class="mist" style="font-size:13px;padding:0 0 6px">Every order went through in the last 24 hours.</div>') +
+    '<div class="chead"><button class="link" data-act="test" style="padding-left:0;color:' + t[1] + '">' + t[0] + '</button>' + (D.alerts.length ? '<button class="link" data-act="dismiss">Dismiss</button>' : '') + '</div>';
+  const posBody = S.positions.length ? S.positions.map(posView).map(p => '<div class="trow" style="border-color:var(--line2)"><div><div style="font-weight:500;font-size:14px">' + esc(p.sym) + ' <span class="' + (p.isLong ? 'long' : 'short') + '" style="font-size:11px;font-weight:600">' + p.dir + '</span></div><div class="mist" style="font-size:11px;margin-top:3px">' + esc(p.entry) + ' → ' + esc(p.mark) + ' · ' + esc(p.lev) + 'x</div></div><div style="text-align:right"><div class="' + cls(p.upl) + '" style="font-weight:500">' + mk(signed(p.upl)) + '</div><div class="' + cls(p.upl) + '" style="font-size:11px;margin-top:3px">' + p.pct + '</div></div></div>').join('') : '<div class="mist" style="font-size:13px;padding:0 0 8px">' + (S.mode === 'paper' ? 'Paper mode: nothing is open on Bybit.' : 'No open positions.') + '</div>';
+  const botBody = botListHtml(D) + '<div class="chead" style="justify-content:flex-end"><button class="link acc" data-act="ping"' + (S.pingState === 'wait' ? ' disabled' : '') + '>' + (S.pingState === 'wait' ? 'Pinging…' : 'Ping bots') + '</button></div>';
+  const histBody = (ch.svg ? '<div class="chartbox" style="margin-top:0"><div style="height:100px">' + ch.svg.replace('class=""', '') + '</div></div>' : '') +
+    '<div class="kpis" style="margin:14px 0 6px;padding-top:0;border:0"><div><small>Win rate</small><b style="font-size:16px">' + (D.closed.length ? Math.round(D.wins / D.closed.length * 100) + '%' : '—') + '</b></div><div><small>PnL</small><b class="' + cls(D.total) + '" style="font-size:16px">' + (D.closed.length ? mk(signed(D.total)) : '—') + '</b></div><div><small>Avg ROI</small><b class="' + cls(D.avgRoi) + '" style="font-size:16px">' + (D.closed.length ? (D.avgRoi >= 0 ? '+' : '−') + Math.abs(D.avgRoi).toFixed(1) + '%' : '—') + '</b></div></div>' +
+    (D.sorted.length ? D.sorted.slice(0, 6).map(tradeView).map(t2 => '<div class="trow"><div><span style="font-weight:500;font-size:13px">' + esc(t2.sym) + '</span> <span class="' + (t2.isLong ? 'long' : 'short') + '" style="font-size:11px;font-weight:600">' + (t2.isLong ? 'LONG' : 'SHORT') + '</span><span class="mist" style="font-size:11px;margin-left:8px">' + (t2.ago ? t2.ago + ' ago' : '') + '</span></div><div><span class="' + cls(t2.pnl) + '" style="font-weight:500;font-size:13px">' + mk(signed(t2.pnl)) + '</span><span class="mist" style="font-size:11px;margin-left:8px">' + (t2.roi >= 0 ? '+' : '−') + Math.abs(t2.roi).toFixed(1) + '%</span></div></div>').join('') : '<div class="mist" style="padding:14px 0 6px;font-size:13px">No trades yet. Closed trades will appear here.</div>') +
+    '<div class="chead" style="justify-content:flex-end"><button class="link" data-act="clear" style="color:' + (S.confirmClear ? 'var(--shortText)' : 'var(--mist)') + '">' + (S.confirmClear ? 'Tap again to clear' : 'Clear log') + '</button></div>';
+  return headerHtml(D, false) +
+  '<div class="gbal"><div class="mist" style="font-size:12px;margin-bottom:10px">Balance</div><div class="big">' + bal + '</div><div style="margin-top:12px;font-size:14px;font-weight:500" class="' + cls(D.today) + '">' + (D.closed.length ? mk(signed(D.today)) : '—') + ' <span class="mist" style="font-weight:400">last 24h</span></div></div>' +
+  '<div class="gstat" style="color:' + D.status.color + '">' + esc(D.status.text) + '</div>' +
+  '<div class="mist" style="text-align:center;font-size:11px;margin-top:6px">' + esc(D.sync.text) + ' · Updated <span class="upd">' + updTxt() + '</span></div>' +
+  '<div class="row" style="justify-content:center;margin-top:22px">' + haltBtn(true) + '</div>' +
+  '<div class="acc-wrap">' +
+    acc('alerts', 'Alerts', D.alerts.length ? D.alerts.length + (D.alerts.length > 1 ? ' need a look' : ' needs a look') : 'All clear', D.alerts.length ? (topFail ? 'var(--shortText)' : 'var(--pending)') : 'var(--long)', D.alerts.length > 0, alertsBody) +
+    acc('pos', 'Open positions', S.positions.length ? S.positions.length + ' open · ' + mk(signed(D.upl)) : 'None open', S.positions.length ? (D.upl >= 0 ? 'var(--long)' : 'var(--short)') : 'var(--mist)', false, posBody) +
+    acc('bots', 'Bots', D.nOff + D.nLate ? D.nOn + ' of ' + D.bots.length + ' online' : 'All ' + D.bots.length + ' online', D.nOff + D.nLate ? 'var(--pending)' : 'var(--mist)', D.nOff + D.nLate > 0, botBody) +
+    acc('hist', 'Performance', D.closed.length ? Math.round(D.wins / D.closed.length * 100) + '% win · ' + mk(signed(D.total)) : 'No trades yet', 'var(--mist)', false, histBody) +
+  '</div>';
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Settings drawer + live modal
+// ---------------------------------------------------------------------------------------------------------------------
+function acctHtml(){
+  const a = S.acct;
+  let h = '<div class="lbl" style="margin-bottom:10px">Trading account</div><div style="margin-bottom:26px">';
+  if (!a) h += '<div class="mist" style="font-size:12px">Loading…</div>';
+  else {
+    const envTxt = a.env === 'demo' ? 'Demo' : (a.env === 'testnet' ? 'Testnet' : 'Live');
+    h += '<div class="chead" style="gap:12px"><div><div style="font-size:13px;font-weight:500">Bybit key <span style="font-family:\'IBM Plex Mono\',monospace">' + esc(a.hint) + '</span></div><div class="mist" style="font-size:11px;margin-top:3px">' + envTxt + ' · ' + (a.source === 'saved' ? 'saved from this page' : 'from Render settings') + '</div></div>' +
+      '<button class="pill" data-act="acctOpen" style="min-height:36px">' + (S.acctOpen ? 'Close' : 'Change key') + '</button></div>';
+    if (S.acctOpen) {
+      if (!a.canSave) h += '<div class="mist" style="font-size:12px;margin-top:12px;line-height:1.5">Saving a key here needs the database and a dashboard password to be set on Render.</div>';
+      else {
+        h += '<div class="row" style="margin:14px 0 10px"><div class="row" style="gap:2px;border:1px solid var(--line);border-radius:10px;padding:2px;background:var(--bg)" role="group" aria-label="Account type">' +
+          ['live', 'demo'].map(e => '<button type="button" data-act="acctEnv" data-v="' + e + '" aria-pressed="' + (S.acctEnv === e) + '" style="padding:6px 14px;border-radius:8px;font-size:12px;' + (S.acctEnv === e ? 'background:var(--accent);color:' + (prefs.theme === 'graphite' ? '#111' : '#fff') : 'color:var(--mist)') + '">' + (e === 'live' ? 'Live' : 'Demo') + '</button>').join('') + '</div></div>' +
+          '<label class="mist" style="display:block;font-size:11px;margin-bottom:5px" for="acctKey">New API key</label><input id="acctKey" class="fld" autocomplete="off" spellcheck="false" value="' + esc(S.acctKey) + '">' +
+          '<label class="mist" style="display:block;font-size:11px;margin-bottom:5px" for="acctSecret">New API secret</label><input id="acctSecret" class="fld" type="password" autocomplete="new-password" value="' + esc(S.acctSecret) + '">';
+        if (S.acctConfirm) h += '<div style="background:var(--warnBg);border:1px solid var(--warnBorder);border-radius:10px;padding:10px 12px;font-size:12px;line-height:1.5;margin-bottom:10px">' + esc(S.acctConfirm) + '</div>';
+        h += '<button class="mbtn" data-act="acctSave"' + (S.acctBusy ? ' disabled' : '') + ' style="width:100%;background:var(--accent);color:' + (prefs.theme === 'graphite' ? '#111' : '#fff') + ';font-weight:600">' + (S.acctBusy ? 'Checking with Bybit…' : (S.acctConfirm ? 'Switch anyway' : 'Check and save')) + '</button>' +
+          '<div class="mist" style="font-size:11px;margin-top:8px;line-height:1.5">The key is checked with Bybit first, then stored encrypted. It takes effect straight away, no restart. ' + (S.acctEnv === 'demo' ? 'Make a demo key while Bybit is in Demo Trading mode.' : 'Use a trade-only key with no withdrawal permission.') + '</div>';
+        if (a.source === 'saved') h += '<button data-act="acctReset" class="link" style="padding-left:0;margin-top:6px;color:' + (S.acctResetArm ? 'var(--shortText)' : 'var(--mist)') + '">' + (S.acctResetArm ? 'Tap again to go back to the Render settings' : 'Use the Render settings instead') + '</button>';
+      }
+    }
+    if (S.acctMsg) h += '<div style="font-size:12px;margin-top:10px;line-height:1.5;color:' + (S.acctMsg.ok ? 'var(--long)' : 'var(--shortText)') + '">' + esc(S.acctMsg.text) + '</div>';
+  }
+  return h + '</div>';
+}
+function overlaysHtml(){
+  let h = '';
+  if (S.settingsOpen) {
+    h += '<div class="scrim" data-act="closeSettings"></div><div class="drawer" role="dialog" aria-label="Appearance">' +
+      '<div class="chead" style="margin-bottom:22px"><span style="font-size:16px;font-weight:600">Settings</span><button class="gear" data-act="closeSettings" aria-label="Close settings" style="font-size:18px;line-height:1;background:transparent">×</button></div>' +
+      acctHtml() + '<div class="lbl" style="margin-bottom:10px">Layout</div><div class="opt">' +
+      '<button class="optb' + (prefs.layout === 'cockpit' ? ' on' : '') + '" data-act="layout" data-v="cockpit" aria-pressed="' + (prefs.layout === 'cockpit') + '"><div style="display:flex;gap:5px;height:46px;margin-bottom:10px"><div style="flex:2;display:flex;flex-direction:column;gap:4px"><div style="flex:2;background:var(--line);border-radius:4px"></div><div style="flex:1;background:var(--line);border-radius:4px"></div></div><div style="flex:1;display:flex;flex-direction:column;gap:4px"><div style="flex:1;background:var(--line);border-radius:4px"></div><div style="flex:1;background:var(--line);border-radius:4px"></div></div></div><div style="font-size:13px;font-weight:500">Cockpit</div><div class="mist" style="font-size:11px;margin-top:2px">Everything at once</div></button>' +
+      '<button class="optb' + (prefs.layout === 'glance' ? ' on' : '') + '" data-act="layout" data-v="glance" aria-pressed="' + (prefs.layout === 'glance') + '"><div style="display:flex;flex-direction:column;align-items:center;gap:4px;height:46px;margin-bottom:10px"><div style="width:46%;height:12px;background:var(--line);border-radius:4px"></div><div style="width:70%;height:4px;background:var(--line);border-radius:2px"></div><div style="width:90%;height:4px;background:var(--line);border-radius:2px;margin-top:4px"></div><div style="width:90%;height:4px;background:var(--line);border-radius:2px"></div><div style="width:90%;height:4px;background:var(--line);border-radius:2px"></div></div><div style="font-size:13px;font-weight:500">Glance</div><div class="mist" style="font-size:11px;margin-top:2px">One calm column</div></button></div>' +
+      '<div class="lbl" style="margin-bottom:10px">Theme</div><div class="opt">' +
+      THEMES.map(t => '<button class="optb' + (prefs.theme === t.k ? ' on' : '') + '" data-act="theme" data-v="' + t.k + '" aria-pressed="' + (prefs.theme === t.k) + '" style="background:' + t.bg + ';color:' + t.paper + ';' + (prefs.theme === t.k ? '' : 'border-color:' + t.line) + '"><div style="background:' + t.panel + ';border-radius:8px;padding:8px;margin-bottom:9px"><div style="display:flex;align-items:center;gap:5px;margin-bottom:7px"><span style="width:7px;height:7px;border-radius:50%;background:' + t.accent + '"></span><span style="height:4px;width:34px;border-radius:2px;background:' + t.mist + ';opacity:.5"></span></div><div style="display:flex;gap:4px;align-items:flex-end;height:20px"><span style="flex:1;height:60%;background:' + t.long + ';border-radius:2px"></span><span style="flex:1;height:35%;background:' + t.short + ';border-radius:2px"></span><span style="flex:1;height:90%;background:' + t.long + ';border-radius:2px"></span><span style="flex:1;height:50%;background:' + t.long + ';border-radius:2px"></span></div></div><div style="font-size:13px;font-weight:500">' + t.name + '</div><div style="font-size:11px;color:' + t.mist + ';margin-top:2px">' + t.note + '</div></button>').join('') + '</div>' +
+      '<div class="lbl" style="margin-bottom:6px">Privacy</div>' +
+      '<button data-act="hide" aria-pressed="' + prefs.hide + '" style="width:100%;display:flex;justify-content:space-between;align-items:center;gap:12px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:14px 0;min-height:56px;text-align:left"><span><span style="display:block;font-size:13px;font-weight:500">Hide amounts</span><span class="mist" style="display:block;font-size:11px;margin-top:2px">Balance and profit show as dots</span></span><span class="sw" style="background:' + (prefs.hide ? 'var(--long)' : 'var(--line)') + '"><b style="left:' + (prefs.hide ? '20px' : '2px') + '"></b></span></button>' +
+      '<div class="mist" style="font-size:11px;margin-top:18px;line-height:1.55">Look and privacy choices are saved on this device only.</div>' +
+      '<div class="lbl" style="margin:26px 0 4px">Go to</div><a class="navlink" href="/"><span>Home<br><small>All your pages in one place</small></span><span class="mist">\u203a</span></a><a class="navlink" href="/admin"><span>Admin console<br><small>Users, plan, orders, security</small></span><span class="mist">\u203a</span></a><a class="navlink" href="/join"><span>User sign-up page<br><small>Where invited users register</small></span><span class="mist">\u203a</span></a></div>';
+  }
+  if (S.liveModal) {
+    const ok = S.liveText === 'LIVE';
+    h += '<div class="modal"><div class="mbox" role="dialog" aria-label="Switch to live trading"><div style="font-size:16px;font-weight:600;margin-bottom:8px">Switch to live trading?</div>' +
+      '<p class="mist" style="font-size:13px;line-height:1.55;margin:0 0 16px">From now on every signal places a real order on Bybit, and is copied to every user account. Type LIVE to confirm.</p>' +
+      '<label class="mist" style="display:block;font-size:11px;margin-bottom:6px" for="liveIn">Confirmation</label><input id="liveIn" value="' + esc(S.liveText) + '" autocomplete="off" placeholder="LIVE">' +
+      (S.liveErr ? '<p style="color:var(--shortText);font-size:11px;margin:-8px 0 12px">Type LIVE exactly to confirm.</p>' : '') +
+      '<div class="row" style="flex-wrap:nowrap"><button class="mbtn" data-act="liveCancel" style="background:var(--chip);color:var(--mist)">Cancel</button><button class="mbtn" data-act="liveGo" style="background:' + (ok ? 'var(--short)' : 'var(--chip)') + ';color:' + (ok ? '#fff' : 'var(--mist)') + ';font-weight:600">Go live</button></div></div></div>';
+  }
+  return h;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------------------------------------------------------
+let lastHtml = '', lastOv = '';
+function render(){
+  const D = derive();
+  const app = document.getElementById('app');
+  const banner = S.mode === 'paper' ? '<div class="banner"><i></i>Paper mode: no real orders are sent to Bybit</div>' : '';
+  document.body.className = prefs.layout === 'glance' ? 'glance' : '';
+  const html = banner + '<div class="wrap">' + (prefs.layout === 'glance' ? glance(D) : cockpit(D)) + '</div>';
+  if (html !== lastHtml) { app.innerHTML = html; lastHtml = html; }
+  const ov = document.getElementById('overlays');
+  const hadInput = document.activeElement && document.activeElement.id === 'liveIn';
+  const sel = hadInput ? document.activeElement.selectionStart : 0;
+  const ovHtml = overlaysHtml();
+  if (ovHtml !== lastOv) {
+    const drawer = ov.querySelector('.drawer'), keep = drawer ? drawer.scrollTop : 0;
+    ov.innerHTML = ovHtml; lastOv = ovHtml;
+    const nd = ov.querySelector('.drawer'); if (nd) nd.scrollTop = keep;
+  }
+  if (S.liveModal) { const i = document.getElementById('liveIn'); if (i) { if (hadInput) { i.focus(); try { i.setSelectionRange(sel, sel); } catch(e){} } i.oninput = e => { S.liveText = e.target.value; S.liveErr = false; const b = ov.querySelector('[data-act="liveGo"]'); const ok = S.liveText === 'LIVE'; if (b) { b.style.background = ok ? 'var(--short)' : 'var(--chip)'; b.style.color = ok ? '#fff' : 'var(--mist)'; } }; i.onkeydown = e => { if (e.key === 'Enter') act('liveGo'); }; } }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------------------------------------------------
+async function act(a, el){
+  if (a === 'settings') { S.settingsOpen = true; render(); loadAcct(); }
+  else if (a === 'acctOpen') { S.acctOpen = !S.acctOpen; S.acctMsg = null; render(); }
+  else if (a === 'acctEnv') { S.acctEnv = el.dataset.v; render(); }
+  else if (a === 'acctSave') saveAcct();
+  else if (a === 'acctReset') resetAcct();
+  else if (a === 'closeSettings') { S.settingsOpen = false; render(); }
+  else if (a === 'layout') { prefs.layout = el.dataset.v; savePrefs(); render(); }
+  else if (a === 'theme') { prefs.theme = el.dataset.v; savePrefs(); render(); }
+  else if (a === 'hide') { prefs.hide = !prefs.hide; savePrefs(); render(); }
+  else if (a === 'acc') { const k = el.dataset.key; S.open[k] = el.dataset.open !== '1'; render(); }
+  else if (a === 'mode') {
+    if (S.mode === 'live') { try { await api('/api/mode', {method:'POST', body:JSON.stringify({mode:'paper'})}); } catch(e){} refreshStatus(); }
+    else { S.liveModal = true; S.liveText = ''; S.liveErr = false; render(); const i = document.getElementById('liveIn'); if (i) i.focus(); }
+  }
+  else if (a === 'liveCancel') { S.liveModal = false; render(); }
+  else if (a === 'liveGo') {
+    if (S.liveText !== 'LIVE') { S.liveErr = true; render(); return; }
+    try { await api('/api/mode', {method:'POST', body:JSON.stringify({mode:'live', confirm:'LIVE'})}); } catch(e){}
+    S.liveModal = false; refreshStatus();
+  }
+  else if (a === 'halt') {
+    if (S.halted) { try { await api('/api/resume', {method:'POST'}); } catch(e){} S.confirmHalt = false; refreshStatus(); return; }
+    if (S.confirmHalt) { clearTimeout(timers.halt); S.confirmHalt = false; try { await api('/api/halt', {method:'POST', body:JSON.stringify({reason:'dashboard'})}); } catch(e){} refreshStatus(); return; }
+    S.confirmHalt = true; render(); clearTimeout(timers.halt); timers.halt = setTimeout(() => { S.confirmHalt = false; render(); }, 3000);
+  }
+  else if (a === 'clear') {
+    if (S.confirmClear) { clearTimeout(timers.clear); S.confirmClear = false; try { await api('/api/clear-trade-log', {method:'POST'}); } catch(e){} refreshActivity(); return; }
+    S.confirmClear = true; render(); clearTimeout(timers.clear); timers.clear = setTimeout(() => { S.confirmClear = false; render(); }, 3000);
+  }
+  else if (a === 'dismiss') {
+    if (S.exec && S.exec.reports && S.exec.reports.length) { try { localStorage.setItem('ymExecDismissedAt', String(Math.max.apply(null, S.exec.reports.map(x => x.at)))); } catch(e){} }
+    render();
+  }
+  else if (a === 'toggleExec') { S.execOpen = !S.execOpen; render(); }
+  else if (a === 'test') {
+    S.testState = 'busy'; render();
+    try {
+      const r = await api('/api/test-offline-alert?send=true');
+      S.testState = (r.delivery && r.delivery.configured) ? 'sent' : 'none';
+    } catch(e){ S.testState = 'fail'; }
+    render(); clearTimeout(timers.test); timers.test = setTimeout(() => { S.testState = 'idle'; render(); }, 4000);
+  }
+  else if (a === 'ping') pingFleet();
+}
+document.addEventListener('click', e => { const el = e.target.closest('[data-act]'); if (el) act(el.dataset.act, el); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { if (S.liveModal) { S.liveModal = false; render(); } else if (S.settingsOpen) { S.settingsOpen = false; render(); } } });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Data
+// ---------------------------------------------------------------------------------------------------------------------
+async function refreshStatus(){
+  try { const s = await api('/api/status'); S.mode = s.mode; S.halted = !!(s.breaker && s.breaker.tripped); S.loaded = true; } catch(e){}
+  render();
+}
+async function refreshBalance(){
+  try { const b = await api('/api/balance'); if (b.success) { S.balance = b.balance; S.available = b.available; } } catch(e){}
+}
+async function refreshActivity(){
+  try {
+    const [p, t] = await Promise.all([api('/api/positions'), api('/api/trade-log')]);
+    S.positions = p.success ? p.positions : [];
+    S.closed = (t.success ? t.trades : []).filter(x => x.status === 'CLOSED');
+  } catch(e){}
+  render();
+}
+async function refreshFleet(){
+  if (S.pingState === 'wait') return;
+  try { const f = await api('/api/fleet-status'); if (f.success) { S.bots = f.bots; if (typeof f.lateAfterSecs === 'number') S.lateAfter = f.lateAfterSecs; } } catch(e){}
+}
+async function refreshExec(){
+  try { const r = await api('/api/exec-reports'); if (r.success) S.exec = r; } catch(e){}
+}
+async function refreshSync(){
+  try { const r = await api('/api/sync-status'); if (r.success) S.sync = r; } catch(e){}
+}
+// ---- trading account key (the master Bybit account this page shows) ----
+async function loadAcct(){
+  try { const r = await api('/api/master-key'); if (r.success) { S.acct = r; if (r.env === 'demo' || r.env === 'live') S.acctEnv = S.acctOpen ? S.acctEnv : r.env; } } catch(e){}
+  render();
+}
+async function saveAcct(){
+  if (S.acctBusy) return;
+  if (!S.acctKey.trim() || !S.acctSecret.trim()) { S.acctMsg = {ok:false, text:'Paste both the key and the secret.'}; render(); return; }
+  S.acctBusy = true; S.acctMsg = null; render();
+  let r;
+  try { r = await api('/api/master-key', {method:'POST', body:JSON.stringify({apiKey:S.acctKey.trim(), apiSecret:S.acctSecret.trim(), env:S.acctEnv, confirmOpen:!!S.acctConfirm})}); }
+  catch(e){ r = {success:false, message:'Could not reach the server.'}; }
+  S.acctBusy = false;
+  if (r.success) {
+    S.acctKey = ''; S.acctSecret = ''; S.acctConfirm = false; S.acctOpen = false;
+    S.acctMsg = {ok:true, text:'Saved. Now trading with ' + r.hint + ' (' + (r.env === 'demo' ? 'Demo' : 'Live') + ')' + (r.equity != null ? ', balance $' + money(r.equity) : '') + '.' + (r.warning ? ' ' + r.warning : '')};
+    await loadAcct(); refreshAll();
+  } else if (r.needConfirm) { S.acctConfirm = r.message; render(); }
+  else { S.acctConfirm = false; S.acctMsg = {ok:false, text:r.message || 'Could not save the key.'}; render(); }
+}
+async function resetAcct(){
+  if (!S.acctResetArm) { S.acctResetArm = true; render(); clearTimeout(timers.acctArm); timers.acctArm = setTimeout(() => { S.acctResetArm = false; render(); }, 3000); return; }
+  S.acctResetArm = false;
+  let r; try { r = await api('/api/master-key/reset', {method:'POST'}); } catch(e){ r = {success:false, message:'Could not reach the server.'}; }
+  S.acctMsg = r.success ? {ok:true, text:'Back on the Render settings (' + r.hint + ').'} : {ok:false, text:r.message || 'Could not reset.'};
+  await loadAcct(); refreshAll();
+}
+document.addEventListener('input', e => {
+  if (e.target.id === 'acctKey') S.acctKey = e.target.value;
+  else if (e.target.id === 'acctSecret') S.acctSecret = e.target.value;
+  else if (e.target.id === 'acctKey' || e.target.id === 'acctSecret') return;
+  if (S.acctConfirm && (e.target.id === 'acctKey' || e.target.id === 'acctSecret')) S.acctConfirm = false;
+});
+async function pingFleet(){
+  if (S.pingState === 'wait') return;
+  S.pingState = 'wait'; S.pingResults = {}; S.pingStartedAt = Date.now(); render();
+  let pingId;
+  try { const r = await api('/api/ping-fleet', {method:'POST'}); pingId = r.pingId; }
+  catch(e){ S.pingState = null; render(); return; }
+  clearInterval(timers.ping);
+  timers.ping = setInterval(async () => {
+    let st; try { st = await api('/api/ping-status/' + pingId); } catch(e){ return; }
+    if (st.success) S.pingResults = st.results || {};
+    const all = ACTIVE_BOT_NAMES.every(n => S.pingResults[n]);
+    if (all || Date.now() - S.pingStartedAt > PING_UI_WAIT_MS) { clearInterval(timers.ping); S.pingState = 'done'; clearTimeout(timers.pingClear); timers.pingClear = setTimeout(() => { S.pingState = null; refreshFleet().then(render); }, 20000); }
+    render();
+  }, 1000);
+}
+async function refreshAll(){
+  await Promise.all([refreshStatus(), refreshBalance(), refreshActivity(), refreshFleet(), refreshExec(), refreshSync()]);
+  S.updatedAt = Date.now(); render();
+}
+refreshAll();
+setInterval(refreshAll, 10000);
+// keep "Updated Ns ago" moving without redrawing the page (a redraw mid-click would swallow the click)
+setInterval(() => { const t = updTxt(); document.querySelectorAll('.upd').forEach(n => { n.textContent = t; }); }, 1000);
+render();
+</script>
+</body>
+</html>
