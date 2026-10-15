@@ -22,7 +22,7 @@ const PMODES = ['inherit', 'off', 'shadow', 'live'];   // a profile can follow t
 const copyProfile = p => ({ mode: 'inherit', beR: p.beR, ladder: p.ladder.map(x => x.slice()), scale: { on: p.scale.on, steps: p.scale.steps.map(x => x.slice()) } });
 
 function defaults() {
-  return { mode: 'off', pollSec: 5, minGapPct: 0.25, stepR: 0.1, beOffsetPct: 0.1, alerts: true, swingBots: ['YM ORACLE IV'],
+  return { mode: 'off', pollSec: 5, minGapPct: 0.25, stepR: 0.1, beOffsetPct: 0.1, alerts: true, swingBots: [],
     reentry: { on: true, minPullR: 0.5, resumePct: 40, targetR: 2, hoursFast: 6, hoursSwing: 48 },
     fast: copyProfile(DEFAULT_LADDER.fast), swing: copyProfile(DEFAULT_LADDER.swing) };
 }
@@ -77,18 +77,20 @@ function effMode(cfg, profile) {
 // Anything stored or submitted becomes a full, valid config; bad values fall back to the defaults, never throw.
 function normalize(raw) {
   const d = defaults(), r = (raw && typeof raw === 'object') ? raw : {};
-  const bots = Array.isArray(r.swingBots) ? r.swingBots.map(x => String(x).trim().toUpperCase().slice(0, 40)).filter(Boolean).slice(0, 8) : d.swingBots;
+  const bots = Array.isArray(r.swingBots) ? r.swingBots.map(x => String(x).trim().toUpperCase().slice(0, 40)).filter(Boolean).slice(0, 8) : d.swingBots;   // optional: bot names to treat as swing when a signal carries no engine tag. Empty by default: no bot is special
   return {
     mode: MODES.includes(r.mode) ? r.mode : d.mode,
     pollSec: num(r.pollSec, 3, 60, d.pollSec), minGapPct: num(r.minGapPct, 0.05, 5, d.minGapPct), stepR: num(r.stepR, 0.02, 1, d.stepR),
     beOffsetPct: num(r.beOffsetPct, 0, 1, d.beOffsetPct), alerts: r.alerts === undefined ? d.alerts : r.alerts === true,
-    swingBots: bots.length ? bots : d.swingBots,
+    swingBots: bots,
     reentry: normReentry(r.reentry, d.reentry),
     fast: normProfile(r.fast, d.fast), swing: normProfile(r.swing, d.swing),
   };
 }
 
 const isSwingBot = (cfg, bot) => !!bot && cfg.swingBots.includes(String(bot).trim().toUpperCase());
+// Which profile a trade follows: what the trade itself says (the engine tag the bot reports with its signal). Only a signal without a tag falls back to the optional bot-name list.
+const profileOf = (cfg, eng, bot) => (eng === 'swing' ? 'swing' : eng === 'fast' ? 'fast' : isSwingBot(cfg, bot) ? 'swing' : 'fast');
 
 // The best price seen so far (highest for a long, lowest for a short).
 function updatePeak(peak, side, mark, entry) {
@@ -190,4 +192,4 @@ function reentryStep(w, mark, nowMs, rc) {
   return { events: ev, finished: false };
 }
 
-module.exports = { PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, updatePeak, decide, clampStop };
+module.exports = { PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };

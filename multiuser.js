@@ -1448,10 +1448,10 @@ function init(deps) {
   // Which profile a trade follows, and the stop the bot originally planned for it (from what the bot reported when it opened the trade).
   async function pgLookup(symbol, side) {
     try {
-      const r = await q(`SELECT bot, sl FROM signals WHERE symbol=$1 AND side IS NOT NULL AND opened_at > now() - interval '30 days' ORDER BY opened_at DESC LIMIT 1`, [symbol]);
-      const x = r.rows[0]; if (!x) return { bot: '', sl: 0 };
-      return { bot: x.bot || '', sl: Number(x.sl) || 0 };
-    } catch { return { bot: '', sl: 0 }; }
+      const r = await q(`SELECT bot, sl, eng FROM signals WHERE symbol=$1 AND side=$2 AND opened_at > now() - interval '30 days' ORDER BY opened_at DESC LIMIT 1`, [symbol, side === 'Buy' ? 'BUY' : 'SELL']);
+      const x = r.rows[0]; if (!x) return { bot: '', sl: 0, eng: null };
+      return { bot: x.bot || '', sl: Number(x.sl) || 0, eng: x.eng || null };
+    } catch { return { bot: '', sl: 0, eng: null }; }
   }
   // Scale-out for the copies: each user closes the same SHARE of their OWN position (not the master's quantity).
   async function fanOutPartialClose(symbol, posSide, frac, inst) {
@@ -1522,7 +1522,7 @@ function init(deps) {
           const lk = await pgLookup(symbol, side);
           let init = lk.sl > 0 && (long ? lk.sl < entry : lk.sl > entry) ? lk.sl : 0;                     // the bot's own planned stop
           if (!init && curSl > 0 && (long ? curSl < entry : curSl > entry)) init = curSl;                    // else the first stop we saw on the position
-          st = { entry, initialSl: init, peak: entry, floor: 0, shadowSl: 0, shadowHit: false, scaled: [], profile: PG.isSwingBot(pgCfg, lk.bot) ? 'swing' : 'fast', bot: lk.bot, since: Date.now(), lastAlert: 0 };
+          st = { entry, initialSl: init, peak: entry, floor: 0, shadowSl: 0, shadowHit: false, scaled: [], profile: PG.profileOf(pgCfg, lk.eng, lk.bot), bot: lk.bot, since: Date.now(), lastAlert: 0 };
           pgState.set(key, st); pgWatch.delete(key);
         }
         st.scaled = st.scaled || [];
