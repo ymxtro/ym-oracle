@@ -559,6 +559,7 @@ async function processOrder(body) {
       body = { ...body, qty: String(sz.qty) };
     } else if (sz && sz.skipped) console.warn(`[master-sizing] plan size not possible (${sz.skipped}): using the manager's quantity. ${sz.detail}`);
   }
+  if (body.reduceOnly && multiuser.guardFitClose) body = await multiuser.guardFitClose(body);   // after a Profit Guard scale-out, a close is fitted to what is really left
   const response = await submitMasterOrder(body);
   const isOpen = !body.reduceOnly;
   const landed = TRADE_MODE === 'paper' || response.retCode === 0 || response.retCode === 110072;
@@ -614,12 +615,13 @@ app.post('/api/trading-stop', requireDevice, async (req, res) => {
     return res.status(503).json({ success: false, message: 'Trading halted', status: breakerStatus() });
   }
   try {
-    multiuser.fanOutTradingStop(req.body).catch(e => console.error('[multiuser] fanOutTradingStop:', e.message));
+    const stopBody = multiuser.guardClamp ? multiuser.guardClamp(req.body) : req.body;   // Profit Guard (when live): a bot's looser stop is held at the guard's floor
+    multiuser.fanOutTradingStop(stopBody).catch(e => console.error('[multiuser] fanOutTradingStop:', e.message));
     let response;
     if (TRADE_MODE === 'paper') {
-      response = { paper: true, wouldHaveSubmitted: req.body, retCode: 0, retMsg: 'PAPER MODE — not sent to Bybit' };
+      response = { paper: true, wouldHaveSubmitted: stopBody, retCode: 0, retMsg: 'PAPER MODE — not sent to Bybit' };
     } else {
-      response = await restClient.setTradingStop(req.body);
+      response = await restClient.setTradingStop(stopBody);
     }
     return res.status(200).json(response);
   } catch (error) {
