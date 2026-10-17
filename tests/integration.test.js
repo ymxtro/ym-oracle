@@ -33,7 +33,7 @@ class Stub {
   }
   async cancelAllOrders() { state.cancels = (state.cancels || 0) + 1; return { retCode: 0 }; }
   async getInstrumentsInfo() { return { retCode: 0, result: { list: [{ status: 'Trading', lotSizeFilter: { qtyStep: '0.01', minOrderQty: '0.01' } }] } }; }
-  async getTickers() { return { retCode: 0, result: { list: [{ lastPrice: '65000' }] } }; }
+  async getTickers({ symbol } = {}) { return { retCode: 0, result: { list: [{ lastPrice: String((state.tickers || {})[symbol] || 65000) }] } }; }
   async getHistoricOrders({ orderLinkId }) { if (state.orderReadFails) throw new Error('timeout'); const o = (state.orders || {})[orderLinkId]; if (o) return { retCode: 0, result: { list: o.active ? [] : [o] } }; if (orderLinkId && /^u\d+-pend/.test(orderLinkId)) return { retCode: 0, result: { list: [] } }; return { retCode: 0, result: { list: [{ avgPrice: state.fillPrice }] } }; }
   async getActiveOrders({ orderLinkId }) { if (state.orderReadFails) throw new Error('timeout'); const o = (state.orders || {})[orderLinkId]; return { retCode: 0, result: { list: o && o.active ? [o] : [] } }; }
   async submitOrder(b) {
@@ -835,6 +835,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     click(aw, q1(aw, '[data-act="closeDrawer"]')); assert(q1(aw, '#drawer').hidden);
     ok('admin page: users table, search, drawer details, per-user limits and dry run save, hold-to-close really closes the trades');
 
+    await call('/api/admin/profit-guard', 'POST', { mode: 'off', fast: { mode: 'inherit' }, swing: { mode: 'inherit', scale: { on: false } } }, admin);   // a failed earlier run may have left it on
     click(aw, q1(aw, '[data-tab="plan"]')); await sleep(800);
     assert(q1(aw, '#p-open') && q1(aw, '#p-lossp') && q1(aw, '#p-pct') && q1(aw, '#review') && /Version history/.test(body()) && /Exactly what each signal says/.test(body()) && /\$500 account/.test(q1(aw, '#planPreviewCard').textContent), 'new plan page');
     assert(/No changes|This is what every account follows/.test(q1(aw, '#review').textContent));
@@ -846,6 +847,26 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     assert((await call('/api/admin/plan', 'GET', null, admin)).j.plan.maxOpenTrades === 4, 'applying saves the plan');
     await call('/api/admin/plan', 'POST', { maxOpenTrades: 3 }, admin);
     ok('admin page: plan form fills from the live plan, review panel previews changes without saving, Apply saves a new version');
+
+    assert(q1(aw, '#pgcard') && /Profit Guard/.test(q1(aw, '#pgcard').textContent) && /OFF/.test(q1(aw, '#pgcard').textContent) && q1(aw, '#pg-swing-be'), 'the Profit Guard card shows, off by default');
+    click(aw, q1(aw, '#pgcard [data-v="shadow"]')); await sleep(900);
+    assert((await call('/api/admin/profit-guard', 'GET', null, admin)).j.cfg.mode === 'shadow' && /SHADOW/.test(q1(aw, '#pgcard').textContent));
+    click(aw, q1(aw, '#pgcard [data-v="live"]')); await sleep(300);
+    assert((await call('/api/admin/profit-guard', 'GET', null, admin)).j.cfg.mode === 'shadow' && /Confirm/.test(q1(aw, '#pgcard').textContent) && q1(aw, '#pgcard [data-act="pgConfirm"]'), 'the first tap on Live only asks');
+    click(aw, q1(aw, '#pgcard [data-act="pgConfirm"]')); await sleep(900);
+    assert((await call('/api/admin/profit-guard', 'GET', null, admin)).j.cfg.mode === 'live', 'the second tap goes live');
+    setVal(aw, q1(aw, '#pg-swing-k0'), '40'); click(aw, q1(aw, '#pgcard [data-act="pgSave"]')); await sleep(900);
+    assert((await call('/api/admin/profit-guard', 'GET', null, admin)).j.cfg.swing.ladder[0][1] === 0.4, 'the ladder is saved from the card');
+    click(aw, q1(aw, '#pgcard [data-act="pgProf"][data-p="fast"][data-v="shadow"]')); await sleep(900);
+    assert((await call('/api/admin/profit-guard', 'GET', null, admin)).j.cfg.fast.mode === 'shadow', 'a profile can be set on its own');
+    assert(q1(aw, '#pg-fast-son') && q1(aw, '#pg-re-on') && /Scorecard/.test(q1(aw, '#pgcard').textContent) && /Re-entry recorder/.test(q1(aw, '#pgcard').textContent), 'scale-out, re-entry and scorecard sections are on the card');
+    q1(aw, '#pg-swing-son').checked = true; click(aw, q1(aw, '#pgcard [data-act="pgSave"]')); await sleep(700);
+    assert(/Confirm/.test(q1(aw, '#pgcard').textContent) && (await call('/api/admin/profit-guard', 'GET', null, admin)).j.cfg.swing.scale.on === false, 'turning on real slice-closing asks first');
+    click(aw, q1(aw, '#pgcard [data-act="pgCancel"]')); await sleep(300);
+    click(aw, q1(aw, '#pgcard [data-v="off"]')); await sleep(900);
+    assert((await call('/api/admin/profit-guard', 'GET', null, admin)).j.cfg.mode === 'off');
+    await call('/api/admin/profit-guard', 'POST', { mode: 'off', fast: { mode: 'inherit' }, swing: { mode: 'inherit', scale: { on: false }, ladder: [[2, 0.35], [4, 0.55], [8, 0.65]] } }, admin);
+    ok('admin page: Profit Guard card: Off / Shadow / Live with a confirm step, per-profile modes, scale-out and re-entry settings, scorecard');
 
     const sw = q1(aw, '#swDry'); click(aw, q1(aw, '#statePill')); sw.checked = true; sw.dispatchEvent(new aw.Event('change', { bubbles: true })); await sleep(900);
     assert((await apiUsers()).dryAll === true && /DRY RUN/.test(q1(aw, '#stateTxt').textContent) && /Dry run is on/.test(q1(aw, '#notice').textContent), 'dry run switch');
@@ -1255,6 +1276,214 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     mode = 'paper'; assert.strictEqual(await mu.sizeMasterOrder(ord), null, 'paper mode: untouched'); mode = 'live';
     delete process.env.MASTER_FOLLOWS_PLAN;
     ok('master sizing (MASTER_FOLLOWS_PLAN): off by default; on, the master uses the same rule (20% of its balance, $500 cap, pair leverage); closes, held pairs, paper mode and unsizable orders are left to the manager');
+  }
+
+  // ---------- Profit Guard: raises stops toward profit only, shadow first, clamps looser bot stops ----------
+  {
+    await db.query('TRUNCATE profit_guard_log, pg_trades'); await db.query(`DELETE FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch')`);
+    mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 125, ETHUSDT: 2000 };
+    for (const kk of Object.keys(state.positions)) delete state.positions[kk];
+    mu._test.pgState.clear(); mode = 'live'; halted = false; await call('/api/admin/profit-guard', 'POST', { mode: 'off' }, admin);   // a failed earlier run may have left it on
+    await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','swing',100,90) ON CONFLICT (k) DO NOTHING`);
+    const P = (mark, sl) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl) }; };
+    const G = () => call('/api/admin/profit-guard', 'GET', null, admin);
+    const masterStops = () => state.stops.filter(x => x.k === 'ADMINK');
+    const logs = async (ev) => (await db.query(`SELECT * FROM profit_guard_log WHERE event=$1 ORDER BY id`, [ev])).rows;
+    assert.strictEqual((await G()).j.cfg.mode, 'off');
+    P(150, 90); let s0 = state.stops.length; await mu._test.pgTick(); assert.strictEqual(state.stops.length, s0); assert.strictEqual(mu._test.pgState.size, 0);
+    assert.strictEqual((await call('/api/admin/profit-guard', 'GET')).s, 401);
+    assert.strictEqual((await call('/api/admin/profit-guard', 'POST', { mode: 'turbo' }, admin)).s, 400);
+    assert.strictEqual((await call('/api/admin/profit-guard', 'POST', { mode: 'live' }, admin)).s, 400, 'going live needs the confirm');
+    ok('profit guard: off by default and does nothing; settings need admin and a confirm to go live');
+
+    assert((await call('/api/admin/profit-guard', 'POST', { mode: 'shadow' }, admin)).j.cfg.mode === 'shadow');
+    s0 = state.stops.length; P(150, 90); await mu._test.pgTick();
+    assert.strictEqual(state.stops.length, s0, 'shadow never touches a stop');
+    let wr = await logs('would_raise'); assert.strictEqual(wr.length, 1); assert.strictEqual(Number(wr[0].new_sl), 127.5); assert.strictEqual(wr[0].profile, 'swing');
+    await mu._test.pgTick(); assert.strictEqual((await logs('would_raise')).length, 1, 'the same decision is not logged again');
+    P(120, 90); await mu._test.pgTick(); assert.strictEqual((await logs('would_exit')).length, 1, 'price fell to the guard\'s stop: recorded as a would-be exit');
+    state.closedPnl.ADMINK = [{ symbol: 'BTCUSDT', avgExitPrice: '125', closedPnl: '2.5', updatedTime: String(Date.now()) }];
+    delete state.positions['ADMINK:BTCUSDT']; await mu._test.pgTick(); assert.strictEqual((await logs('closed')).length, 1); assert.strictEqual(mu._test.pgState.size, 0);
+    ok('profit guard shadow: logs the stop it would set and the exit it would have made, touches nothing real, forgets a closed trade');
+
+    assert((await call('/api/admin/profit-guard', 'POST', { mode: 'live', confirm: 'LIVE' }, admin)).j.cfg.mode === 'live');
+    state.positions['KEYB:BTCUSDT'] = { side: 'Buy', size: '0.02', avgPrice: '100' };
+    tradeAlerts.length = 0; s0 = state.stops.length; P(150, 90); await mu._test.pgTick(); await sleep(400);
+    assert.deepStrictEqual(masterStops().slice(-1)[0].b.stopLoss, '127.5');
+    assert(state.stops.slice(s0).every(x => x.b.stopLoss === '127.5' && x.b.symbol === 'BTCUSDT'), 'master and copies get the same stop');
+    assert((await logs('raised')).length === 1 && tradeAlerts.some(t => /Profit locked: BTC long/.test(t)));
+    const n1 = state.stops.length; P(150, 127.5); await mu._test.pgTick(); await sleep(100); assert.strictEqual(state.stops.length, n1, 'already tight: nothing more is sent');
+    ok('profit guard live: raises the master stop and the copies\' stops once, tells you, and does not repeat');
+
+    assert.strictEqual(mu.guardClamp({ symbol: 'BTCUSDT', stopLoss: '95', takeProfit: '300' }).stopLoss, '127.5');
+    assert.strictEqual(mu.guardClamp({ symbol: 'BTCUSDT', stopLoss: '0' }).stopLoss, '127.5');
+    assert.strictEqual(mu.guardClamp({ symbol: 'BTCUSDT', stopLoss: '140' }).stopLoss, '140');
+    assert.strictEqual(mu.guardClamp({ symbol: 'BTCUSDT', takeProfit: '300' }).stopLoss, undefined);
+    assert.strictEqual(mu.guardClamp({ symbol: 'ETHUSDT', stopLoss: '1' }).stopLoss, '1');
+    await sleep(300); assert((await logs('held')).length >= 2);
+    ok('profit guard: a bot\'s looser stop (or a stop removal) is held at the floor; a tighter stop, TP-only updates and other pairs pass untouched');
+
+    P(200, 127.5); await mu._test.pgTick(); assert.strictEqual(masterStops().slice(-1)[0].b.stopLoss, '165');   // 10R: keep 65% of the +100 peak
+    P(180, 165); await mu._test.pgTick(); assert.strictEqual(masterStops().slice(-1)[0].b.stopLoss, '165', 'a pullback never lowers it');
+    ok('profit guard: the floor follows new highs and never drops on a pullback');
+
+    halted = true; const n2 = state.stops.length; P(260, 165); await mu._test.pgTick(); assert.strictEqual(state.stops.length, n2, 'halted: it does nothing');
+    halted = false; mode = 'paper'; P(260, 165); await mu._test.pgTick(); assert.strictEqual(state.stops.length, n2, 'paper mode: it does nothing'); mode = 'live';
+    state.submitRet = {};
+    const saved = (await db.query(`SELECT v FROM meta WHERE k='profit_guard_state'`)).rows[0]; assert(saved && /BTCUSDT\|Buy/.test(saved.v), 'peaks and floors are saved');
+    ok('profit guard: stays out when trading is halted or in paper mode; its state is saved for restarts');
+
+    assert((await call('/api/admin/profit-guard', 'POST', { mode: 'off' }, admin)).j.cfg.mode === 'off');
+    assert.strictEqual(mu.guardClamp({ symbol: 'BTCUSDT', stopLoss: '95' }).stopLoss, '95', 'off: no clamping');
+    for (const kk of Object.keys(state.positions)) delete state.positions[kk]; mu._test.pgState.clear();
+    await db.query(`DELETE FROM meta WHERE k IN ('profit_guard','profit_guard_state')`);
+    ok('profit guard: switching it off removes all of its influence');
+
+    // ---------- v2.7.0: per-profile modes, scorecard, re-entry recorder, scale-out ----------
+    {
+      mu._test.pgState.clear(); mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 125, ETHUSDT: 2000 };
+      await db.query('TRUNCATE profit_guard_log, pg_trades');
+      await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig2','YM ORACLE IV','ETHUSDT','BUY','fast',100,90) ON CONFLICT (k) DO NOTHING`);
+      const PB = (mark, sl, size) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: String(size || 0.1), avgPrice: '100', markPrice: String(mark), stopLoss: String(sl) }; };
+      const PE = (mark, sl) => { state.positions['ADMINK:ETHUSDT'] = { side: 'Buy', size: '1', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl) }; };
+      const P2 = () => call('/api/admin/profit-guard', 'POST', {}, admin);
+      // a profile can have its own mode; going live for any profile needs the confirm
+      assert.strictEqual((await call('/api/admin/profit-guard', 'POST', { mode: 'shadow', swing: { mode: 'live' } }, admin)).s, 400);
+      const sm = await call('/api/admin/profit-guard', 'POST', { mode: 'shadow', swing: { mode: 'live' }, confirm: 'LIVE' }, admin);
+      assert(sm.j.success && sm.j.cfg.swing.mode === 'live' && sm.j.cfg.fast.mode === 'inherit');
+      let s0 = state.stops.length; PB(150, 90); PE(150, 90); await mu._test.pgTick(); await sleep(300);
+      assert(masterStops().slice(s0 ? 0 : 0).some(x => x.b.symbol === 'BTCUSDT' && x.b.stopLoss === '127.5'), 'swing (live) moved its real stop');
+      assert(!state.stops.some(x => x.b.symbol === 'ETHUSDT'), 'fast (shadow) touched nothing');
+      assert((await logs('would_raise')).some(x => x.symbol === 'ETHUSDT' && x.profile === 'fast'), 'fast recorded what it would do');
+      assert.strictEqual(mu.guardClamp({ symbol: 'ETHUSDT', stopLoss: '95' }).stopLoss, '95', 'only a LIVE profile clamps');
+      assert.strictEqual(mu.guardClamp({ symbol: 'BTCUSDT', stopLoss: '95' }).stopLoss, '127.5');
+      assert.strictEqual((await call('/api/admin/profit-guard', 'POST', { mode: 'off' }, admin)).j.cfg.mode, 'off');
+      ok('profit guard: fast and swing each have their own mode (here swing live, fast shadow); the overall Off is a master switch; going live needs the confirm');
+
+      // scorecard: a closed trade is stored with Bybit's own exit and how much it gave back
+      await call('/api/admin/profit-guard', 'POST', { mode: 'shadow', swing: { mode: 'live' }, confirm: 'LIVE' }, admin);
+      state.closedPnl.ADMINK = [{ symbol: 'BTCUSDT', avgExitPrice: '130', closedPnl: '3', updatedTime: String(Date.now()) }];
+      delete state.positions['ADMINK:BTCUSDT']; delete state.positions['ADMINK:ETHUSDT'];
+      await mu._test.pgTick();
+      const tr = (await db.query(`SELECT * FROM pg_trades WHERE symbol='BTCUSDT' ORDER BY id DESC LIMIT 1`)).rows[0];
+      assert(tr && tr.profile === 'swing' && tr.mode === 'live' && Number(tr.peak_pct) === 50 && Number(tr.exit_pct) === 30 && Number(tr.giveback_pct) === 20 && Number(tr.peak_r) === 5 && Number(tr.exit_r) === 3, JSON.stringify(tr));
+      assert.strictEqual((await db.query(`SELECT 1 FROM pg_trades WHERE symbol='ETHUSDT'`)).rows.length, 0, 'it waits for Bybit\'s record first');
+      for (let i = 0; i < 7; i++) await mu._test.pgTick();
+      const eth = (await db.query(`SELECT * FROM pg_trades WHERE symbol='ETHUSDT'`)).rows[0]; assert(eth && eth.exit_price === null && eth.mode === 'shadow', 'an exit Bybit has not reported is kept as unknown, not guessed');
+      assert.strictEqual(mu._test.pgClosing.length, 0);
+      const sc = (await call('/api/admin/profit-guard', 'GET', null, admin)).j.scorecard;
+      assert(sc.recent.length >= 2 && sc.summary.some(x => x.profile === 'swing' && Number(x.giveback) === 20), JSON.stringify(sc.summary));
+      ok('profit guard scorecard: each closed trade is stored with its best point, its real exit and how much it gave back; an unknown exit stays unknown');
+
+      // re-entry recorder: pulled back, resumed, +2R (recording only; nothing is ordered)
+      assert(mu._test.pgWatch.has('BTCUSDT|Buy'), 'a winner that closed is being watched');
+      const sub0 = state.submits.length;
+      state.tickers.BTCUSDT = 120; await mu._test.pgTick(); assert.strictEqual((await logs('would_reenter')).length, 0);
+      state.tickers.BTCUSDT = 135; await mu._test.pgTick();
+      const wr = await logs('would_reenter'); assert.strictEqual(wr.length, 1); assert.strictEqual(Number(wr[0].mark), 135); assert.strictEqual(Number(wr[0].new_sl), 120);
+      state.tickers.BTCUSDT = 170; await mu._test.pgTick();
+      const rr = await logs('reentry_result'); assert(rr.length === 1 && Number(rr[0].result_r) === 2, JSON.stringify(rr));
+      assert(!mu._test.pgWatch.has('BTCUSDT|Buy'), 'finished watches are removed');
+      assert.strictEqual(state.submits.length, sub0, 'the recorder never places an order');
+      const rsum = (await call('/api/admin/profit-guard', 'GET', null, admin)).j.scorecard.reentry; assert(rsum.spotted === 1 && rsum.done === 1 && rsum.wins === 1);
+      ok('profit guard re-entry recorder: notes a pullback-and-resume entry and its outcome, shows it in the summary, and never trades');
+
+      // scale-out
+      await call('/api/admin/profit-guard', 'POST', { mode: 'shadow', swing: { mode: 'shadow', scale: { on: true, steps: [[3, 0.25]] } } }, admin);
+      PB(135, 90); await mu._test.pgTick(); await sleep(150);
+      assert((await logs('would_scale')).length === 1 && state.submits.length === sub0, 'shadow only records');
+      state.positions['KEYA:BTCUSDT'] = { side: 'Buy', size: '0.4' };
+      assert.strictEqual((await call('/api/admin/profit-guard', 'POST', { swing: { mode: 'live', scale: { on: true } } }, admin)).s, 400, 'live scale-out needs the confirm');
+      await call('/api/admin/profit-guard', 'POST', { mode: 'live', confirm: 'LIVE', swing: { mode: 'live' } }, admin);
+      mu._test.pgState.clear(); PB(135, 90, 0.1); await mu._test.pgTick(); await sleep(500);
+      const so = state.submits.slice(sub0).filter(x => x.body.reduceOnly);
+      const mo = so.find(x => x.k === 'ADMINK'); assert(mo && mo.body.qty === '0.02' && mo.body.side === 'Sell', JSON.stringify(so.map(x => [x.k, x.body.qty])));
+      const uo = so.find(x => x.k === 'KEYA'); assert(uo && uo.body.qty === '0.1', 'a copy closes the same SHARE of its own position (25% of 0.4)');
+      assert((await logs('scaled')).length === 1 && tradeAlerts.some(t => /Profit banked: BTC long 25%/.test(t)));
+      const sub1 = state.submits.length; PB(140, 90, 0.08); await mu._test.pgTick(); await sleep(150);
+      assert.strictEqual(state.submits.slice(sub0).filter(x => x.body.reduceOnly).length, so.length, 'each step is taken once');
+      const fit = await mu.guardFitClose({ symbol: 'BTCUSDT', side: 'Sell', reduceOnly: true, qty: '0.1' }); assert.strictEqual(fit.qty, '0.08', 'the bot\'s later full close is fitted to what is left');
+      assert.strictEqual((await mu.guardFitClose({ symbol: 'ETHUSDT', side: 'Sell', reduceOnly: true, qty: '0.1' })).qty, '0.1');
+      assert.strictEqual((await mu.guardFitClose({ symbol: 'BTCUSDT', side: 'Buy', qty: '0.1' })).qty, '0.1', 'opens are never touched');
+      ok('profit guard scale-out: shadow records, live closes a slice on the master and the same share on each copy, once per step, and a later full close is fitted to what is left');
+
+      // no bot is special: the profile follows the trade's own engine tag
+      await call('/api/admin/profit-guard', 'POST', { mode: 'shadow', fast: { mode: 'inherit' }, swing: { mode: 'inherit', scale: { on: false } } }, admin);
+      await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig3','YM ORACLE IV','SOLUSDT','BUY','fast',100,90),('pgsig4','YM ORACLE II','XRPUSDT','SELL','swing',100,110) ON CONFLICT (k) DO NOTHING`);
+      mu._test.pgState.clear();
+      state.positions['ADMINK:SOLUSDT'] = { side: 'Buy', size: '1', avgPrice: '100', markPrice: '101', stopLoss: '90' };
+      state.positions['ADMINK:XRPUSDT'] = { side: 'Sell', size: '1', avgPrice: '100', markPrice: '99', stopLoss: '110' };
+      await mu._test.pgTick();
+      assert.strictEqual(mu._test.pgState.get('SOLUSDT|Buy').profile, 'fast', 'Oracle IV\'s own fast trade follows the fast profile');
+      assert.strictEqual(mu._test.pgState.get('XRPUSDT|Sell').profile, 'swing', 'a swing trade from Oracle II follows the swing profile');
+      ok('profit guard: the profile comes from the trade\'s engine tag, not from which bot sent it');
+      await call('/api/admin/profit-guard', 'POST', { mode: 'off' }, admin);
+      for (const kk of Object.keys(state.positions)) delete state.positions[kk]; mu._test.pgState.clear(); mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.tickers = {}; state.closedPnl.ADMINK = [];
+      await db.query(`DELETE FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch')`);
+      await call('/api/admin/profit-guard', 'POST', { mode: 'off', swing: { mode: 'inherit', scale: { on: false } }, fast: { mode: 'inherit' } }, admin);
+    }
+  }
+
+  // ---------- Profit Guard, smart layer (final-17c): breathing room, stall tightening, self-tuning ----------
+  {
+    const POST = (b, extra) => call('/api/admin/profit-guard', 'POST', Object.assign({}, b, extra || {}), admin);
+    const GETG = () => call('/api/admin/profit-guard', 'GET', null, admin);
+    const reset = async () => {
+      await db.query('TRUNCATE profit_guard_log, pg_trades'); await db.query(`DELETE FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch')`);
+      mu._test.pgState.clear(); mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 100 };
+      for (const kk of Object.keys(state.positions)) delete state.positions[kk]; mode = 'live'; halted = false;
+      await POST({ mode: 'off', smart: { noise: { on: true, mult: 1, capR: 1.5 }, stall: { on: true, fastMin: 30, swingMin: 360, stepPts: 0.1, maxPts: 0.2 }, tune: { mode: 'suggest' } },
+        swing: { mode: 'inherit', ladder: [[2, 0.35], [4, 0.55], [8, 0.65]], scale: { on: false } }, fast: { mode: 'inherit', ladder: [[1.5, 0.45], [3, 0.6], [6, 0.7]], scale: { on: false } } });
+    };
+    const P = (mark, sl) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl) }; };
+    const lastStop = () => Number(state.stops.filter(x => x.k === 'ADMINK').slice(-1)[0].b.stopLoss);
+    await reset();
+    await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','swing',100,90) ON CONFLICT (k) DO NOTHING`);
+    assert.strictEqual((await GETG()).j.cfg.smart.noise.on, true); assert.strictEqual((await GETG()).j.cfg.smart.tune.mode, 'suggest');
+    assert.strictEqual((await POST({ smart: { tune: { mode: 'auto' } } })).s, 400, 'switching auto-tuning on needs the confirm');
+    assert.strictEqual((await POST({ mode: 'live' }, { confirm: 'LIVE' })).j.cfg.mode, 'live');
+
+    // breathing room: the trade has already wobbled 12 (to 96); at 1.1R plain breakeven would be 100.1, which sits inside that wobble, so the stop is held 12 under the price
+    P(108, 90); await mu._test.pgTick(); P(96, 90); await mu._test.pgTick(); P(111, 90); await mu._test.pgTick(); await sleep(150);
+    assert(Math.abs(lastStop() - 99) < 0.011, 'held 12 below the price: ' + lastStop());
+    let rl = (await db.query(`SELECT detail FROM profit_guard_log WHERE event='raised' ORDER BY id DESC LIMIT 1`)).rows[0]; assert(/breathing room/.test(rl.detail), rl.detail);
+    assert(mu._test.pgState.get('BTCUSDT|Buy').maxPull >= 12);
+    P(150, 99); await mu._test.pgTick(); await sleep(100); assert(lastStop() > 120, 'once the price is clear of the wobble the stop moves on: ' + lastStop());
+    ok('profit guard smart: breathing room holds the first raise out of the trade\'s own wobble, then it moves on as the price clears it');
+
+    await reset(); await POST({ mode: 'live', smart: { noise: { on: false } } }, { confirm: 'LIVE' });
+    P(108, 90); await mu._test.pgTick(); P(96, 90); await mu._test.pgTick(); P(111, 90); await mu._test.pgTick(); await sleep(150);
+    assert(Math.abs(lastStop() - 100.1) < 0.011, 'with breathing room switched off the plain breakeven applies: ' + lastStop());
+    ok('profit guard smart: with breathing room off, the plain rules apply unchanged');
+
+    // stall tightening: 1.5R, price stops making new highs for longer than the swing quiet period (6 h): keeps 10 more points
+    await reset(); await POST({ mode: 'live', smart: { noise: { on: false } } }, { confirm: 'LIVE' });
+    P(115, 90); await mu._test.pgTick(); await sleep(100); assert(Math.abs(lastStop() - 100.1) < 0.011);
+    mu._test.pgState.get('BTCUSDT|Buy').peakAt = Date.now() - 361 * 60000;
+    P(114, 100.1); await mu._test.pgTick(); await sleep(100); assert(Math.abs(lastStop() - 101.5) < 0.011, 'stalled for a full period: ' + lastStop());
+    assert(/stalled/.test((await db.query(`SELECT detail FROM profit_guard_log WHERE event='raised' ORDER BY id DESC LIMIT 1`)).rows[0].detail));
+    const wv = (await GETG()).j.trades[0]; assert(wv && wv.stallPts === 10 && wv.pullR !== undefined);
+    P(118, 101.5); await mu._test.pgTick(); assert.strictEqual(mu._test.pgState.get('BTCUSDT|Buy').peakAt > Date.now() - 5000, true, 'a new best restarts the stall clock');
+    ok('profit guard smart: a trade with no new best for a full quiet period keeps 10 more points of its profit; a new best resets the clock');
+
+    // self-tuning
+    await reset(); await POST({ mode: 'live' }, { confirm: 'LIVE' });
+    const addRows = async (n, from) => { for (let i = 0; i < n; i++) await db.query(`INSERT INTO pg_trades(symbol,side,profile,mode,entry,initial_sl,peak_price,exit_price,peak_pct,exit_pct,giveback_pct,peak_r,exit_r,scaled) VALUES('BTCUSDT','Buy','swing','live',100,90,110,103,10,3,7,3,0.3,0)`); };
+    await addRows(5); let tg = (await GETG()).j.tuning.swing; assert.strictEqual(tg.ready, false); assert((await POST({ applyTuning: 'swing' }, { confirm: 'LIVE' })).s === 400, 'nothing to apply yet');
+    await addRows(20); tg = (await GETG()).j.tuning.swing; assert(tg.ready && tg.action === 'tighten' && tg.changes.length === 3, JSON.stringify(tg));
+    assert.strictEqual((await POST({ applyTuning: 'swing' })).s, 400, 'changing live stop rules needs the confirm');
+    let ap = await POST({ applyTuning: 'swing' }, { confirm: 'LIVE' }); assert(ap.j.success && Math.abs(ap.j.cfg.swing.ladder[0][1] - 0.40) < 1e-9 && ap.j.cfg.smart.tune.lastAtN.swing === 25, JSON.stringify(ap.j.cfg.swing.ladder));
+    assert.strictEqual((await db.query(`SELECT 1 FROM profit_guard_log WHERE event='tuned'`)).rowCount, 1);
+    assert.strictEqual((await POST({ applyTuning: 'nope' }, { confirm: 'LIVE' })).s, 400);
+    ok('profit guard smart: tuning waits for enough live trades, suggests a small tightening when trades hand profit back, and applies it only on confirm');
+    assert.strictEqual((await POST({ smart: { tune: { mode: 'auto' } } }, { confirm: 'LIVE' })).j.cfg.smart.tune.mode, 'auto');
+    await mu._test.pgAutoTune(true); assert.strictEqual((await GETG()).j.cfg.swing.ladder[0][1], 0.40, 'fewer than 10 new trades since the last change: no change');
+    await addRows(10); await mu._test.pgAutoTune(true); const cf = (await GETG()).j.cfg;
+    assert(Math.abs(cf.swing.ladder[0][1] - 0.45) < 1e-9 && cf.smart.tune.lastAtN.swing === 35, JSON.stringify(cf.swing.ladder));
+    assert.strictEqual((await db.query(`SELECT 1 FROM profit_guard_log WHERE event='tuned'`)).rowCount, 2);
+    ok('profit guard smart: automatic tuning needs the confirm to switch on, acts at most once per 10 new live trades, and logs every change');
+    await reset();
+    await POST({ mode: 'off', smart: { tune: { mode: 'suggest' } }, swing: { mode: 'inherit' }, fast: { mode: 'inherit' } });
   }
 
   const fs = require('fs'); for (const f of ['admin', 'join', 'share']) assert(fs.existsSync(R + '/public/' + f + '.html'));

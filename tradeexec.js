@@ -84,7 +84,7 @@ function classify(res) {
 }
 
 function create(deps) {
-  const d = Object.assign({ now: () => Date.now(), sleep: ms => new Promise(r => setTimeout(r, ms)), log: () => {}, fanOutLeverage: () => {}, fanOutTradingStop: () => {}, report: () => {} }, deps);
+  const d = Object.assign({ now: () => Date.now(), sleep: ms => new Promise(r => setTimeout(r, ms)), log: () => {}, fanOutLeverage: () => {}, fanOutTradingStop: () => {}, guardClamp: b => b, report: () => {} }, deps);
   const done = new Map();      // "kind:id" -> { at, body }
   const inflight = new Map();  // "kind:id" -> Promise<{ http, body, cache }>
   const locks = new Map();     // symbol -> tail of a promise chain
@@ -172,6 +172,7 @@ function create(deps) {
 
   // setTradingStop with the manager's "try three times on a non-answer" rule. Returns { ok, code, detail }.
   async function tradingStop(body) {
+    try { body = d.guardClamp(body) || body; } catch (e) { /* the guard must never block a stop update */ }
     Promise.resolve().then(() => d.fanOutTradingStop(body)).catch(() => {});
     if (d.mode() === 'paper') return { ok: true, code: 'PAPER', detail: 'paper mode: nothing was sent to Bybit', paper: true };
     let c = { ok: false, code: 'NET', detail: 'no reply from Bybit' };

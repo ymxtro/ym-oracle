@@ -316,7 +316,7 @@ function csvCell(v) {
 // ---------- module ----------
 function init(deps) {
   const noop = async () => {};
-  const off = { enabled: false, canPersist: false, loadMasterCreds: async () => null, saveMasterCreds: async () => ({ ok: false, reason: 'no database' }), clearMasterCreds: async () => ({ ok: false, reason: 'no database' }), fanOutOrder: noop, fanOutTradingStop: noop, fanOutLeverage: noop, recordExec: noop, recordBotEvent: async () => ({ status: 200 }), verifyAdminToken: async () => false, sizeMasterOrder: async () => null,
+  const off = { enabled: false, canPersist: false, loadMasterCreds: async () => null, saveMasterCreds: async () => ({ ok: false, reason: 'no database' }), clearMasterCreds: async () => ({ ok: false, reason: 'no database' }), fanOutOrder: noop, fanOutTradingStop: noop, guardClamp: b => b, guardFitClose: async b => b, fanOutLeverage: noop, recordExec: noop, recordBotEvent: async () => ({ status: 200 }), verifyAdminToken: async () => false, sizeMasterOrder: async () => null,
     _test: { envOptsFor, defaultEnvFor, encrypt, decrypt, scaleQty, sizeForUser, minPositive, parseControls, planMatch, PLAN_DEFAULT, hashPassword, verifyPassword, classifyRet, permissionProblem, sanitizeOrder, sanitizeStop, sanitizeLeverage, csvCell } };
 
   const DATABASE_URL = process.env.DATABASE_URL || '';
@@ -329,6 +329,10 @@ function init(deps) {
   }
 
   const { app, restClient, getMode, breakerIsTripped, sendAlert, baseOpts } = deps;
+  const PG = require('./profitguard.js');
+  let pgCfg = PG.defaults();            // Profit Guard settings (off until switched on from the admin console)
+  const pgWatch = new Map();            // re-entry watches (recording only); filled and used further down
+  const pgState = new Map();            // 'SYMBOL|Buy' -> { entry, initialSl, peak, floor, shadowSl, profile, ... } for every trade being watched
   // deliverAlert (optional dep) = async text => { ok, configured, telegram, email }: waits for the real result. Falls back to fire-and-forget sendAlert.
   const deliverAlert = deps.deliverAlert || (async (t, _o) => { if (!sendAlert) return { ok: false, configured: false }; sendAlert(t); return { ok: true, configured: true, telegram: 'sent' }; });
   const getSecurityInfo = deps.getSecurityInfo || (() => ({}));
@@ -510,6 +514,18 @@ function init(deps) {
       UNIQUE (user_id, tx_key)
     );
     CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS profit_guard_log (
+      id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      symbol TEXT, side TEXT, mode TEXT, profile TEXT, event TEXT,
+      entry NUMERIC, mark NUMERIC, old_sl NUMERIC, new_sl NUMERIC, peak_r NUMERIC, lock_pct NUMERIC, detail TEXT
+    );
+    CREATE INDEX IF NOT EXISTS profit_guard_log_at_idx ON profit_guard_log(at DESC);
+    ALTER TABLE profit_guard_log ADD COLUMN IF NOT EXISTS result_r NUMERIC;
+    CREATE TABLE IF NOT EXISTS pg_trades (
+      id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(), symbol TEXT, side TEXT, profile TEXT, mode TEXT,
+      entry NUMERIC, initial_sl NUMERIC, peak_price NUMERIC, exit_price NUMERIC, peak_pct NUMERIC, exit_pct NUMERIC, giveback_pct NUMERIC,
+      peak_r NUMERIC, exit_r NUMERIC, guard_floor NUMERIC, scaled INT, pnl NUMERIC
+    );
     -- when a user switches between a demo key and a live key, the results of the environment they leave are moved here
     -- (kept, never mixed into their current numbers or the admin totals)
     CREATE TABLE IF NOT EXISTS pnl_ledger_old (LIKE pnl_ledger);
@@ -545,6 +561,14 @@ function init(deps) {
       try { const ar = await q(`SELECT v FROM meta WHERE k='alert_routes'`); if (ar.rows[0]) alertRouter.state.cfg = alertRouter.route.normalize(JSON.parse(ar.rows[0].v)); }
       catch (e) { console.error('[multiuser] alert routes not loaded, using defaults:', e.message); }
     }
+    try {                                                // Profit Guard: saved settings and the peaks/floors of trades that were open (so a restart forgets nothing)
+      const pg = await q(`SELECT k, v FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch')`);
+      for (const row of pg.rows) {
+        if (row.k === 'profit_guard') pgCfg = PG.normalize(JSON.parse(row.v));
+        else if (row.k === 'profit_guard_watch') { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) pgWatch.set(k, v); }
+        else { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) pgState.set(k, v); }
+      }
+    } catch (e) { console.error('[multiuser] profit guard settings not loaded, it stays off:', e.message); }
     const dr = await q(`SELECT v FROM meta WHERE k='dry_run_all'`);
     dryAll = !!(dr.rows[0] && dr.rows[0].v === '1');
     const mp = await q(`SELECT v FROM meta WHERE k='master_plan'`);
@@ -783,7 +807,7 @@ function init(deps) {
       const r = await withRetry(() => restClient.getInstrumentsInfo({ category: 'linear', symbol }));
       if (r.retCode !== 0 || !(r.result.list || []).length) return null;
       const i = r.result.list[0];
-      const v = { qtyStep: parseFloat(i.lotSizeFilter.qtyStep), minQty: parseFloat(i.lotSizeFilter.minOrderQty), status: i.status };
+      const v = { qtyStep: parseFloat(i.lotSizeFilter.qtyStep), minQty: parseFloat(i.lotSizeFilter.minOrderQty), status: i.status, tickSize: parseFloat((i.priceFilter || {}).tickSize) || 0 };
       instCache.set(symbol, { at: Date.now(), v });
       return v;
     } catch (e) {
@@ -1397,6 +1421,281 @@ function init(deps) {
     return { users, added, failed };
   }
 
+  // ---------- Profit Guard ----------
+  // Watches the MASTER account's open trades every few seconds (see profitguard.js). Three jobs, each switchable per profile (fast / swing):
+  //   1. lock profit: only ever RAISES a stop toward the profit side (never loosens it) and keeps the stop on Bybit
+  //   2. scale-out (optional): closes a small slice at set R levels and leaves a runner
+  //   3. re-entry RECORDER: after a winner closes, notes when a "pulled back, then resumed" entry would have appeared and how it would have ended. It never trades.
+  // shadow = records what it would do and touches nothing. live = does it for real (master and copies).
+  const pgRun = { at: 0, ok: null, note: '', err: null, positions: 0, busy: false, raises: 0, scales: 0 };
+  let pgSavedAt = 0, pgForce = false;
+  const pgClosing = [];           // trades that just closed, waiting for Bybit's closed-PnL record (in memory only)
+  const pgEm = st => PG.effMode(pgCfg, st.profile);
+  async function pgLog(row) {
+    try {
+      await q(`INSERT INTO profit_guard_log(symbol,side,mode,profile,event,entry,mark,old_sl,new_sl,peak_r,lock_pct,detail,result_r) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        [row.symbol, row.side || null, row.mode || pgCfg.mode, row.profile || null, row.event, row.entry ?? null, row.mark ?? null, row.oldSl ?? null, row.newSl ?? null, row.peakR ?? null, row.lockPct ?? null, String(row.detail || '').slice(0, 300), row.resultR ?? null]);
+    } catch (e) { console.error('[multiuser] profit guard log:', e.message); }
+  }
+  async function pgSaveState(force) {
+    if (!force && Date.now() - pgSavedAt < 15000) return;
+    pgSavedAt = Date.now();
+    try {
+      await q(`INSERT INTO meta(k,v) VALUES('profit_guard_state',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(Object.fromEntries(pgState))]);
+      await q(`INSERT INTO meta(k,v) VALUES('profit_guard_watch',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(Object.fromEntries(pgWatch))]);
+    } catch (e) { console.error('[multiuser] profit guard state:', e.message); }
+  }
+  // Which profile a trade follows, and the stop the bot originally planned for it (from what the bot reported when it opened the trade).
+  async function pgLookup(symbol, side) {
+    try {
+      const r = await q(`SELECT bot, sl, eng FROM signals WHERE symbol=$1 AND side=$2 AND opened_at > now() - interval '30 days' ORDER BY opened_at DESC LIMIT 1`, [symbol, side === 'Buy' ? 'BUY' : 'SELL']);
+      const x = r.rows[0]; if (!x) return { bot: '', sl: 0, eng: null };
+      return { bot: x.bot || '', sl: Number(x.sl) || 0, eng: x.eng || null };
+    } catch { return { bot: '', sl: 0, eng: null }; }
+  }
+  // Scale-out for the copies: each user closes the same SHARE of their OWN position (not the master's quantity).
+  async function fanOutPartialClose(symbol, posSide, frac, inst) {
+    if (getMode() !== 'live' || breakerIsTripped() || !inst) return { users: 0, closed: 0 };
+    const opp = posSide === 'Buy' ? 'Sell' : 'Buy';
+    const users = await tradableUsers({ forOpen: false });
+    let closed = 0;
+    await runLimited(users, 5, u => enqueue(u.id, async () => {
+      if (isDry(u)) return;
+      const base = { userId: u.id, kind: 'CLOSE', symbol, side: opp };
+      try {
+        const client = userClient(u);
+        const pos = await getOpenPosition(client, symbol);
+        if (!pos || pos.side !== posSide) return;
+        const qty = PG.sliceQty(pos.size, frac, inst.qtyStep, inst.minQty);
+        if (!qty) return logOrder({ ...base, code: 'MINQ', ok: true, detail: 'Scale-out skipped: the position is too small to split' });
+        const res = await client.submitOrder({ category: 'linear', symbol, side: opp, orderType: 'Market', qty: String(qty), reduceOnly: true, positionIdx: Number(pos.positionIdx) || 0 });
+        if (res.retCode === 0) { closed++; await logOrder({ ...base, qty, code: 'OK', ok: true, detail: 'Scale-out: took ' + Math.round(frac * 100) + '% profit, the rest keeps running' }); }
+        else { const f = failFrom({ retCode: res.retCode, message: res.retMsg }); await logOrder({ ...base, qty, code: f.code, ok: false, detail: 'Scale-out failed: ' + res.retMsg }); if (f.auth) await markKeyError(u, res.retMsg); }
+      } catch (e) { const f = failFrom(e); await logOrder({ ...base, code: f.code, ok: false, detail: 'Scale-out failed: ' + f.detail }); if (f.auth) await markKeyError(u, f.detail); }
+    }));
+    return { users: users.length, closed };
+  }
+  // A trade has closed: find Bybit's own exit, store the scorecard row, and (for a winner) start a re-entry watch.
+  async function pgRecordClose(it) {
+    const st = it.st, [symbol, side] = it.key.split('|'), long = side === 'Buy';
+    let exit = 0, pnl = null;
+    try {
+      const r = await restClient.getClosedPnL({ category: 'linear', symbol, limit: 10 });
+      const rows = ((r.result && r.result.list) || []).filter(x => x.symbol === symbol && Number(x.updatedTime || x.createdTime || 0) >= st.since - 60000);
+      const last = rows.find(x => Number(x.updatedTime || x.createdTime || 0) >= it.at - 180000);
+      if (last && parseFloat(last.avgExitPrice) > 0) { exit = parseFloat(last.avgExitPrice); pnl = rows.reduce((t, x) => t + (Number(x.closedPnl) || 0), 0); }
+    } catch { /* retried below */ }
+    if (!(exit > 0) && it.tries < 6) { it.tries++; return false; }
+    const entry = st.entry, risk = st.initialSl > 0 ? Math.abs(entry - st.initialSl) : 0;
+    const peakDist = long ? st.peak - entry : entry - st.peak, exitDist = exit > 0 ? (long ? exit - entry : entry - exit) : null;
+    const peakPct = peakDist / entry * 100, exitPct = exitDist === null ? null : exitDist / entry * 100;
+    const peakR = risk > 0 ? peakDist / risk : null, exitR = risk > 0 && exitDist !== null ? exitDist / risk : null;
+    const gb = exitPct === null ? null : peakPct - exitPct;
+    try {
+      await q(`INSERT INTO pg_trades(symbol,side,profile,mode,entry,initial_sl,peak_price,exit_price,peak_pct,exit_pct,giveback_pct,peak_r,exit_r,guard_floor,scaled,pnl) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+        [symbol, side, st.profile, it.em, entry, st.initialSl || null, st.peak, exit || null, peakPct, exitPct, gb, peakR, exitR, st.floor || st.shadowSl || null, (st.scaled || []).length, pnl]);
+    } catch (e) { console.error('[multiuser] profit guard scorecard:', e.message); }
+    await pgLog({ symbol, side, profile: st.profile, mode: it.em, event: 'closed', entry, mark: exit || null, newSl: st.floor || st.shadowSl || null, peakR, detail: 'trade closed' + (exitPct !== null ? ': best +' + peakPct.toFixed(2) + '%, exit ' + (exitPct >= 0 ? '+' : '') + exitPct.toFixed(2) + '%, gave back ' + gb.toFixed(2) + '%' : ' (exit price not found)') + (st.shadowSl > 0 && !st.shadowHit ? ' (price never touched the guard\'s shadow stop)' : '') });
+    const rc = pgCfg.reentry, pf = pgCfg[st.profile];
+    if (rc.on && it.em !== 'off' && risk > 0 && peakR >= pf.beR) {
+      pgWatch.set(it.key, { symbol, side, profile: st.profile, entry, exit: exit || it.mark, peak: st.peak, risk, extreme: exit || it.mark, cand: null, expiresAt: Date.now() + (st.profile === 'swing' ? rc.hoursSwing : rc.hoursFast) * 3600000 });
+      for (const k of [...pgWatch.keys()].slice(0, Math.max(0, pgWatch.size - 20))) pgWatch.delete(k);
+    }
+    return true;
+  }
+  async function pgTick() {
+    if (pgRun.busy || pgCfg.mode === 'off') return;
+    if (getMode() !== 'live' || breakerIsTripped()) { pgRun.note = 'paused: the relay is not live or trading is halted'; return; }
+    pgRun.busy = true;
+    try {
+      await ready;
+      const positions = await listOpenPositions(restClient);
+      const seen = new Set();
+      for (const p of positions) {
+        if (p.side !== 'Buy' && p.side !== 'Sell') continue;
+        const symbol = p.symbol, side = p.side, key = symbol + '|' + side, long = side === 'Buy'; seen.add(key);
+        const entry = parseFloat(p.avgPrice), mark = parseFloat(p.markPrice), curSl = parseFloat(p.stopLoss) || 0;
+        if (!(entry > 0) || !(mark > 0)) continue;
+        let st = pgState.get(key);
+        if (st && Math.abs(st.entry - entry) / st.entry > 0.005) st = null;   // a different trade on the same pair: start fresh
+        if (!st) {
+          const lk = await pgLookup(symbol, side);
+          let init = lk.sl > 0 && (long ? lk.sl < entry : lk.sl > entry) ? lk.sl : 0;                     // the bot's own planned stop
+          if (!init && curSl > 0 && (long ? curSl < entry : curSl > entry)) init = curSl;                    // else the first stop we saw on the position
+          st = { entry, initialSl: init, peak: entry, peakAt: Date.now(), maxPull: 0, floor: 0, shadowSl: 0, shadowHit: false, scaled: [], profile: PG.profileOf(pgCfg, lk.eng, lk.bot), bot: lk.bot, since: Date.now(), lastAlert: 0 };
+          pgState.set(key, st); pgWatch.delete(key);
+        }
+        st.scaled = st.scaled || [];
+        const peak0 = st.peak;
+        st.peak = PG.updatePeak(st.peak, side, mark, entry); st.mark = mark; st.curSl = curSl; st.size = Number(p.size) || 0;
+        if (st.peak !== peak0 || !(st.peakAt > 0)) { st.peakAt = Date.now(); st.dirty = true; }          // smart: a new best resets the stall clock
+        const pull0 = st.maxPull || 0; st.maxPull = PG.updatePull(pull0, side, st.peak, mark);          // smart: the trade's own largest pullback so far
+        if (st.maxPull !== pull0) st.dirty = true;
+        const em = pgEm(st);
+        st.em = em;
+        if (em === 'off') { st.lastWhy = 'switched off for this profile'; continue; }
+        const inst = await getInstrument(symbol).catch(() => null);
+        const pf = pgCfg[st.profile];
+
+        // ---- scale-out ----
+        if (pf.scale.on && st.initialSl > 0 && !PG_BAD_RISK(long, entry, st.initialSl)) {
+          const risk = Math.abs(entry - st.initialSl), curR = (long ? mark - entry : entry - mark) / risk;
+          const doneList = em === 'live' ? st.scaled : (st.scaledShadow = st.scaledShadow || []);
+          const i = PG.scaleDue(pf.scale.steps, curR, doneList);
+          if (i >= 0 && Date.now() >= (st.scaleRetryAt || 0)) {
+            const frac = pf.scale.steps[i][1];
+            if (em === 'shadow') {
+              doneList.push(i); st.dirty = true;
+              await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'would_scale', entry, mark, peakR: curR, detail: 'would take ' + Math.round(frac * 100) + '% off at ' + curR.toFixed(1) + 'R' });
+            } else {
+              const qty = PG.sliceQty(p.size, frac, inst && inst.qtyStep, inst && inst.minQty);
+              if (!qty) { doneList.push(i); st.dirty = true; await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'scale_skipped', entry, mark, detail: 'position too small to split' }); }
+              else {
+                let res = null, err = null;
+                try { res = await restClient.submitOrder({ category: 'linear', symbol, side: long ? 'Sell' : 'Buy', orderType: 'Market', qty: String(qty), reduceOnly: true, positionIdx: Number(p.positionIdx) || 0 }); }
+                catch (e) { err = e.message || String(e); }
+                if (res && res.retCode === 0) {
+                  doneList.push(i); st.dirty = true; pgForce = true; pgRun.scales++;
+                  await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'scaled', entry, mark, peakR: curR, detail: 'took ' + Math.round(frac * 100) + '% profit at ' + curR.toFixed(1) + 'R (' + qty + ')' });
+                  fanOutPartialClose(symbol, side, frac, inst).catch(e => console.error('[multiuser] profit guard scale-out fan-out:', e.message));
+                  if (pgCfg.alerts) deliverAlert('💰 Profit banked: ' + symbol.replace(/USDT$/, '') + ' ' + (long ? 'long' : 'short') + ' ' + Math.round(frac * 100) + '% closed at ' + curR.toFixed(1) + 'R. The rest keeps running with its stop.', { cat: 'updates' }).catch(() => {});
+                } else {
+                  st.scaleRetryAt = Date.now() + 60000;
+                  await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'failed', entry, mark, detail: 'scale-out: ' + (err || (res && res.retMsg) || 'no answer') });
+                }
+              }
+            }
+          }
+        }
+
+        // ---- profit lock ----
+        const eff = em === 'shadow' && st.shadowSl > 0 ? (long ? Math.max(curSl, st.shadowSl) : (curSl > 0 ? Math.min(curSl, st.shadowSl) : st.shadowSl)) : curSl;
+        const d = PG.decide({ side, entry, mark, peak: st.peak, curSl: eff, initialSl: st.initialSl, tick: inst && inst.tickSize || 0, profile: pf, cfg: pgCfg,
+          smart: { ...PG.noiseOf(pgCfg, st.maxPull), stallExtra: PG.stallExtra(pgCfg, st.profile, Date.now(), st.peakAt) } });
+        st.lastWhy = d.action === 'raise' ? d.label : d.why; st.peakR = d.peakR !== undefined ? d.peakR : st.peakR;
+        if (em === 'shadow' && st.shadowSl > 0 && !st.shadowHit && (long ? mark <= st.shadowSl : mark >= st.shadowSl)) {
+          st.shadowHit = true;
+          await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'would_exit', entry, mark, newSl: st.shadowSl, peakR: st.peakR, lockPct: (long ? st.shadowSl - entry : entry - st.shadowSl) / entry * 100, detail: 'price touched the guard\'s stop: it would have been closed here with the profit locked' });
+        }
+        if (d.action !== 'raise') continue;
+        if (em === 'shadow') {
+          st.shadowSl = d.newSl; st.dirty = true;
+          await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'would_raise', entry, mark, oldSl: curSl || null, newSl: d.newSl, peakR: d.peakR, lockPct: d.lockPct, detail: d.label });
+          continue;
+        }
+        // live: move the master's real stop, then the copies' stops
+        const body = { category: 'linear', symbol, positionIdx: Number(p.positionIdx) || 0, stopLoss: String(d.newSl) };
+        let res;
+        try { res = await restClient.setTradingStop(body); }
+        catch (e) { await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'failed', entry, mark, oldSl: curSl || null, newSl: d.newSl, peakR: d.peakR, detail: 'Bybit call failed: ' + (e.message || e) }); continue; }
+        if (res.retCode !== 0 && res.retCode !== 34040) { await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'failed', entry, mark, oldSl: curSl || null, newSl: d.newSl, peakR: d.peakR, detail: 'Bybit refused: ' + (res.retMsg || res.retCode) }); continue; }
+        st.floor = d.newSl; st.curSl = d.newSl; st.dirty = true; pgRun.raises++; pgForce = true;
+        await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'raised', entry, mark, oldSl: curSl || null, newSl: d.newSl, peakR: d.peakR, lockPct: d.lockPct, detail: d.label });
+        fanOutTradingStop({ symbol, positionIdx: Number(p.positionIdx) || 0, stopLoss: String(d.newSl) }).catch(e => console.error('[multiuser] profit guard fan-out:', e.message));
+        if (pgCfg.alerts && Date.now() - st.lastAlert > 60000) {
+          st.lastAlert = Date.now();
+          deliverAlert('🔒 Profit locked: ' + symbol.replace(/USDT$/, '') + ' ' + (long ? 'long' : 'short') + ' stop moved to ' + d.newSl + ' (' + (d.lockPct >= 0 ? '+' : '') + d.lockPct.toFixed(2) + '% from entry, ' + d.label + '). Best so far was ' + d.peakR.toFixed(1) + 'R.', { cat: 'updates' }).catch(() => {});
+        }
+      }
+      // trades that have closed since the last look: queue them for the scorecard
+      let gone = false;
+      for (const [key, st] of [...pgState.entries()]) {
+        if (seen.has(key)) continue;
+        pgClosing.push({ key, st, em: st.em || pgEm(st), at: Date.now(), tries: 0, mark: st.mark });
+        pgState.delete(key); gone = true;
+      }
+      for (let i = 0; i < pgClosing.length;) { if (await pgRecordClose(pgClosing[i]).catch(() => false)) { pgClosing.splice(i, 1); gone = true; } else i++; }
+      // re-entry watches (recording only: this never places a trade)
+      for (const [key, w] of [...pgWatch.entries()]) {
+        if (seen.has(key) || Date.now() > w.expiresAt + 3600000) { pgWatch.delete(key); gone = true; continue; }
+        if (!pgCfg.reentry.on || PG.effMode(pgCfg, w.profile) === 'off') continue;
+        let mk = 0;
+        try { const r = await restClient.getTickers({ category: 'linear', symbol: w.symbol }); mk = parseFloat(r.result.list[0].lastPrice); } catch { continue; }
+        const out = PG.reentryStep(w, mk, Date.now(), pgCfg.reentry);
+        if (out.events.length || out.finished) gone = true;
+        for (const e of out.events) {
+          const base = { symbol: w.symbol, side: w.side, profile: w.profile, mode: 'shadow', entry: w.entry };
+          if (e.type === 'would_reenter') await pgLog({ ...base, event: 'would_reenter', mark: e.price, newSl: e.stop, peakR: e.pullR, detail: 'pulled back ' + e.pullR.toFixed(1) + 'R then resumed: a re-entry would have been taken here (recording only)' });
+          else if (e.type === 'reentry_result') await pgLog({ ...base, event: 'reentry_result', mark: mk, resultR: e.r, peakR: e.bestR, detail: e.why });
+          else if (e.type === 'no_reentry') await pgLog({ ...base, event: 'no_reentry', mark: mk, peakR: e.pullR, detail: 'no pullback-and-resume appeared within the window' });
+        }
+        if (out.finished) pgWatch.delete(key);
+      }
+      await pgAutoTune().catch(e => console.error('[multiuser] profit guard tuning:', e.message));
+      pgRun.at = Date.now(); pgRun.ok = true; pgRun.err = null; pgRun.note = ''; pgRun.positions = positions.length;
+      const changed = gone || [...pgState.values()].some(s => s.dirty);
+      for (const s of pgState.values()) s.dirty = false;
+      if (changed) { await pgSaveState(gone || pgForce); pgForce = false; }
+    } catch (e) { pgRun.at = Date.now(); pgRun.ok = false; pgRun.err = e.message; console.error('[multiuser] profit guard:', e.message); }
+    finally { pgRun.busy = false; }
+  }
+  const PG_BAD_RISK = (long, entry, init) => !(init > 0) || (long ? init >= entry : init <= entry);
+  // Called by the stop route before a bot's stop is applied: while the guard is live for that trade, a looser stop is held at the guard's floor (and a stop removal is refused).
+  function guardClamp(body) {
+    try {
+      if (!body || typeof body !== 'object' || body.stopLoss === undefined) return body;
+      const cands = ['Buy', 'Sell'].map(s => [s, pgState.get(String(body.symbol) + '|' + s)]).filter(([, st]) => st && st.floor > 0 && pgEm(st) === 'live');
+      if (cands.length !== 1) return body;
+      const [side, st] = cands[0];
+      const use = PG.clampStop(side, body.stopLoss, st.floor);
+      if (use === null) return body;
+      pgLog({ symbol: body.symbol, side, profile: st.profile, mode: 'live', event: 'held', entry: st.entry, newSl: st.floor, oldSl: Number(body.stopLoss) || null, detail: 'a stop of ' + body.stopLoss + ' was held at the guard\'s floor ' + st.floor });
+      return { ...body, stopLoss: String(use) };
+    } catch { return body; }
+  }
+  // After a scale-out the bot still thinks it holds the whole position. When it later sends its own close, fit the quantity to what is really left.
+  async function guardFitClose(body) {
+    try {
+      if (!body || body.reduceOnly !== true || !(Number(body.qty) > 0)) return body;
+      const st = ['Buy', 'Sell'].map(s => pgState.get(String(body.symbol) + '|' + s)).find(x => x && x.scaled && x.scaled.length);
+      if (!st) return body;
+      const left = parseFloat(((await getPositionState(restClient, body.symbol)).open || {}).size);
+      if (left > 0 && left < Number(body.qty)) return { ...body, qty: String(left) };
+    } catch { /* the original order goes ahead untouched */ }
+    return body;
+  }
+
+  // ---- smart tuning: read the scorecard, suggest (or, with consent, apply) small changes to the keep shares ----
+  async function pgTuneEval(profile) {
+    const rows = (await q(`SELECT peak_pct, exit_pct, giveback_pct, peak_r FROM pg_trades WHERE profile=$1 AND mode='live' AND exit_pct IS NOT NULL ORDER BY id DESC LIMIT 300`, [profile])).rows
+      .map(r => ({ peak_pct: Number(r.peak_pct), exit_pct: r.exit_pct === null ? null : Number(r.exit_pct), giveback_pct: Number(r.giveback_pct), peak_r: Number(r.peak_r) }));
+    const re = (await q(`SELECT COUNT(*)::int AS done, COUNT(*) FILTER (WHERE result_r>0)::int AS wins, AVG(result_r) AS avg_r FROM profit_guard_log WHERE event='reentry_result' AND profile=$1`, [profile])).rows[0];
+    return PG.suggestTuning(pgCfg, profile, rows, { done: re.done, wins: re.wins, avg_r: re.avg_r === null ? null : Number(re.avg_r) });
+  }
+  async function pgApplyTuning(profile, sug, who) {
+    if (!sug || !sug.next) return false;
+    const next = PG.normalize({ ...pgCfg, [profile]: { ...pgCfg[profile], ladder: sug.next }, smart: { ...pgCfg.smart, tune: { ...pgCfg.smart.tune, lastAtN: { ...pgCfg.smart.tune.lastAtN, [profile]: sug.n } } } });
+    await q(`INSERT INTO meta(k,v) VALUES('profit_guard',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(next)]);
+    pgCfg = next;
+    const txt = sug.changes.map(c => 'step at ' + c.atR + 'R: keep ' + Math.round(c.from * 100) + '% -> ' + Math.round(c.to * 100) + '%').join('; ');
+    await pgLog({ symbol: '-', profile, mode: 'live', event: 'tuned', detail: (who || 'auto') + ' (' + sug.n + ' trades): ' + txt + '. ' + sug.reasons.join(' ') });
+    await audit('admin', 'profit_guard_tuned', null, null, profile + ': ' + txt).catch(() => {});
+    if (pgCfg.alerts) deliverAlert('🧠 Profit Guard tuned the ' + profile + ' ladder: ' + txt + '. Why: ' + sug.reasons.join(' '), { kind: 'master' });
+    return true;
+  }
+  let pgTunedAt = 0;
+  async function pgAutoTune(force) {
+    if (pgCfg.smart.tune.mode !== 'auto' || (!force && Date.now() - pgTunedAt < 60000)) return;
+    pgTunedAt = Date.now();
+    for (const profile of ['fast', 'swing']) {
+      if (PG.effMode(pgCfg, profile) !== 'live') continue;
+      const sug = await pgTuneEval(profile);
+      if (!sug.ready || sug.since < pgCfg.smart.tune.every) continue;
+      if (sug.action === 'hold') { pgCfg = PG.normalize({ ...pgCfg, smart: { ...pgCfg.smart, tune: { ...pgCfg.smart.tune, lastAtN: { ...pgCfg.smart.tune.lastAtN, [profile]: sug.n } } } }); await q(`INSERT INTO meta(k,v) VALUES('profit_guard',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(pgCfg)]); continue; }
+      await pgApplyTuning(profile, sug, 'auto');
+    }
+  }
+  const pgView = async () => {
+    const log = (await q(`SELECT at, symbol, side, mode, profile, event, entry, mark, old_sl, new_sl, peak_r, lock_pct, detail, result_r FROM profit_guard_log ORDER BY id DESC LIMIT 60`)).rows;
+    const trades = [...pgState.entries()].map(([key, st]) => ({ symbol: key.split('|')[0], side: key.split('|')[1], profile: st.profile, bot: st.bot, mode: st.em || pgEm(st), entry: st.entry, mark: st.mark || null, peak: st.peak, peakR: st.peakR || 0, initialSl: st.initialSl || null, stop: st.curSl || null, floor: st.floor || null, shadowStop: st.shadowSl || null, scaled: (st.scaled || []).length, why: st.lastWhy || '', pullR: st.initialSl > 0 ? (st.maxPull || 0) / Math.abs(st.entry - st.initialSl) : null, stallPts: Math.round(PG.stallExtra(pgCfg, st.profile, Date.now(), st.peakAt) * 100) }));
+    const card = (await q(`SELECT at, symbol, side, profile, mode, peak_pct, exit_pct, giveback_pct, peak_r, exit_r, scaled, pnl FROM pg_trades ORDER BY id DESC LIMIT 20`)).rows;
+    const agg = (await q(`SELECT profile, mode, COUNT(*)::int AS n, AVG(peak_pct) AS peak, AVG(exit_pct) AS exit, AVG(giveback_pct) AS giveback FROM pg_trades WHERE exit_pct IS NOT NULL GROUP BY profile, mode ORDER BY profile, mode`)).rows;
+    const re = (await q(`SELECT COUNT(*) FILTER (WHERE event='would_reenter')::int AS spotted, COUNT(*) FILTER (WHERE event='reentry_result')::int AS done, COUNT(*) FILTER (WHERE event='reentry_result' AND result_r>0)::int AS wins, AVG(result_r) FILTER (WHERE event='reentry_result') AS avg_r, COUNT(*) FILTER (WHERE event='no_reentry')::int AS none FROM profit_guard_log`)).rows[0];
+    const watching = [...pgWatch.values()].map(w => ({ symbol: w.symbol, side: w.side, profile: w.profile, cand: !!w.cand, expiresAt: w.expiresAt }));
+    const tuning = {}; for (const pr of ['fast', 'swing']) { try { const t = await pgTuneEval(pr); delete t.next; tuning[pr] = t; } catch { tuning[pr] = null; } }
+    return { cfg: pgCfg, tuning, run: { at: pgRun.at, ok: pgRun.ok, note: pgRun.note, err: pgRun.err, positions: pgRun.positions, raises: pgRun.raises, scales: pgRun.scales, relayMode: getMode(), halted: !!breakerIsTripped() }, trades, log, scorecard: { recent: card, summary: agg, reentry: re, watching } };
+  };
+
   // ---------- CSV export + daily backup ----------
   async function buildCsv(userId) {
     const where = userId ? 'WHERE u.id=$1' : '';
@@ -1430,6 +1729,8 @@ function init(deps) {
     setInterval(() => settlePending().catch(() => {}), 30000);
     setInterval(() => alertSweep().catch(e => console.error('[multiuser] alert sweep:', e.message)), Number(process.env.ALERT_SWEEP_MS) || 20000);   // retries failed deliveries and sends the short safety-net alerts
     setInterval(() => q(`DELETE FROM bot_msgs WHERE created_at < now() - interval '30 days'`).catch(() => {}), 6 * 3600 * 1000);
+    const pgLoop = () => { pgTick().catch(e => console.error('[multiuser] profit guard:', e.message)).finally(() => { const t = setTimeout(pgLoop, Math.max(3000, (pgCfg.pollSec || 5) * 1000)); if (t.unref) t.unref(); }); };
+    setTimeout(pgLoop, 15000);   // Profit Guard loop (does nothing while it is switched off)
     setInterval(() => checkSignalAlarms().catch(e => console.error('[multiuser] signal alarm:', e.message)), Number(process.env.ALERT_SWEEP_MS) || 20000);
     setTimeout(() => syncAll().catch(e => console.error('[multiuser] initial sync:', e.message)), 20000);
     setInterval(() => syncAll().catch(e => console.error('[multiuser] sync:', e.message)), SYNC_INTERVAL_MS);
@@ -2197,6 +2498,34 @@ function init(deps) {
     res.json({ success: true, ...routeView() });
   }));
 
+  // Profit Guard: settings, what it is watching, and its log. Going live needs an explicit confirm.
+  app.get('/api/admin/profit-guard', adminAuth, h(async (req, res) => { res.json({ success: true, ...(await pgView()) }); }));
+  app.post('/api/admin/profit-guard', adminAuth, h(async (req, res) => {
+    const b = req.body || {};
+    if (b.mode !== undefined && !PG.MODES.includes(b.mode)) return res.status(400).json({ success: false, message: 'mode must be off, shadow or live' });
+    if (b.mode === 'live' && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'Going live moves real stops on Bybit. Confirm it on the panel.' });
+    if (b.applyTuning !== undefined) {                 // apply the current suggestion for one profile (the server recomputes it: nothing is taken from the page)
+      const pr = b.applyTuning; if (pr !== 'fast' && pr !== 'swing') return res.status(400).json({ success: false, message: 'applyTuning must be fast or swing' });
+      if (PG.effMode(pgCfg, pr) === 'live' && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'This changes the live stop rules. Confirm it on the panel.' });
+      const sug = await pgTuneEval(pr);
+      if (!sug.ready || sug.action === 'hold' || !sug.next) return res.status(400).json({ success: false, message: 'There is nothing to apply: ' + sug.reasons.join(' ') });
+      await pgApplyTuning(pr, sug, 'admin');
+      return res.json({ success: true, ...(await pgView()) });
+    }
+    const sm = b.smart && typeof b.smart === 'object' ? { noise: { ...pgCfg.smart.noise, ...(b.smart.noise || {}) }, stall: { ...pgCfg.smart.stall, ...(b.smart.stall || {}) }, tune: { ...pgCfg.smart.tune, ...(b.smart.tune || {}), lastAtN: pgCfg.smart.tune.lastAtN } } : pgCfg.smart;
+    const next = PG.normalize({ ...pgCfg, ...b, smart: sm, reentry: b.reentry ? { ...pgCfg.reentry, ...b.reentry } : pgCfg.reentry, fast: b.fast ? { ...pgCfg.fast, ...b.fast } : pgCfg.fast, swing: b.swing ? { ...pgCfg.swing, ...b.swing } : pgCfg.swing });
+    if (next.smart.tune.mode === 'auto' && pgCfg.smart.tune.mode !== 'auto' && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'Auto-tuning changes the live stop rules by itself. Confirm it on the panel.' });
+    for (const pr of ['fast', 'swing']) {      // anything that starts acting on real money needs the explicit confirm
+      const goesLive = PG.effMode(next, pr) === 'live' && PG.effMode(pgCfg, pr) !== 'live';
+      const scaleLive = PG.effMode(next, pr) === 'live' && next[pr].scale.on && !(PG.effMode(pgCfg, pr) === 'live' && pgCfg[pr].scale.on);
+      if ((goesLive || scaleLive) && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'This moves real stops or closes real positions on Bybit. Confirm it on the panel.' });
+    }
+    await q(`INSERT INTO meta(k,v) VALUES('profit_guard',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(next)]);
+    const was = pgCfg.mode; pgCfg = next;
+    await audit('admin', 'profit_guard_changed', null, req, was + ' -> ' + next.mode + ' ' + JSON.stringify({ fast: next.fast, swing: next.swing, minGapPct: next.minGapPct, smart: next.smart }));
+    res.json({ success: true, ...(await pgView()) });
+  }));
+
   // signal-first view: one row per bot signal with what the bot said, whether the order reached the relay, the master result and the copies
   app.get('/api/admin/signal-ledger', adminAuth, h(async (req, res) => {
     const hours = Math.min(168, Math.max(1, parseInt(req.query.hours, 10) || 24));
@@ -2364,7 +2693,7 @@ function init(deps) {
   app.get('/admin', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
   app.get('/s/:token', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'share.html')));
 
-  return { enabled: true, canPersist: true, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
+  return { enabled: true, canPersist: true, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, pgTune: pgTuneEval, pgAutoTune, pgTick, pgState, pgWatch, pgClosing, pgRun, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
 }
 
 module.exports = { init };

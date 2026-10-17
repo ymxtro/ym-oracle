@@ -619,12 +619,13 @@ app.post('/api/trading-stop', requireDevice, async (req, res) => {
     return res.status(503).json({ success: false, message: 'Trading halted', status: breakerStatus() });
   }
   try {
-    multiuser.fanOutTradingStop(req.body).catch(e => console.error('[multiuser] fanOutTradingStop:', e.message));
+    const stopBody = multiuser.guardClamp ? multiuser.guardClamp(req.body) : req.body;   // Profit Guard (when live): a bot's looser stop is held at the guard's floor
+    multiuser.fanOutTradingStop(stopBody).catch(e => console.error('[multiuser] fanOutTradingStop:', e.message));
     let response;
     if (TRADE_MODE === 'paper') {
-      response = { paper: true, wouldHaveSubmitted: req.body, retCode: 0, retMsg: 'PAPER MODE — not sent to Bybit' };
+      response = { paper: true, wouldHaveSubmitted: stopBody, retCode: 0, retMsg: 'PAPER MODE — not sent to Bybit' };
     } else {
-      response = await restClient.setTradingStop(req.body);
+      response = await restClient.setTradingStop(stopBody);
     }
     return res.status(200).json(response);
   } catch (error) {
@@ -1282,6 +1283,7 @@ const tradeExec = require('./tradeexec').create({
   placeOrder: body => processOrder(body),
   fanOutLeverage: b => multiuser.fanOutLeverage(b),
   fanOutTradingStop: b => multiuser.fanOutTradingStop(b),
+  guardClamp: b => (multiuser.guardClamp ? multiuser.guardClamp(b) : b),   // Profit Guard: a looser stop from a bot is held at the guard's floor
   report: rec => ingestExecReport(rec),
   log: (...a) => console.log(...a),
 });

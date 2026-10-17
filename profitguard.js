@@ -10,6 +10,14 @@
 //      "once the trade has been 2R in profit keep at least 35% of its best profit, at 4R keep 55%", and so on.
 //   3. The stop never goes closer to the current price than `minGapPct` (Bybit would refuse it, and it would be noise).
 // Two profiles with their own ladders: fast (the fast engines) and swing (Oracle IV).
+//
+// SMART layer (final-17c, each part can be switched off on the admin card; with all of it off the rules above are unchanged):
+//   a. Breathing room: the trade's own wobble (its largest pullback from its best price so far) sets a minimum distance between the stop and the price,
+//      so a stop is not raised into the noise this particular trade has already shown. It only DELAYS a raise; it never loosens a stop.
+//   b. Stall tightening: a trade that has been in profit but has made no new best for a while is more likely to turn than one still pushing, so the
+//      share of the best profit it must keep creeps up (a few points per stalled period, capped). Any new best resets it.
+//   c. Self-tuning: from the closed-trade scorecard (and the re-entry recorder) it suggests, or with explicit consent applies, small changes to the keep shares.
+//      Bounded: 0.15 to 0.85, a few points at a time, never before enough closed trades, never making a higher rung keep less than a lower one.
 
 const MODES = ['off', 'shadow', 'live'];   // off: does nothing. shadow: records what it WOULD do, touches nothing. live: moves the real stops.
 
@@ -21,8 +29,15 @@ const PMODES = ['inherit', 'off', 'shadow', 'live'];   // a profile can follow t
 
 const copyProfile = p => ({ mode: 'inherit', beR: p.beR, ladder: p.ladder.map(x => x.slice()), scale: { on: p.scale.on, steps: p.scale.steps.map(x => x.slice()) } });
 
+const DEFAULT_SMART = {
+  noise: { on: true, mult: 1.0, capR: 1.5 },                                   // breathing room: gap >= mult x the trade's largest pullback, never more than capR x R
+  stall: { on: true, fastMin: 30, swingMin: 360, stepPts: 0.10, maxPts: 0.20 }, // every stalled period adds stepPts to the keep share, up to maxPts
+  tune:  { mode: 'suggest', minTrades: 20, every: 10, step: 0.05, lastAtN: { fast: 0, swing: 0 } },   // off | suggest | auto
+};
+const copySmart = d => JSON.parse(JSON.stringify(d));
+
 function defaults() {
-  return { mode: 'off', pollSec: 5, minGapPct: 0.25, stepR: 0.1, beOffsetPct: 0.1, alerts: true, swingBots: [],
+  return { mode: 'off', pollSec: 5, minGapPct: 0.25, stepR: 0.1, beOffsetPct: 0.1, alerts: true, swingBots: [], smart: copySmart(DEFAULT_SMART),
     reentry: { on: true, minPullR: 0.5, resumePct: 40, targetR: 2, hoursFast: 6, hoursSwing: 48 },
     fast: copyProfile(DEFAULT_LADDER.fast), swing: copyProfile(DEFAULT_LADDER.swing) };
 }
@@ -67,6 +82,18 @@ function normReentry(raw, d) {
     targetR: num(r.targetR, 0.5, 10, d.targetR), hoursFast: num(r.hoursFast, 1, 72, d.hoursFast), hoursSwing: num(r.hoursSwing, 1, 240, d.hoursSwing) };
 }
 
+function normSmart(raw, d) {
+  const r = (raw && typeof raw === 'object') ? raw : {}, n = (r.noise && typeof r.noise === 'object') ? r.noise : {}, st = (r.stall && typeof r.stall === 'object') ? r.stall : {}, t = (r.tune && typeof r.tune === 'object') ? r.tune : {};
+  const la = (t.lastAtN && typeof t.lastAtN === 'object') ? t.lastAtN : {};
+  return {
+    noise: { on: n.on === undefined ? d.noise.on : n.on === true, mult: num(n.mult, 0, 3, d.noise.mult), capR: num(n.capR, 0.2, 5, d.noise.capR) },
+    stall: { on: st.on === undefined ? d.stall.on : st.on === true, fastMin: num(st.fastMin, 5, 720, d.stall.fastMin), swingMin: num(st.swingMin, 30, 4320, d.stall.swingMin),
+             stepPts: num(st.stepPts, 0.02, 0.3, d.stall.stepPts), maxPts: num(st.maxPts, 0.02, 0.5, d.stall.maxPts) },
+    tune: { mode: ['off', 'suggest', 'auto'].includes(t.mode) ? t.mode : d.tune.mode, minTrades: Math.round(num(t.minTrades, 5, 500, d.tune.minTrades)), every: Math.round(num(t.every, 3, 200, d.tune.every)),
+            step: num(t.step, 0.01, 0.1, d.tune.step), lastAtN: { fast: Math.round(num(la.fast, 0, 1e6, 0)), swing: Math.round(num(la.swing, 0, 1e6, 0)) } },
+  };
+}
+
 // The mode really in force for one profile: the overall switch is a master (off turns everything off), a profile may then set its own.
 function effMode(cfg, profile) {
   if (cfg.mode === 'off') return 'off';
@@ -83,7 +110,7 @@ function normalize(raw) {
     pollSec: num(r.pollSec, 3, 60, d.pollSec), minGapPct: num(r.minGapPct, 0.05, 5, d.minGapPct), stepR: num(r.stepR, 0.02, 1, d.stepR),
     beOffsetPct: num(r.beOffsetPct, 0, 1, d.beOffsetPct), alerts: r.alerts === undefined ? d.alerts : r.alerts === true,
     swingBots: bots,
-    reentry: normReentry(r.reentry, d.reentry),
+    reentry: normReentry(r.reentry, d.reentry), smart: normSmart(r.smart, d.smart),
     fast: normProfile(r.fast, d.fast), swing: normProfile(r.swing, d.swing),
   };
 }
@@ -122,9 +149,16 @@ function decide(i) {
     const cand = long ? entry + frac * peakDist : entry - frac * peakDist;
     if (long ? cand > target : cand < target) { target = cand; label = 'keep ' + Math.round(frac * 100) + '% of the peak'; keepFrac = frac; }
   }
-  const gap = cfg.minGapPct / 100;
-  const limit = long ? mark * (1 - gap) : mark * (1 + gap);      // never closer to the price than this
-  if (long ? target > limit : target < limit) { target = limit; label += ' (held back from the price)'; }
+  const sm = i.smart || {};
+  const noiseGap = Number(sm.noisePrice) > 0 ? Math.min(Number(sm.noisePrice), (Number(sm.noiseCapR) > 0 ? Number(sm.noiseCapR) : 1.5) * risk) : 0;   // breathing room from this trade's own wobble
+  const stallExtra = Number(sm.stallExtra) > 0 ? Math.min(0.5, Number(sm.stallExtra)) : 0;
+  if (stallExtra > 0) {                       // stalled: no new best for a while, so keep a bit more of what was made
+    const f = Math.min(0.9, keepFrac + stallExtra), cand = long ? entry + f * peakDist : entry - f * peakDist;
+    if (long ? cand > target : cand < target) { target = cand; label = keepFrac > 0 ? label + ' +' + Math.round(stallExtra * 100) + ' pts (stalled)' : 'keep ' + Math.round(f * 100) + '% of the peak (stalled)'; keepFrac = f; }
+  }
+  const gapDist = Math.max(mark * cfg.minGapPct / 100, noiseGap);
+  const limit = long ? mark - gapDist : mark + gapDist;          // never closer to the price than this
+  if (long ? target > limit : target < limit) { target = limit; label += noiseGap > mark * cfg.minGapPct / 100 ? ' (held back: breathing room)' : ' (held back from the price)'; }
   target = roundTo(target, tick);
   if (tick > 0) { if (long && target > limit) target -= tick; if (!long && target < limit) target += tick; }
   target = fixTick(target, tick);
@@ -145,6 +179,52 @@ function clampStop(side, incoming, floor) {
   if (!(inc > 0)) return f;                          // "remove the stop" (0 or empty) must not remove the floor
   if (long ? inc < f : inc > f) return f;
   return null;
+}
+
+
+// ---- smart helpers (pure) ----
+// The trade's largest pullback from its best price so far, in price units (grows only).
+function updatePull(prev, side, peak, mark) {
+  const long = side === 'Buy', p = Number(prev) > 0 ? Number(prev) : 0;
+  if (!(peak > 0) || !(mark > 0)) return p;
+  const pull = long ? peak - mark : mark - peak;
+  return pull > p ? pull : p;
+}
+const noiseOf = (cfg, maxPull) => (cfg.smart.noise.on && maxPull > 0 ? { noisePrice: cfg.smart.noise.mult * maxPull, noiseCapR: cfg.smart.noise.capR } : {});
+// Extra share of the best profit to keep because the trade has made no new best for a while. 0 when it is still pushing or the feature is off.
+function stallExtra(cfg, profile, nowMs, peakAt) {
+  const st = cfg.smart.stall;
+  if (!st.on || !(peakAt > 0) || !(nowMs > peakAt)) return 0;
+  const periodMs = (profile === 'swing' ? st.swingMin : st.fastMin) * 60000;
+  const steps = Math.floor((nowMs - peakAt) / periodMs);
+  return steps > 0 ? Math.min(st.maxPts, steps * st.stepPts) : 0;
+}
+
+// Self-tuning from the scorecard. rows: closed trades of ONE profile that ran with the guard LIVE ({ peak_pct, exit_pct, peak_r, giveback_pct }).
+// re: the re-entry recorder summary for that profile ({ done, wins, avg_r }). Returns what it would change and why; changes nothing itself.
+function suggestTuning(cfg, profile, rows, re) {
+  const tu = cfg.smart.tune, pf = cfg[profile], first = pf.ladder.length ? pf.ladder[0][0] : pf.beR;
+  const used = (rows || []).filter(r => Number(r.peak_pct) > 0 && r.exit_pct !== null && r.exit_pct !== undefined && Number(r.peak_r) >= first);
+  const n = used.length, since = n - (tu.lastAtN[profile] || 0);
+  const out = { profile, n, ready: false, action: 'hold', changes: [], reasons: [], since, share: null };
+  if (!pf.ladder.length) { out.reasons.push('this profile has no ladder rungs to tune'); return out; }
+  if (n < tu.minTrades) { out.reasons.push('needs ' + (tu.minTrades - n) + ' more closed live trade(s) that reached the first step (' + n + ' so far)'); return out; }
+  out.ready = true;
+  const share = used.reduce((t, r) => t + Math.min(1.5, Math.max(0, (Number(r.giveback_pct) || 0) / Number(r.peak_pct))), 0) / n;
+  out.share = share;
+  const done = Number(re && re.done) || 0, wins = Number(re && re.wins) || 0, avgR = Number(re && re.avg_r);
+  let dir = 0;
+  if (share > 0.5) { dir = 1; out.reasons.push('on average these trades gave back ' + Math.round(share * 100) + '% of their best profit: keep more'); }
+  else if (share < 0.2 && done >= 10 && wins / done >= 0.6 && avgR >= 0.5) { dir = -1; out.reasons.push('only ' + Math.round(share * 100) + '% given back, yet ' + wins + ' of ' + done + ' re-entries after the guard exit would have won (average ' + avgR.toFixed(1) + 'R): the guard may be leaving too early, keep less'); }
+  else out.reasons.push('gave back ' + Math.round(share * 100) + '% of the best profit on average: within the comfortable range, no change');
+  if (!dir) return out;
+  const next = pf.ladder.map(x => x.slice());
+  for (const rung of next) rung[1] = Math.round(Math.min(0.85, Math.max(0.15, rung[1] + dir * tu.step)) * 1000) / 1000;
+  for (let k = 1; k < next.length; k++) if (next[k][1] < next[k - 1][1]) next[k][1] = next[k - 1][1];
+  next.forEach((rung, k) => { if (Math.abs(rung[1] - pf.ladder[k][1]) > 1e-9) out.changes.push({ rung: k, atR: rung[0], from: pf.ladder[k][1], to: rung[1] }); });
+  if (!out.changes.length) { out.reasons.push('already at the limit of the allowed range'); return out; }
+  out.action = dir > 0 ? 'tighten' : 'loosen'; out.next = next;
+  return out;
 }
 
 // Scale-out: which step (if any) is due. currentR = how many R the trade is in profit right now; done = indexes already taken.
@@ -192,4 +272,4 @@ function reentryStep(w, mark, nowMs, rc) {
   return { events: ev, finished: false };
 }
 
-module.exports = { PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };
+module.exports = { updatePull, noiseOf, stallExtra, suggestTuning, DEFAULT_SMART, PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };

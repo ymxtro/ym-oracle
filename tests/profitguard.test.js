@@ -119,4 +119,39 @@ w = { ...W(), exit: 198, extreme: 198 }; r = G.reentryStep(w, 199, T0, rc); asse
 const ws = { side: 'Sell', exit: 50, peak: 0, risk: 10, extreme: 50, cand: null, expiresAt: T0 + 1e6 };   // a short that fell from 100 to 0, bounced then resumes down
 G.reentryStep(ws, 60, T0, rc); r = G.reentryStep(ws, 30, T0, rc); assert.strictEqual(r.events[0].type, 'would_reenter'); assert.strictEqual(r.events[0].stop, 60);
 ok('re-entry recorder: needs a real pullback, fires on the resume, ends on +target / stop / window, works for shorts');
+
+// ---- smart layer (final-17c) ----
+assert.strictEqual(G.normalize({}).smart.tune.mode, 'suggest'); assert.strictEqual(G.normalize({ smart: { tune: { mode: 'bogus', step: 9 } } }).smart.tune.mode, 'suggest'); assert.strictEqual(G.normalize({ smart: { tune: { step: 9 } } }).smart.tune.step, 0.05);
+assert.strictEqual(G.normalize({ smart: { noise: { on: false } } }).smart.noise.on, false);
+ok('smart settings: sensible defaults, junk falls back, can be switched off');
+// breathing room: swing trade, peak 130 (3R), price pulled back to 118, so this trade has wobbled 12. Plain rule keeps 35% of 30 -> 110.5.
+const wob = G.updatePull(0, 'Buy', 130, 118);                                  // this trade dipped 12 below its best
+assert.strictEqual(wob, 12); assert.strictEqual(G.updatePull(wob, 'Buy', 130, 125), 12); assert.strictEqual(G.updatePull(0, 'Sell', 70, 82), 12);
+const nz = G.noiseOf(cfg, wob); assert.deepStrictEqual(nz, { noisePrice: 12, noiseCapR: 1.5 }); assert.deepStrictEqual(G.noiseOf(G.normalize({ smart: { noise: { on: false } } }), wob), {});
+let d0 = L({ peak: 130, mark: 118, curSl: 90 }); assert(d0.action === 'raise' && Math.abs(d0.newSl - 110.5) < 0.011, 'plain: ' + d0.newSl);
+let dn = L({ peak: 130, mark: 118, curSl: 90, smart: nz }); assert(dn.action === 'raise' && Math.abs(dn.newSl - 106) < 0.011 && /breathing room/.test(dn.label), 'held 12 below the price: ' + dn.newSl + ' ' + dn.label);
+let dn2 = L({ peak: 130, mark: 118, curSl: 90, smart: { noisePrice: 500, noiseCapR: 1.5 } }); assert(Math.abs(dn2.newSl - 103) < 0.011, 'wobble capped at 1.5R (15): ' + dn2.newSl);
+assert.strictEqual(L({ peak: 130, mark: 118, curSl: 108, smart: nz }).action, 'none');                    // already tighter than what breathing room allows: left alone, never loosened
+let ds = S({ peak: 70, mark: 82, curSl: 110, smart: G.noiseOf(cfg, G.updatePull(0, 'Sell', 70, 82)) }); assert(ds.action === 'raise' && Math.abs(ds.newSl - 94) < 0.011, 'short: ' + ds.newSl);
+ok('breathing room: a stop is held at least the trade\'s own largest pullback (capped at 1.5R) from the price; works for shorts; never loosens');
+// stall tightening
+const T1 = 1e12, fm = 30 * 60000;
+assert.strictEqual(G.stallExtra(cfg, 'fast', T1 + fm - 1, T1), 0); assert.strictEqual(G.stallExtra(cfg, 'fast', T1 + fm, T1), 0.10); assert.strictEqual(G.stallExtra(cfg, 'fast', T1 + 9 * fm, T1), 0.20);
+assert.strictEqual(G.stallExtra(cfg, 'swing', T1 + fm, T1), 0); assert.strictEqual(G.stallExtra(cfg, 'swing', T1 + 360 * 60000, T1), 0.10);
+assert.strictEqual(G.stallExtra(G.normalize({ smart: { stall: { on: false } } }), 'fast', T1 + 9 * fm, T1), 0); assert.strictEqual(G.stallExtra(cfg, 'fast', T1 + 9 * fm, 0), 0);
+let dst0 = L({ peak: 115, mark: 114, curSl: 90 }), dst1 = L({ peak: 115, mark: 114, curSl: 90, smart: { stallExtra: 0.10 } });   // 1.5R: between breakeven and the first swing rung
+assert(Math.abs(dst0.newSl - 100.1) < 0.011); assert(/stalled/.test(dst1.label) && Math.abs(dst1.newSl - 101.5) < 0.011, 'a stalled trade at 1.5R locks 10% of its best: ' + dst1.newSl);
+let dst2 = L({ peak: 130, mark: 129, curSl: 90, smart: { stallExtra: 0.10 } }); assert(Math.abs(dst2.newSl - 113.5) < 0.011, 'rung 35% + 10 pts = 45% of 30 = 13.5 above entry: ' + dst2.newSl);
+ok('stall tightening: nothing until a full period passes with no new best, then +10 pts per period up to +20; off switch works; never past 90% kept');
+// tuning
+const mk = (n, giveback, peakR) => Array.from({ length: n }, () => ({ peak_pct: 10, exit_pct: 10 - giveback, giveback_pct: giveback, peak_r: peakR }));
+let t0 = G.suggestTuning(cfg, 'swing', mk(5, 7, 3), null); assert.strictEqual(t0.ready, false); assert(/more closed/.test(t0.reasons[0]));
+let t1 = G.suggestTuning(cfg, 'swing', mk(25, 7, 3), null); assert(t1.ready && t1.action === 'tighten' && t1.changes.length === 3 && Math.abs(t1.next[0][1] - 0.40) < 1e-9 && Math.abs(t1.next[2][1] - 0.70) < 1e-9, JSON.stringify(t1));
+let t2 = G.suggestTuning(cfg, 'swing', mk(25, 3.5, 3), null); assert.strictEqual(t2.action, 'hold');
+let t3 = G.suggestTuning(cfg, 'swing', mk(25, 1, 3), { done: 12, wins: 9, avg_r: 0.8 }); assert.strictEqual(t3.action, 'loosen'); assert(Math.abs(t3.next[0][1] - 0.30) < 1e-9);
+assert.strictEqual(G.suggestTuning(cfg, 'swing', mk(25, 1, 3), { done: 12, wins: 3, avg_r: -0.2 }).action, 'hold');
+assert.strictEqual(G.suggestTuning(cfg, 'swing', mk(25, 7, 1.2), null).ready, false);                                    // trades that never reached the first step do not count
+const capped = G.normalize({ swing: { ladder: [[2, 0.84], [4, 0.85], [8, 0.85]] } }); let t4 = G.suggestTuning(capped, 'swing', mk(25, 7, 3), null); assert(t4.next.every(x => x[1] <= 0.85) && t4.changes.length === 1);
+const tl = G.normalize({ smart: { tune: { lastAtN: { swing: 20 } } } }); assert.strictEqual(G.suggestTuning(tl, 'swing', mk(25, 7, 3), null).since, 5);
+ok('tuning: waits for enough live trades, tightens when profit is handed back, loosens only when re-entries show the guard left too early, stays within 15-85%, keeps rungs in order');
 console.log('PASS ' + n);

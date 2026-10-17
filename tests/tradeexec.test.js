@@ -28,6 +28,7 @@ function world(o) {
       return { retCode: 0, result: {} };
     },
     fanOutLeverage: () => { w.fan.lev++; }, fanOutTradingStop: () => { w.fan.stop++; },
+    guardClamp: o.guardClamp,
     report: r => w.reports.push(r),
   });
   w.run = b => ex.run(b);
@@ -147,6 +148,14 @@ const open = (x) => Object.assign({ kind: 'open', id: 'T0001', bot: 'YM ORACLE I
   r = await w.run({ kind: 'sltp', id: 'S0003', side: 'BUY', symbol: 'ETHUSDT', sl: '98' }); assert.strictEqual(r.body.code, 'NOPOS'); assert.strictEqual(r.body.ok, false);
   r = await w.run({ kind: 'sltp', id: 'S0004', side: 'BUY', symbol: 'SOLUSDT' }); assert.strictEqual(r.http, 400);
   ok('stop/target update: only on a held position on the right side; needs at least one of tp / sl');
+  // Profit Guard: a looser stop from a bot is held at the guard's floor, on this route too (and a guard that throws never blocks the update)
+  w = world({ guardClamp: x => (x.stopLoss !== undefined && Number(x.stopLoss) < 110 ? { ...x, stopLoss: '110' } : x) }); w.positions.SOLUSDT = { side: 'Buy', size: '1' };
+  r = await w.run({ kind: 'sltp', id: 'G0001', side: 'BUY', symbol: 'SOLUSDT', tp: '130', sl: '98' });
+  assert.strictEqual(r.body.ok, true); assert.deepStrictEqual(w.stops[0], { category: 'linear', symbol: 'SOLUSDT', takeProfit: '130', stopLoss: '110' });
+  r = await w.run({ kind: 'sltp', id: 'G0002', side: 'BUY', symbol: 'SOLUSDT', sl: '115' }); assert.strictEqual(w.stops[1].stopLoss, '115');
+  w = world({ guardClamp: () => { throw new Error('boom'); } }); w.positions.SOLUSDT = { side: 'Buy', size: '1' };
+  r = await w.run({ kind: 'sltp', id: 'G0003', side: 'BUY', symbol: 'SOLUSDT', sl: '98' }); assert.strictEqual(r.body.ok, true); assert.strictEqual(w.stops[0].stopLoss, '98');
+  ok('profit guard hook: a looser stop is held at the floor on the web route too, a tighter one passes, and a failing guard never blocks the update');
 
   // ---- helpers
   assert.strictEqual(T.decimalsOf(0.1), 1); assert.strictEqual(T.decimalsOf(1), 0); assert.strictEqual(T.decimalsOf('0.001'), 3); assert.strictEqual(T.decimalsOf(1e-7), 7); assert.strictEqual(T.decimalsOf(10), 0);
