@@ -1486,6 +1486,52 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     await POST({ mode: 'off', smart: { tune: { mode: 'suggest' } }, swing: { mode: 'inherit' }, fast: { mode: 'inherit' } });
   }
 
+  // ---- final-18: retention + indexes ----
+  {
+    const ix = (await db.query(`SELECT indexname FROM pg_indexes WHERE tablename IN ('pnl_ledger','order_log','master_log','audit_log')`)).rows.map(r => r.indexname);
+    for (const n of ['pnl_ledger_user_closed_idx', 'pnl_ledger_closed_idx', 'order_log_created_idx', 'master_log_created_idx', 'audit_log_at_idx']) assert(ix.includes(n), 'missing index ' + n);
+    ok('retention: the new indexes exist (pnl_ledger by user+closed_at and closed_at, plus the log tables the job scans)');
+    const uid = (await db.query('SELECT id FROM users ORDER BY id LIMIT 1')).rows[0].id;
+    const cnt = async t => (await db.query(`SELECT COUNT(*)::int n FROM ${t}`)).rows[0].n;
+    await db.query(`DELETE FROM signals WHERE k LIKE 'ret-%'`); await db.query(`DELETE FROM master_log WHERE exec_id LIKE 'ret-%'`);
+    await db.query(`DELETE FROM order_log WHERE order_link_id LIKE 'ret-%'`); await db.query(`DELETE FROM audit_log WHERE actor='ret-test'`); await db.query(`DELETE FROM profit_guard_log WHERE detail='ret-test'`);
+    await db.query(`DELETE FROM pnl_ledger WHERE order_id LIKE 'ret-%'`);
+    const old = `now() - interval '120 days'`, older = `now() - interval '400 days'`, fresh = `now() - interval '2 days'`;
+    await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,opened_at) VALUES ('ret-old','b','X','BUY','f',${old}),('ret-new','b','X','BUY','f',${fresh})`);
+    await db.query(`INSERT INTO master_log(exec_id,bot,kind,created_at) VALUES ('ret-old','b','TRADE',${old}),('ret-new','b','TRADE',${fresh})`);
+    await db.query(`INSERT INTO order_log(user_id,kind,order_link_id,symbol,side,code,ok,created_at) VALUES ($1,'ORDER','ret-old','X','Buy','OK',true,${old}),($1,'ORDER','ret-oldpending','X','Buy','PENDING',null,${old}),($1,'ORDER','ret-new','X','Buy','OK',true,${fresh})`, [uid]);
+    await db.query(`INSERT INTO audit_log(actor,action,at) VALUES ('ret-test','a',${old}),('ret-test','b',${older}),('ret-test','c',${fresh})`);
+    await db.query(`INSERT INTO profit_guard_log(event,detail,at) VALUES ('x','ret-test',${old}),('x','ret-test',${older}),('x','ret-test',${fresh})`);
+    await db.query(`INSERT INTO pnl_ledger(user_id,order_id,closed_pnl,closed_at) VALUES ($1,'ret-ancient',1,${older})`, [uid]);
+    const pgBefore = await cnt('pg_trades');
+    delete process.env.RETENTION_DAYS; delete process.env.AUDIT_RETENTION_DAYS;
+    const out = await T.pruneOldRows();
+    assert.strictEqual(out.signals >= 1 && out.master_log >= 1 && out.order_log >= 1, true, JSON.stringify(out));
+    const has = async (t, col, v) => (await db.query(`SELECT 1 FROM ${t} WHERE ${col}=$1`, [v])).rowCount;
+    assert.strictEqual(await has('signals', 'k', 'ret-old'), 0); assert.strictEqual(await has('signals', 'k', 'ret-new'), 1);
+    assert.strictEqual(await has('master_log', 'exec_id', 'ret-old'), 0); assert.strictEqual(await has('master_log', 'exec_id', 'ret-new'), 1);
+    assert.strictEqual(await has('order_log', 'order_link_id', 'ret-old'), 0); assert.strictEqual(await has('order_log', 'order_link_id', 'ret-new'), 1);
+    ok('retention: signals, order_log and master_log older than 90 days are removed, newer rows stay');
+    assert.strictEqual(await has('order_log', 'order_link_id', 'ret-oldpending'), 1);
+    ok('retention: an order still in PENDING is never removed, however old (the settle job still needs it)');
+    assert.strictEqual((await db.query(`SELECT COUNT(*)::int n FROM audit_log WHERE actor='ret-test'`)).rows[0].n, 2, 'a 120-day-old audit row stays (180-day window)');
+    assert.strictEqual((await db.query(`SELECT COUNT(*)::int n FROM profit_guard_log WHERE detail='ret-test'`)).rows[0].n, 2);
+    ok('retention: audit_log and profit_guard_log use the longer 180-day window');
+    assert.strictEqual(await has('pnl_ledger', 'order_id', 'ret-ancient'), 1); assert.strictEqual(await cnt('pg_trades'), pgBefore);
+    ok('retention: pnl_ledger (the money history) and pg_trades are never touched');
+    process.env.RETENTION_DAYS = '0'; await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,opened_at) VALUES ('ret-old2','b','X','BUY','f',${old})`);
+    const out0 = await T.pruneOldRows(); assert.strictEqual(out0.signals, undefined); assert.strictEqual(await has('signals', 'k', 'ret-old2'), 1);
+    process.env.RETENTION_DAYS = '3'; await T.pruneOldRows(); assert.strictEqual(await has('signals', 'k', 'ret-old2'), 0); assert.strictEqual(await has('signals', 'k', 'ret-new'), 1, 'a value below 14 is raised to 14 days, so a 2-day-old row survives');
+    ok('retention: RETENTION_DAYS=0 keeps everything; a value under 14 is raised to 14');
+    delete process.env.RETENTION_DAYS;
+    // batching: more than one batch of 5000 in a single table
+    await db.query(`INSERT INTO master_log(exec_id,bot,kind,created_at) SELECT 'ret-bulk' || g,'b','TRADE',${old} FROM generate_series(1,12000) g`);
+    const outB = await T.pruneOldRows(); assert.strictEqual(outB.master_log, 12000, JSON.stringify(outB)); assert.strictEqual((await db.query(`SELECT COUNT(*)::int n FROM master_log WHERE exec_id LIKE 'ret-bulk%'`)).rows[0].n, 0);
+    ok('retention: a 12,000-row backlog is cleared in batches of 5000');
+    await db.query(`DELETE FROM signals WHERE k LIKE 'ret-%'`); await db.query(`DELETE FROM master_log WHERE exec_id LIKE 'ret-%'`); await db.query(`DELETE FROM order_log WHERE order_link_id LIKE 'ret-%'`);
+    await db.query(`DELETE FROM audit_log WHERE actor='ret-test'`); await db.query(`DELETE FROM profit_guard_log WHERE detail='ret-test'`); await db.query(`DELETE FROM pnl_ledger WHERE order_id LIKE 'ret-%'`);
+  }
+
   const fs = require('fs'); for (const f of ['admin', 'join', 'share']) assert(fs.existsSync(R + '/public/' + f + '.html'));
   console.log('\nALL ' + n + ' CHECKS PASSED');
   srv.close(); await db.end(); process.exit(0);

@@ -541,6 +541,12 @@ function init(deps) {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE (exec_id, bot)
     );
+    -- final-18: indexes for the dashboard's ledger reads (pnl_ledger had only its UNIQUE key) and for the retention job below
+    CREATE INDEX IF NOT EXISTS pnl_ledger_user_closed_idx ON pnl_ledger(user_id, closed_at DESC);
+    CREATE INDEX IF NOT EXISTS pnl_ledger_closed_idx ON pnl_ledger(closed_at);
+    CREATE INDEX IF NOT EXISTS order_log_created_idx ON order_log(created_at);
+    CREATE INDEX IF NOT EXISTS master_log_created_idx ON master_log(created_at);
+    CREATE INDEX IF NOT EXISTS audit_log_at_idx ON audit_log(at);
   `).then(() => console.log('[multiuser] ON. Database schema ready.'))
     .catch(e => { console.error('[multiuser] schema setup FAILED:', e.message); throw e; });
 
@@ -1724,7 +1730,46 @@ function init(deps) {
     return { sent: ok, rows };
   }
 
+  // ---- RETENTION (final-18) ---------------------------------------------------------------------------------------------
+  // Only pure log tables are pruned. NEVER pruned: pnl_ledger, funding_ledger, equity_snap, the *_old archives (the user's money
+  // history and the CSV backup), and pg_trades (one row per guarded trade; the Profit Guard tuner learns from it).
+  //   RETENTION_DAYS        signals, order_log (settled rows only), master_log   default 90, minimum 14, 0 = keep everything
+  //   AUDIT_RETENTION_DAYS  audit_log, profit_guard_log                           default 180, minimum 30
+  // Deletes run in batches of 5000 so a first run on a big table never holds a long lock; at most 20 batches per table per run.
+  const retentionDays = () => { const v = process.env.RETENTION_DAYS; if (v === undefined || v === '') return 90; const n = Number(v); return n === 0 ? 0 : (Number.isFinite(n) ? Math.max(14, Math.floor(n)) : 90); };
+  const auditRetentionDays = () => { const n = Number(process.env.AUDIT_RETENTION_DAYS); return Number.isFinite(n) && n > 0 ? Math.max(30, Math.floor(n)) : 180; };
+  async function pruneOldRows() {
+    await ready;
+    const days = retentionDays(), adays = auditRetentionDays(), out = {};
+    const batch = async (table, cond, d) => {
+      let total = 0;
+      for (let i = 0; i < 20; i++) {
+        const r = await q(`DELETE FROM ${table} WHERE ctid = ANY(ARRAY(SELECT ctid FROM ${table} WHERE ${cond} LIMIT 5000))`, [d]);
+        total += r.rowCount || 0;
+        if ((r.rowCount || 0) < 5000) break;
+      }
+      return total;
+    };
+    const jobs = [];
+    if (days > 0) jobs.push(
+      ['signals', `opened_at < now() - ($1 || ' days')::interval`, days],
+      ['order_log', `created_at < now() - ($1 || ' days')::interval AND code <> 'PENDING'`, days],
+      ['master_log', `created_at < now() - ($1 || ' days')::interval`, days]);
+    jobs.push(
+      ['audit_log', `at < now() - ($1 || ' days')::interval`, adays],
+      ['profit_guard_log', `at < now() - ($1 || ' days')::interval`, adays]);
+    for (const [table, cond, d] of jobs) {
+      try { out[table] = await batch(table, cond, String(d)); }
+      catch (e) { out[table] = -1; console.error('[multiuser] retention ' + table + ':', e.message); }
+    }
+    const removed = Object.entries(out).filter(([, n]) => n > 0).map(([t, n]) => t + '=' + n).join(' ');
+    if (removed) console.log('[multiuser] retention removed: ' + removed);
+    return out;
+  }
+
   if (process.env.NODE_ENV !== 'test' || process.env.YM_TEST_TIMERS === '1') {
+    { const t1 = setTimeout(() => pruneOldRows().catch(e => console.error('[multiuser] retention:', e.message)), 5 * 60000); if (t1.unref) t1.unref();
+      const t2 = setInterval(() => pruneOldRows().catch(e => console.error('[multiuser] retention:', e.message)), 6 * 3600 * 1000); if (t2.unref) t2.unref(); }
     setTimeout(() => settlePending().catch(() => {}), 20000);
     setInterval(() => settlePending().catch(() => {}), 30000);
     setInterval(() => alertSweep().catch(e => console.error('[multiuser] alert sweep:', e.message)), Number(process.env.ALERT_SWEEP_MS) || 20000);   // retries failed deliveries and sends the short safety-net alerts
@@ -2693,7 +2738,7 @@ function init(deps) {
   app.get('/admin', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
   app.get('/s/:token', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'share.html')));
 
-  return { enabled: true, canPersist: true, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, pgTune: pgTuneEval, pgAutoTune, pgTick, pgState, pgWatch, pgClosing, pgRun, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
+  return { enabled: true, canPersist: true, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, pruneOldRows, pgTune: pgTuneEval, pgAutoTune, pgTick, pgState, pgWatch, pgClosing, pgRun, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
 }
 
 module.exports = { init };

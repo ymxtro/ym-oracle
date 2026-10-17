@@ -107,7 +107,7 @@ const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || '';
 // HEARTBEAT_INTERVAL_SEC in the oracle firmware -- and this is the ONLY place on
 // this side that knows it: the amber ("late") and offline thresholds below are
 // derived from it, and the dashboard reads them from /api/fleet-status instead of
-// keeping its own copy. Late = 1.5x (one missed beat), offline = 2.5x (room for a
+// keeping its own copy. Late = 1.5x (one missed beat), offline = 3.5x (room for two lost beats / a
 // brief WiFi hiccup or a busy moment before actually flagging a bot as down).
 const fleetStatus = {}; // { "YM ORACLE I": epochMs, ... }
 // Optional extra health fields a bot may send with its heartbeat (uptime, why it last restarted, free memory, build).
@@ -115,7 +115,9 @@ const fleetStatus = {}; // { "YM ORACLE I": epochMs, ... }
 const fleetInfo = {}; // { "YM ORACLE I": { uptimeMin, resetReason, freeHeap, build } }
 const HEARTBEAT_INTERVAL_SEC = 180;
 const HEARTBEAT_LATE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 1.5;      // 270s
-const HEARTBEAT_OFFLINE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 2.5;   // 450s
+// FALSE-OFFLINE FIX: was 2.5x (450s), which tolerates only ONE lost beat -- two in a row (a radio miss, then a slow Render answer that made the
+// manager drop the next forward) flagged a healthy bot offline and the next beat flagged it back online. 3.5x (630s) tolerates two lost beats.
+const HEARTBEAT_OFFLINE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 3.5;   // 630s
 const HEARTBEAT_OFFLINE_THRESHOLD_MS = HEARTBEAT_OFFLINE_AFTER_SEC * 1000;
 // REAL BUG FOUND, and it is the actual root cause of offline alerts never firing: there is ALSO a constant
 // literally named ACTIVE_BOT_NAMES down inside public/dashboard.html -- but that one is CLIENT-SIDE
@@ -675,7 +677,11 @@ app.post('/api/heartbeat', requireDevice, (req, res) => {
   }
   const clean = name.replace(/[^\w .\-]/g, '').slice(0, 40);
   if (!clean) return res.status(400).json({ success: false, message: 'name is required' });
-  fleetStatus[clean] = Date.now();
+  // FALSE-OFFLINE FIX: the manager may forward a beat late (it retries while Render is slow). It now says how old the beat is, so the
+  // time recorded is when the bot REALLY spoke -- not when the forward finally got through. A beat can never move the clock backwards.
+  const ageRaw = Number(req.body && req.body.ageSec);
+  const ageMs = (Number.isFinite(ageRaw) && ageRaw > 0 && ageRaw <= 900) ? ageRaw * 1000 : 0;
+  fleetStatus[clean] = Math.max(fleetStatus[clean] || 0, Date.now() - ageMs);
   const hb = req.body || {};
   const num = v => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Number(v) : null);
   const txt = (v, n) => (typeof v === 'string' && v ? v.replace(/[^\w .:\-]/g, '').slice(0, n) : null);
@@ -828,13 +834,39 @@ async function deliverTradeAlert(text, opts) {
 }
 // ===== TRADEALERT-END =====
 
-function runOfflineCheck() {
-  const names = trackedNames();
-  const events = computeOfflineTransitions(names, fleetStatus, Date.now(), HEARTBEAT_OFFLINE_THRESHOLD_MS, offlineState);
+// FALSE-OFFLINE FIX (three guards, all in front of the unchanged computeOfflineTransitions):
+//  1. FREEZE: this check runs every 30 s. If it did not run for > 90 s, THIS server was frozen/asleep (a free Render host can be), and every
+//     heartbeat that arrived meanwhile was never processed -- judging now would flag EVERYONE offline and then back online. Skip, with a grace window.
+//  2. MANAGER SILENT: while the manager has not polled for > 90 s, heartbeats that travel through it cannot reach us, so such a bot's state is
+//     UNKNOWN, not offline. Those bots are not judged then (the manager's own offline alert still fires normally, which is the real news).
+//  3. GRACE after the manager (or this server) comes back: queued heartbeats need up to one interval to arrive; nobody is judged until then.
+const MANAGER_SILENT_MS = 90 * 1000;
+const OFFLINE_CHECK_FREEZE_MS = 90 * 1000;
+const OFFLINE_GRACE_MS = (HEARTBEAT_INTERVAL_SEC + 30) * 1000;
+let offlineGraceUntil = 0;
+let lastOfflineCheckAt = 0;
+function runOfflineCheck(nowArg) {
+  const now = nowArg === undefined ? Date.now() : nowArg;
+  const sinceLast = lastOfflineCheckAt ? now - lastOfflineCheckAt : 0;
+  lastOfflineCheckAt = now;
+  if (sinceLast > OFFLINE_CHECK_FREEZE_MS) {
+    offlineGraceUntil = Math.max(offlineGraceUntil, now + OFFLINE_GRACE_MS);
+    console.log('[OFFLINE ALERT] this server was not running for ' + Math.round(sinceLast / 1000) + 's -- offline judgement paused for ' + Math.round(OFFLINE_GRACE_MS / 1000) + 's so healthy bots are not flagged');
+  }
+  if (now < offlineGraceUntil) return [];
+  let names = trackedNames();
+  const mgrSeen = fleetStatus['YM ORACLE MANAGER'];
+  if (TRACK_MANAGER && mgrSeen !== undefined && (now - mgrSeen) > MANAGER_SILENT_MS) {
+    // Only bots that rely on the manager for their heartbeat are unobservable now. A bot that also reports DIRECTLY (newer firmware: its beat carries
+    // uptime / reset reason, which is what fleetInfo holds) is still judged normally, so a real outage of that bot is never hidden by a manager outage.
+    names = names.filter(n => !SERVER_TRACKED_BOT_NAMES.includes(n) || !!fleetInfo[n]);
+  }
+  const events = computeOfflineTransitions(names, fleetStatus, now, HEARTBEAT_OFFLINE_THRESHOLD_MS, offlineState);
   for (const e of events) {
     if (e.event === 'offline') sendOfflineAlertTelegram(`\u26a0\ufe0f ${e.name} has gone offline (no contact for ${e.downForMin}m)`);
     else sendOfflineAlertTelegram(`\u2705 ${e.name} is back online`);
   }
+  return events;
 }
 if (process.env.NODE_ENV !== 'test') {
   setInterval(runOfflineCheck, 30000); // a real interval would keep a test process alive forever; tests call runOfflineCheck()/computeOfflineTransitions() directly instead
@@ -924,6 +956,10 @@ app.post('/api/ping-fleet', requireDashboardAuth, (req, res) => {
 // could tell when a BOT went quiet, never when the MANAGER did. It already GETs this endpoint every ~10s on its
 // own, so that traffic itself is proof of life; no new call or firmware change needed for this specific signal.
 app.get('/api/ping-check', requireDevice, (req, res) => {
+  // FALSE-OFFLINE FIX: the manager is the ONLY path bot heartbeats take to this server. If it was silent for a while (its link to this
+  // server was down), the bots were not offline -- they were unobservable, and their queued beats are about to arrive. Give them a grace window.
+  const prevMgr = fleetStatus['YM ORACLE MANAGER'];
+  if (prevMgr !== undefined && (Date.now() - prevMgr) > MANAGER_SILENT_MS) offlineGraceUntil = Math.max(offlineGraceUntil, Date.now() + OFFLINE_GRACE_MS);
   fleetStatus['YM ORACLE MANAGER'] = Date.now();
   let pingId = pendingPingId;
   pendingPingId = null;
