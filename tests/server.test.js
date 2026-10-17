@@ -201,6 +201,16 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
   assert(st.success && st.results['YM ORACLE II'] && st.results['YM ORACLE II'].ms === 640 && !st.results['YM ORACLE III']);
   ok('bot-poll: proof of life, every bot is told about a ping round until it answers, the dashboard sees the answers');
 
+  // 12c. SYNC-17: one owner per ping round. While the manager polls /api/ping-check the bots are NOT told about the round.
+  await A.get('/api/ping-check');                                   // the manager is alive (this is its ~10 s poll)
+  const round2 = (await A.post('/api/ping-fleet', {}, DASH)).j; assert(round2.success && round2.pingId);
+  assert.strictEqual((await A.get('/api/bot-poll?name=YM%20ORACLE%20III')).j.pingId, null, 'the manager owns the round: the bot is not asked');
+  await A.post('/api/ping-result', { pingId: round2.pingId, name: 'YM ORACLE III', ms: 120 });
+  await A.post('/api/ping-result', { pingId: round2.pingId, name: 'YM ORACLE III', timeout: true });   // a late timeout report
+  const st2 = (await A.get('/api/ping-status/' + round2.pingId, DASH)).j;
+  assert(st2.results['YM ORACLE III'] && st2.results['YM ORACLE III'].ms === 120 && !st2.results['YM ORACLE III'].timeout, 'a timeout never overwrites a real answer');
+  ok('ping ownership: manager polling => bots stay out of the round; a late timeout cannot undo a real answer');
+
   s1.kill();
 
   // 10. the device key: with DEVICE_KEY_MODE=enforce a forged signal is refused

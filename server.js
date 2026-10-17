@@ -127,7 +127,8 @@ const HEARTBEAT_OFFLINE_THRESHOLD_MS = HEARTBEAT_OFFLINE_AFTER_SEC * 1000;
 // tools/verify_sync.py now guards against a server-side reference to the wrong one ever happening again.
 const SERVER_TRACKED_BOT_NAMES = ['YM ORACLE I', 'YM ORACLE II', 'YM ORACLE III', 'YM ORACLE IV']; // IV (the swing bot) is watched too: a silent IV used to go unnoticed
 // The manager is off the critical path now (it comes back later for the LCD and buzzer). Watch it for going quiet only if you set TRACK_MANAGER=true.
-const TRACK_MANAGER = String(process.env.TRACK_MANAGER || '').toLowerCase() === 'true';
+// SYNC-17: trades go through the manager again, so it is watched by default. Set TRACK_MANAGER=false only if you really run without it.
+const TRACK_MANAGER = String(process.env.TRACK_MANAGER || 'true').toLowerCase() !== 'false';
 function trackedNames() { return TRACK_MANAGER ? SERVER_TRACKED_BOT_NAMES.concat(['YM ORACLE MANAGER']) : SERVER_TRACKED_BOT_NAMES; }
 
 // REAL FEATURE ADDED at the user's explicit request: manual "ping
@@ -948,13 +949,19 @@ app.get('/api/ping-check', requireDevice, (req, res) => {
 //   * the answer says whether a fleet-ping round is waiting for THIS bot. A bot that has not answered the round yet is told again on its
 //     next poll, so a lost answer is retried by itself. The bot answers with POST /api/ping-result (its own measured round trip).
 // The manager's /api/ping-check keeps working unchanged, for when it comes back.
+const MANAGER_PING_OWNER_MS = 45 * 1000; // the manager polls /api/ping-check every ~10 s; 45 s without a poll = it is not there to own the ping
 app.get('/api/bot-poll', requireDevice, (req, res) => {
   const clean = String(req.query.name || '').replace(/[^\w .\-]/g, '').slice(0, 40);
   if (!clean) return res.status(400).json({ success: false, message: 'name is required' });
   fleetStatus[clean] = Date.now();
   let pingId = null;
   const round = latestPingId && pingRounds[latestPingId];
-  if (round && (Date.now() - round.requestedAt) <= PENDING_PING_MAX_AGE_MS && !round.results[clean]) pingId = latestPingId;
+  // SYNC-17: ONE owner for a fleet-ping round. While the manager is polling /api/ping-check it measures every bot over ESP-NOW (the path a trade
+  // takes), so the bots stay out of it and an answer can no longer flip between the manager's time and a bot's server time. Only when the
+  // manager has gone quiet do the bots answer for themselves, over HTTPS.
+  const mgrSeen = fleetStatus['YM ORACLE MANAGER'];
+  const managerOwnsPing = !!mgrSeen && (Date.now() - mgrSeen) <= MANAGER_PING_OWNER_MS;
+  if (!managerOwnsPing && round && (Date.now() - round.requestedAt) <= PENDING_PING_MAX_AGE_MS && !round.results[clean]) pingId = latestPingId;
   res.status(200).json({ success: true, pingId });
 });
 
@@ -964,7 +971,9 @@ app.post('/api/ping-result', requireDevice, (req, res) => {
     return res.status(400).json({ success: false, message: 'pingId and name are required' });
   }
   if (pingRounds[pingId]) {
-    pingRounds[pingId].results[name] = timeout ? { timeout: true } : { ms };
+    // SYNC-17: a real answer is never replaced by a timeout (a late timeout report cannot undo it); a real answer does replace an earlier timeout.
+    const prev = pingRounds[pingId].results[name];
+    if (!(timeout && prev && prev.ms !== undefined)) pingRounds[pingId].results[name] = timeout ? { timeout: true } : { ms };
   }
   res.status(200).json({ success: true });
 });
