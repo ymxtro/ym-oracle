@@ -126,6 +126,9 @@ const HEARTBEAT_OFFLINE_THRESHOLD_MS = HEARTBEAT_OFFLINE_AFTER_SEC * 1000;
 // needs. Keep this in sync with the one inside public/dashboard.html by hand if the active bot list ever changes;
 // tools/verify_sync.py now guards against a server-side reference to the wrong one ever happening again.
 const SERVER_TRACKED_BOT_NAMES = ['YM ORACLE I', 'YM ORACLE II', 'YM ORACLE III', 'YM ORACLE IV']; // IV (the swing bot) is watched too: a silent IV used to go unnoticed
+// The manager is off the critical path now (it comes back later for the LCD and buzzer). Watch it for going quiet only if you set TRACK_MANAGER=true.
+const TRACK_MANAGER = String(process.env.TRACK_MANAGER || '').toLowerCase() === 'true';
+function trackedNames() { return TRACK_MANAGER ? SERVER_TRACKED_BOT_NAMES.concat(['YM ORACLE MANAGER']) : SERVER_TRACKED_BOT_NAMES; }
 
 // REAL FEATURE ADDED at the user's explicit request: manual "ping
 // fleet" from the dashboard. The manager bot can't be pushed to --
@@ -139,6 +142,7 @@ const SERVER_TRACKED_BOT_NAMES = ['YM ORACLE I', 'YM ORACLE II', 'YM ORACLE III'
 // In-memory only, same reasoning as fleetStatus -- a round is only
 // ever relevant for the few seconds it's resolving.
 let pendingPingId = null;
+let latestPingId = null; // the newest round, for the bots that now ask for it themselves (/api/bot-poll)
 const pingRounds = {}; // { pingId: { requestedAt, results: { name: {ms} | {timeout:true} } } }
 // REAL FIX at the user's explicit request: a ping request the manager bot never picked up (it was offline,
 // or between polls) used to sit in pendingPingId indefinitely and fire whenever it next polled -- possibly
@@ -823,7 +827,7 @@ async function deliverTradeAlert(text, opts) {
 // ===== TRADEALERT-END =====
 
 function runOfflineCheck() {
-  const names = SERVER_TRACKED_BOT_NAMES.concat(['YM ORACLE MANAGER']);
+  const names = trackedNames();
   const events = computeOfflineTransitions(names, fleetStatus, Date.now(), HEARTBEAT_OFFLINE_THRESHOLD_MS, offlineState);
   for (const e of events) {
     if (e.event === 'offline') sendOfflineAlertTelegram(`\u26a0\ufe0f ${e.name} has gone offline (no contact for ${e.downForMin}m)`);
@@ -850,7 +854,7 @@ if (process.env.NODE_ENV !== 'test') {
 // fire one real Telegram message on demand so the send path itself can be proven working right now.
 app.get('/api/test-offline-alert', requireDashboardAuth, (req, res) => {
   const now = Date.now();
-  const names = SERVER_TRACKED_BOT_NAMES.concat(['YM ORACLE MANAGER']);
+  const names = trackedNames();
   const seen = names.map(name => {
     const lastSeen = fleetStatus[name];
     return {
@@ -897,6 +901,7 @@ app.get('/api/fleet-status', requireDashboardAuth, (req, res) => {
 app.post('/api/ping-fleet', requireDashboardAuth, (req, res) => {
   const pingId = `ping-${Date.now()}`;
   pendingPingId = pingId;
+  latestPingId = pingId;
   pingRounds[pingId] = { requestedAt: Date.now(), results: {} };
 
   const ids = Object.keys(pingRounds);
@@ -937,6 +942,22 @@ app.get('/api/ping-check', requireDevice, (req, res) => {
 // before a restart) is accepted and silently dropped rather than
 // erroring -- the manager bot has no reason to care whether this
 // backend still has room for it.
+// BOTS TALK TO THE SERVER THEMSELVES (the manager is no longer in the path). Every bot asks here every ~15 s:
+//   * the request itself is the bot's proof of life (same fleetStatus the heartbeat feeds), and it is regular traffic, which keeps a
+//     sleeping-prone host awake (the manager's old 10 s poll did that);
+//   * the answer says whether a fleet-ping round is waiting for THIS bot. A bot that has not answered the round yet is told again on its
+//     next poll, so a lost answer is retried by itself. The bot answers with POST /api/ping-result (its own measured round trip).
+// The manager's /api/ping-check keeps working unchanged, for when it comes back.
+app.get('/api/bot-poll', requireDevice, (req, res) => {
+  const clean = String(req.query.name || '').replace(/[^\w .\-]/g, '').slice(0, 40);
+  if (!clean) return res.status(400).json({ success: false, message: 'name is required' });
+  fleetStatus[clean] = Date.now();
+  let pingId = null;
+  const round = latestPingId && pingRounds[latestPingId];
+  if (round && (Date.now() - round.requestedAt) <= PENDING_PING_MAX_AGE_MS && !round.results[clean]) pingId = latestPingId;
+  res.status(200).json({ success: true, pingId });
+});
+
 app.post('/api/ping-result', requireDevice, (req, res) => {
   const { pingId, name, ms, timeout } = req.body || {};
   if (!pingId || !name) {
@@ -1047,7 +1068,7 @@ function ingestExecReport(b) {
     if (isNew && EXEC_ALERT_TEXT[rec.code]) {
       const who = rec.bot.replace('YM ORACLE ', 'Oracle ');
       const noUsers = rec.code !== 'NOTRL';
-      sendOfflineAlertTelegram('⚠️ ' + who + ' ' + rec.symbol.replace('USDT', '') + ' ' + (rec.side === 'BUY' ? 'long' : 'short') + ': ' + EXEC_ALERT_TEXT[rec.code] + '.' + (noUsers ? ' This trade was not placed on the master account, so it was not copied to users.' : ''));
+      sendOfflineAlertTelegram('⚠️ ' + who + ' ' + rec.symbol.replace('USDT', '') + (rec.side === 'BUY' ? ' long' : rec.side === 'SELL' ? ' short' : '') + ': ' + EXEC_ALERT_TEXT[rec.code] + '.' + (noUsers ? ' This trade was not placed on the master account, so it was not copied to users.' : ''));
     }
   }
   return true;

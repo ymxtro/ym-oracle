@@ -46,12 +46,12 @@ function parse(b) {
   const id = String(b.id || '');
   if (!/^[A-Za-z0-9]{1,20}$/.test(id)) return { error: 'id is required (letters and digits, up to 20)' };
   const side = String(b.side || '').toUpperCase();
-  if (side !== 'BUY' && side !== 'SELL') return { error: 'side must be BUY or SELL' };
+  if (side !== 'BUY' && side !== 'SELL' && !(kind === 'close' && side === 'ANY')) return { error: 'side must be BUY or SELL' };   // ANY: a manual close from a bot's page, which knows only the pair
   const symbol = String(b.symbol || '').toUpperCase();
   if (!/^[A-Z0-9]{3,20}$/.test(symbol)) return { error: 'symbol is required' };
   const tp = numStr(b.tp), sl = numStr(b.sl), activePrice = numStr(b.trailActivePrice);
   if (tp === null || sl === null || activePrice === null) return { error: 'tp, sl and trailActivePrice must be positive numbers when given' };
-  const cmd = { kind, id, side, symbol, bot: clip(b.bot || '?', 30), bybitSide: side === 'BUY' ? 'Buy' : 'Sell', tp, sl, activePrice, usdMargin: 0, leverage: 0, trailPct: 0 };
+  const cmd = { kind, id, side, symbol, bot: clip(b.bot || '?', 30), bybitSide: side === 'BUY' ? 'Buy' : side === 'SELL' ? 'Sell' : 'ANY', tp, sl, activePrice, usdMargin: 0, leverage: 0, trailPct: 0 };
   if (kind === 'open') {
     cmd.usdMargin = Number(b.usdMargin);
     cmd.leverage = Math.floor(Number(b.leverage));
@@ -272,7 +272,7 @@ function create(deps) {
   async function execClose(cmd, T) {
     const h = await getHeld(cmd.symbol).then(x => ({ x }), () => fail('NET', 'could not read the open positions'));
     if (!h.x) return { ok: true, code: 'NOPOS', detail: 'no open position on ' + cmd.symbol + ' (already closed)' };
-    if (h.x.side !== cmd.bybitSide) return { ok: false, code: 'SIDE', detail: 'open position on ' + cmd.symbol + ' is ' + h.x.side + ', not ' + cmd.bybitSide + ' -- left alone' };
+    if (cmd.bybitSide !== 'ANY' && h.x.side !== cmd.bybitSide) return { ok: false, code: 'SIDE', detail: 'open position on ' + cmd.symbol + ' is ' + h.x.side + ', not ' + cmd.bybitSide + ' -- left alone' };
     const closeSide = h.x.side === 'Buy' ? 'Sell' : 'Buy';
     const payload = { category: 'linear', symbol: cmd.symbol, side: closeSide, orderType: 'Market', qty: h.x.size, reduceOnly: true, orderLinkId: 'ymc-' + cmd.id };
     return placeAndConfirm(payload, cmd.symbol, null, T);   // null = "confirmed" means the position is gone
