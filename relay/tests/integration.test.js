@@ -72,10 +72,12 @@ const FLEET = { last: { 'YM ORACLE I': Date.now() - 5000, 'YM ORACLE II': Date.n
 const express = require(R + '/node_modules/express');
 const app = express(); app.use(express.json());
 let mode = 'live', halted = false; const alerts = [], tradeAlerts = [], tradeOpts = []; let deliverResult = { ok: true, configured: true, telegram: 'sent', email: 'off' };
+const arMod = require(R + '/alertroute.js'); const arState = { cfg: arMod.defaults() }; const alertRouterState = () => arState;
 const mu = require(R + '/multiuser.js').init({
   app, restClient: new Stub({ key: 'ADMINK' }), getMode: () => mode, breakerIsTripped: () => halted,
   getSecurityInfo: () => ({ deviceKeySet: false, deviceKeyMode: 'warn', deviceKeyMisses: 0 }),
-  sendAlert: t => alerts.push(t), deliverAlert: async (t, o) => { tradeAlerts.push(t); tradeOpts.push(o || {}); return deliverResult; }, baseOpts: {},
+  sendAlert: t => alerts.push(t), deliverAlert: async (t, o) => { tradeAlerts.push(t); tradeOpts.push(o || {}); return deliverResult; },
+  alertRouter: { state: arState, route: arMod, envChats: () => ({ groupChat: '-100500', dmChat: '900' }), tokenSet: () => true }, baseOpts: {},
   getFleet: () => FLEET,
   getMasterSync: () => SYNC,
   getExecReports: () => [],
@@ -881,7 +883,11 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     ok('console Trading: balance, positions, trades and sync from the same sign-in; paper/live (LIVE typed), hold-to-halt, resume, dismiss alerts');
 
     click(aw, q1(aw, '[data-tab="bots"]')); await sleep(900);
-    assert(/Signal bots/.test(body()) && /Ping all bots/.test(body()) && /Trade alerts/.test(body()) && /Recent alerts from the bots/.test(body()), 'bots tab'); click(aw, q1(aw, '[data-act="ping"]')); await sleep(2300);
+    assert(/Signal bots/.test(body()) && /Ping all bots/.test(body()) && /Telegram alert control/.test(body()) && /Where each alert goes/.test(body()) && /Recent alerts from the bots/.test(body()), 'bots tab');
+    // the alert control panel: a route change from the page is saved, Dev mode from the page switches the mode and shows the banner
+    { const sel = q1(aw, 'select[data-arcat="updates"]'); assert(sel, 'per-category select is here'); sel.value = 'dm'; sel.dispatchEvent(new aw.Event('change', { bubbles: true })); await sleep(700);
+      assert.strictEqual(alertRouterState().cfg.routes.updates, 'dm', 'the route change was saved'); click(aw, q1(aw, '[data-act="arMode"][data-v="dev"]')); await sleep(800);
+      assert.strictEqual(alertRouterState().cfg.mode, 'dev'); assert(/DEV · group silent/.test(body()), 'the page shows Dev mode'); click(aw, q1(aw, '[data-act="arMode"][data-v="live"]')); await sleep(800); assert.strictEqual(alertRouterState().cfg.mode, 'live'); alertRouterState().cfg = arMod.defaults(); await db.query(`DELETE FROM meta WHERE k='alert_routes'`); } click(aw, q1(aw, '[data-act="ping"]')); await sleep(2300);
     assert(/120 ms/.test(body()) && /Timeout/.test(body()) && /90 ms/.test(body()), 'ping results'); assert(q1(aw, '[data-act="testAlert"]'), 'test alert button is here too');
     click(aw, q1(aw, '[data-act="testAlert"]')); await sleep(600); assert(tradeAlerts.some(t => /admin page/.test(t)), 'the test button reaches the alert sender');
     ok('console Bots & alerts: bot cards, ping all bots with timings, test alert');

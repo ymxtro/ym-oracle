@@ -255,6 +255,12 @@ let masterSavedAt = 0;
 // Used by multiuser.js: always forwards to the CURRENT client, so swapping the key needs no restart.
 const restClientProxy = new Proxy({}, { get: (_t, prop) => { const v = restClient[prop]; return typeof v === 'function' ? v.bind(restClient) : v; } });
 
+// Where each Telegram alert goes (group / DM / both / off, plus the Dev and Off modes). The settings live in the database (loaded by multiuser.js
+// at start-up, changed from the admin console) and take effect at once. With no database the defaults apply: everything to the main chat, as before.
+const alertRoute = require('./alertroute');
+const alertState = { cfg: alertRoute.defaults() };
+const alertEnvChats = () => ({ groupChat: ALERT_TELEGRAM_CHAT_ID, dmChat: process.env.ALERT_TELEGRAM_PRIVATE_CHAT_ID || '' });
+
 // MULTI-USER LAYER (see multiuser.js). Stays completely OFF unless DATABASE_URL and a 64-hex
 // KEY_ENCRYPTION_SECRET are set on Render -- with neither set, every call below is a harmless no-op and this
 // relay behaves exactly as the single-account version did. Adds /join (user signup), /admin and /api/me*,
@@ -269,6 +275,7 @@ const multiuser = require('./multiuser').init({
   getFleet: () => ({ last: fleetStatus, info: fleetInfo, offlineMs: HEARTBEAT_OFFLINE_THRESHOLD_MS }),
   sendAlert: (text) => sendOfflineAlertTelegram(text),
   deliverAlert: (text, opts) => deliverTradeAlert(text, opts),
+  alertRouter: { state: alertState, route: alertRoute, envChats: alertEnvChats, tokenSet: () => !!ALERT_TELEGRAM_BOT_TOKEN },
   getMasterSync: () => ({ ...syncStatus, mode: TRADE_MODE }),
   getExecReports: () => execReports,
   baseOpts: {
@@ -692,6 +699,7 @@ app.post('/api/heartbeat', requireDevice, (req, res) => {
 // exactly what it means there -- no separate, drifting definition of offline.
 const ALERT_TELEGRAM_BOT_TOKEN = process.env.ALERT_TELEGRAM_BOT_TOKEN || '';
 const ALERT_TELEGRAM_CHAT_ID = process.env.ALERT_TELEGRAM_CHAT_ID || '';
+
 const offlineState = {}; // name -> bool, only ever set for a name we've heard from at least once
 
 // Pure decision logic, no network I/O -- this is what gets unit tested directly, against the real function, not a
@@ -717,29 +725,33 @@ function computeOfflineTransitions(names, lastSeenMap, nowMs, offlineAfterMs, of
 // project can reach the internet from a test run). Silently does nothing if the two env vars below are unset,
 // matching DASHBOARD_PASSWORD's own off-by-default pattern: a feature you have to opt into, not one that fails
 // loudly if you haven't set it up yet.
-function sendOfflineAlertTelegram(text) {
-  if (!ALERT_TELEGRAM_BOT_TOKEN || !ALERT_TELEGRAM_CHAT_ID) return;
+function sendOfflineAlertTelegram(text, category) {
+  if (!ALERT_TELEGRAM_BOT_TOKEN) return;
+  const rt = alertRoute.resolve(alertState.cfg, category || 'ops', Date.now(), alertEnvChats());
+  if (rt.muted) { console.log('[ALERT] not sent (' + rt.reason + '):', String(text).slice(0, 80)); return; }
   console.log('[OFFLINE ALERT] sending:', text);
-  const payload = JSON.stringify({ chat_id: ALERT_TELEGRAM_CHAT_ID, text });
-  const tr = alertTransport('api.telegram.org');
-  const req = tr.mod.request({
-    hostname: tr.hostname, port: tr.port, path: `/bot${ALERT_TELEGRAM_BOT_TOKEN}/sendMessage`, method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-  }, (res) => {
-    // REAL BUG FOUND: this used to just drain the response and discard it, never checking whether Telegram
-    // actually accepted the message. A rejection (bad token, bad chat id, the bot blocked, rate limited) would
-    // fail completely silently -- nothing anywhere would show it happened. Now the outcome always reaches the
-    // Render logs, whether it worked or not.
-    let body = '';
-    res.on('data', chunk => { body += chunk; });
-    res.on('end', () => {
-      if (res.statusCode === 200) console.log('[OFFLINE ALERT] Telegram accepted it');
-      else console.error('[OFFLINE ALERT] Telegram rejected it: HTTP', res.statusCode, body);
+  for (const t of rt.targets) {
+    const payload = JSON.stringify({ chat_id: t.chat, text: rt.prefix + text });
+    const tr = alertTransport('api.telegram.org');
+    const req = tr.mod.request({
+      hostname: tr.hostname, port: tr.port, path: `/bot${ALERT_TELEGRAM_BOT_TOKEN}/sendMessage`, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+    }, (res) => {
+      // REAL BUG FOUND: this used to just drain the response and discard it, never checking whether Telegram
+      // actually accepted the message. A rejection (bad token, bad chat id, the bot blocked, rate limited) would
+      // fail completely silently -- nothing anywhere would show it happened. Now the outcome always reaches the
+      // Render logs, whether it worked or not.
+      let body = '';
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => {
+        if (res.statusCode === 200) console.log('[OFFLINE ALERT] Telegram accepted it (' + t.kind + ')');
+        else console.error('[OFFLINE ALERT] Telegram rejected it (' + t.kind + '): HTTP', res.statusCode, body);
+      });
     });
-  });
-  req.on('error', (e) => console.error('[OFFLINE ALERT] Telegram send failed:', e.message));
-  req.write(payload);
-  req.end();
+    req.on('error', (e) => console.error('[OFFLINE ALERT] Telegram send failed:', e.message));
+    req.write(payload);
+    req.end();
+  }
 }
 
 // ===== TRADEALERT-BEGIN =====
@@ -769,17 +781,33 @@ function httpsJson(hostname, path, headers, payload) {
 }
 async function deliverTradeAlert(text, opts) {
   opts = opts || {};
-  const tgOn = !!(ALERT_TELEGRAM_BOT_TOKEN && ALERT_TELEGRAM_CHAT_ID);
+  const cat = alertRoute.CAT_IDS.includes(opts.cat) ? opts.cat : (opts.priv ? 'zones' : 'signals');
+  const env = alertEnvChats();
+  const tgOn = !!(ALERT_TELEGRAM_BOT_TOKEN && (alertState.cfg.groupChat || alertState.cfg.dmChat || env.groupChat || env.dmChat));
   const mailOn = !!(process.env.RESEND_API_KEY && process.env.ALERT_EMAIL_TO);
   const wantMail = mailOn && (opts.email === true || process.env.ALERT_EMAIL_ALL === 'true' || (!opts.html && !opts.priv));
-  const out = { ok: false, configured: tgOn || mailOn, telegram: 'off', email: 'off' };
+  const out = { ok: false, configured: tgOn || mailOn, telegram: 'off', email: 'off', muted: false, route: [] };
   const plain = String(text).replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
   if (tgOn) {
-    const chat = (opts.priv && process.env.ALERT_TELEGRAM_PRIVATE_CHAT_ID) ? process.env.ALERT_TELEGRAM_PRIVATE_CHAT_ID : ALERT_TELEGRAM_CHAT_ID;
-    let r = await httpsJson('api.telegram.org', `/bot${ALERT_TELEGRAM_BOT_TOKEN}/sendMessage`, {}, opts.html ? { chat_id: chat, text: String(text).slice(0, 4000), parse_mode: 'HTML' } : { chat_id: chat, text });
-    if (!r.ok && opts.html && r.status === 400) r = await httpsJson('api.telegram.org', `/bot${ALERT_TELEGRAM_BOT_TOKEN}/sendMessage`, {}, { chat_id: chat, text: plain.slice(0, 4000) }); // Telegram could not read the formatting: send it plain rather than lose it
-    out.telegram = r.ok ? 'sent' : 'failed (' + (r.status || r.body) + ')';
-    if (!r.ok) console.error('[TRADE ALERT] Telegram failed:', r.status, r.body);
+    // opts.force ('group' | 'dm') is for the test buttons only: an explicit "try this chat" that ignores the mode.
+    let rt;
+    if (opts.force === 'group' || opts.force === 'dm') {
+      const chat = opts.force === 'dm' ? (alertState.cfg.dmChat || env.dmChat) : (alertState.cfg.groupChat || env.groupChat);
+      rt = chat ? { targets: [{ kind: opts.force, chat }], muted: false, reason: '', prefix: '' } : { targets: [], muted: true, reason: 'no ' + opts.force + ' chat is set up', prefix: '', unset: true };
+    } else rt = alertRoute.resolve(alertState.cfg, cat, Date.now(), env);
+    if (rt.muted) {
+      out.telegram = rt.unset ? 'failed (' + rt.reason + ')' : 'muted (' + rt.reason + ')'; out.muted = !rt.unset; out.reason = rt.reason;
+    } else {
+      let sentN = 0, firstFail = '';
+      for (const t of rt.targets) {
+        const body = rt.prefix + String(text);
+        let r = await httpsJson('api.telegram.org', `/bot${ALERT_TELEGRAM_BOT_TOKEN}/sendMessage`, {}, opts.html ? { chat_id: t.chat, text: body.slice(0, 4000), parse_mode: 'HTML' } : { chat_id: t.chat, text: body });
+        if (!r.ok && opts.html && r.status === 400) r = await httpsJson('api.telegram.org', `/bot${ALERT_TELEGRAM_BOT_TOKEN}/sendMessage`, {}, { chat_id: t.chat, text: (rt.prefix + plain).slice(0, 4000) }); // Telegram could not read the formatting: send it plain rather than lose it
+        if (r.ok) { sentN++; out.route.push(t.kind); } else { if (!firstFail) firstFail = t.kind + ' ' + (r.status || r.body); console.error('[TRADE ALERT] Telegram failed (' + t.kind + '):', r.status, r.body); }
+      }
+      out.telegram = sentN > 0 ? 'sent' : 'failed (' + firstFail + ')';
+      if (sentN > 0 && firstFail) out.telegram = 'sent (' + out.route.join('+') + '; ' + firstFail + ' failed)';
+    }
   }
   if (wantMail) {
     const subject = plain.split('\n').map(x => x.trim()).filter(Boolean)[0].slice(0, 120) || 'YM Oracle alert';
@@ -788,7 +816,8 @@ async function deliverTradeAlert(text, opts) {
     out.email = r.ok ? 'sent' : 'failed (' + (r.status || r.body) + ')';
     if (!r.ok) console.error('[TRADE ALERT] Email failed:', r.status, r.body);
   }
-  out.ok = out.telegram === 'sent' || out.email === 'sent';   // one working channel is enough to call it delivered
+  // delivered = at least one channel took it, OR it was deliberately muted (handled: it must not be retried and then sent later when you switch back to live)
+  out.ok = out.telegram.startsWith('sent') || out.email === 'sent' || (out.muted && out.email !== 'failed' && !String(out.email).startsWith('failed'));
   return out;
 }
 // ===== TRADEALERT-END =====
@@ -988,9 +1017,10 @@ const EXEC_ALERT_TEXT = {
 };
 
 let reconcileTimer = null;
-app.post('/api/exec-report', requireDevice, (req, res) => {
-  const b = req.body || {};
-  if (!b.id || !b.kind) return res.status(400).json({ success: false, message: 'id and kind are required' });
+// Records one execution report (dashboard row, trade-log healing, alerts). Used by POST /api/exec-report (the manager ESP32)
+// and by the server's own trade execution (POST /api/trade). Returns false when the report has no id or kind.
+function ingestExecReport(b) {
+  if (!b || !b.id || !b.kind) return false;
   const rec = {
     id: cleanExecText(b.id, 20), bot: cleanExecText(b.bot || '?', 30), kind: cleanExecText(b.kind, 10),
     side: cleanExecText(b.side, 5), symbol: cleanExecText(b.symbol, 20), ok: b.ok === true,
@@ -1020,6 +1050,10 @@ app.post('/api/exec-report', requireDevice, (req, res) => {
       sendOfflineAlertTelegram('⚠️ ' + who + ' ' + rec.symbol.replace('USDT', '') + ' ' + (rec.side === 'BUY' ? 'long' : 'short') + ': ' + EXEC_ALERT_TEXT[rec.code] + '.' + (noUsers ? ' This trade was not placed on the master account, so it was not copied to users.' : ''));
     }
   }
+  return true;
+}
+app.post('/api/exec-report', requireDevice, (req, res) => {
+  if (!ingestExecReport(req.body || {})) return res.status(400).json({ success: false, message: 'id and kind are required' });
   return res.status(200).json({ success: true });
 });
 
@@ -1204,6 +1238,31 @@ app.post('/api/clear-trade-log', requireDashboardAuth, (req, res) => {
 // Global Exception Safety Net
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// ---- SERVER-SIDE TRADE EXECUTION (POST /api/trade) -------------------------------------------------------------------------
+// A bot sends ONE request with its decision; the server does what the manager ESP32 used to do with ~8 HTTPS calls (balance, held-pair
+// check, instrument rules, leverage, quantity, order, wait for the position, trailing stop). See tradeexec.js. The manager path
+// (/api/order etc.) is unchanged and keeps working, so bots can be moved over one at a time.
+// A 200 answer is final for that id (ok:true/false + a code); a 5xx or a timeout means "ask again with the same id" (safe: ids are idempotent).
+const tradeExec = require('./tradeexec').create({
+  rest: () => restClient,
+  mode: () => TRADE_MODE,
+  halted: () => breakerIsTripped(),
+  placeOrder: body => processOrder(body),
+  fanOutLeverage: b => multiuser.fanOutLeverage(b),
+  fanOutTradingStop: b => multiuser.fanOutTradingStop(b),
+  report: rec => ingestExecReport(rec),
+  log: (...a) => console.log(...a),
+});
+app.post('/api/trade', requireDevice, async (req, res) => {
+  try {
+    const r = await tradeExec.run(req.body);
+    return res.status(r.http).json(r.body);
+  } catch (error) {
+    console.error('[trade]', error && error.message);
+    return res.status(500).json({ success: false, error: 'trade execution failed, ask again with the same id' });
+  }
 });
 
 process.on('uncaughtException', (err) => {

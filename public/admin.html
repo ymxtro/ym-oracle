@@ -225,7 +225,7 @@ function jq(path){return j(path).catch(function(){return null})}   // a card tha
 /* ---------- state ---------- */
 var TABS=['overview','trading','bots','users','plan','activity','payments','settings'];
 var TITLES={overview:'Overview',trading:'Trading',bots:'Bots & alerts',users:'Users',plan:'Plan & risk',activity:'Activity',payments:'Payments',settings:'Settings'};
-var S={pg:null,pgPending:null,ar:null,arHours:4,tab:'overview',tr:null,ping:null,mk:{info:null,open:false,env:'live',key:'',sec:'',msg:null,busy:false,confirm:false,arm:false},liveAsk:false,liveTxt:'',users:[],pausedAll:false,dryAll:false,planVersion:null,plan:null,ov:null,period:30,series:null,bots:null,signals:null,sec:null,
+var S={ar:null,arHours:4,tab:'overview',tr:null,ping:null,mk:{info:null,open:false,env:'live',key:'',sec:'',msg:null,busy:false,confirm:false,arm:false},liveAsk:false,liveTxt:'',users:[],pausedAll:false,dryAll:false,planVersion:null,plan:null,ov:null,period:30,series:null,bots:null,signals:null,sec:null,
   filter:'all',q:'',ofilter:'all',ouser:'',orders:null,audit:null,openId:null,planDraft:null,planPreview:null,planCounts:null,hist:null,drySummary:null,hash:'',timer:null,drawerMsg:''};
 var HOLD={};
 
@@ -283,7 +283,6 @@ function loadTab(){
     jobs.push(jq('/api/admin/plan').then(function(r){if(r&&r.success){S.planCounts=r;if(!S.planDraft)S.planDraft=draftFrom(r.plan)}}));
     jobs.push(jq('/api/admin/plan/history?limit=12').then(function(r){S.hist=r&&r.success?r:null}));
     jobs.push(jq('/api/admin/orders/summary?hours=24').then(function(r){S.drySummary=r&&r.success?r.users:null}));
-    jobs.push(jq('/api/admin/profit-guard').then(function(r){S.pg=r&&r.success?r:S.pg}));
   }
   if(t==='activity'){
     jobs.push(loadOrders());
@@ -534,7 +533,6 @@ function viewPlan(){
   h+='</div><div class="stack sticky"><div class="card" id="review">'+reviewHtml()+'</div>';
   h+='<div class="card" id="planPreviewCard">'+previewHtml(d)+'</div>';
   h+='<div class="card"><h2 style="margin:0 0 8px">Dry run</h2><div class="line" style="padding-top:0"><span>'+(S.dryAll?'<b class="warn">On for everyone.</b> No orders are being sent.':'Off for everyone.')+'</span><label class="sw"><input type="checkbox" data-dryplan '+(S.dryAll?'checked':'')+' aria-label="Dry run for everyone"><i></i></label></div>'+dryTable()+'</div>';
-  h+=guardCard();
   h+='<div class="card"><h2 style="margin:0 0 8px">Version history</h2>'+histHtml()+'</div></div></div>';
   return h;
 }
@@ -678,54 +676,6 @@ function pingFleet(){
   }).catch(function(){S.ping=null;render()});
 }
 /* ---------- Telegram alert control ---------- */
-function pgPost(body,msg){return j('/api/admin/profit-guard','POST',body).then(function(r){if(r.success){S.pg=r;S.pgPending=null;toast(msg||'Saved');render()}else if(/Confirm/.test(r.message||'')){S.pgPending={body:body,msg:msg,why:r.message};render()}else toast(r.message||'Could not save');return r}).catch(function(){toast('Could not reach the server')})}
-function pgSettingsBody(){
-  var g=function(id){var e=$('#'+id);return e?Number(e.value):NaN},c=function(id){var e=$('#'+id);return !!(e&&e.checked)},o={minGapPct:g('pg-gap')};
-  ['fast','swing'].forEach(function(p){
-    var pr={beR:g('pg-'+p+'-be'),ladder:[],scale:{on:c('pg-'+p+'-son'),steps:[]}};
-    for(var i=0;i<3;i++){var r=g('pg-'+p+'-r'+i),k=g('pg-'+p+'-k'+i);if(r>0&&k>0)pr.ladder.push([r,k/100])}
-    for(var n=0;n<2;n++){var sr=g('pg-'+p+'-sr'+n),sk=g('pg-'+p+'-sk'+n);if(sr>0&&sk>0)pr.scale.steps.push([sr,sk/100])}
-    o[p]=pr});
-  o.reentry={on:c('pg-re-on'),minPullR:g('pg-re-pull'),resumePct:g('pg-re-res'),targetR:g('pg-re-tgt')};
-  return o;
-}
-function pgNum(v,d){var n=Number(v);return isFinite(n)?n.toFixed(d===undefined?2:d):'–'}
-function guardCard(){
-  var P=S.pg,h='<div class="card" id="pgcard"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0 0 4px">Profit Guard</h2>';
-  if(!P)return h+'</div><p class="mist small">Loading…</p></div>';
-  var C=P.cfg,R=P.run||{};
-  h+=(C.mode==='live'?'<span class="chip long">LIVE</span>':C.mode==='shadow'?'<span class="chip warn">SHADOW · testing only</span>':'<span class="chip">OFF</span>')+'</div>';
-  h+='<p class="mist small" style="margin:0 0 10px">Watches your open trades every few seconds and locks profit by raising stops (never loosening them), can bank a small slice at set levels, and records when a re-entry would have appeared. <b>Shadow</b> only records; <b>Live</b> acts for real. Fast and swing trades can each run in their own mode.</p>';
-  h+='<div class="line" style="padding-top:0"><span><b>Overall</b><br><span class="hint2">Off here switches everything off. Each profile below follows this unless you set it separately.</span></span></div><div class="seg" role="group" aria-label="Profit Guard overall mode">'+[['off','Off'],['shadow','Shadow'],['live','Live']].map(function(m){return '<button data-act="pgMode" data-v="'+m[0]+'" aria-pressed="'+(C.mode===m[0])+'">'+m[1]+'</button>'}).join('')+'</div>';
-  if(S.pgPending)h+='<div class="box red" style="margin-top:8px">'+esc(S.pgPending.why||'This acts on real money.')+'<div class="btns" style="margin-top:8px"><button class="btn pri" data-act="pgConfirm">Confirm</button><button class="btn" data-act="pgCancel">Cancel</button></div></div>';
-  if(C.mode!=='off'&&(R.relayMode!=='live'||R.halted))h+='<div class="box" style="margin-top:8px">Paused: '+(R.halted?'trading is halted.':'the relay is not in live trading mode.')+'</div>';
-  if(R.ok===false&&R.err)h+='<div class="box red" style="margin-top:8px">Last check failed: '+esc(R.err)+'</div>';
-  h+='<h3 style="margin:14px 0 4px;font-size:13px">Trades being watched</h3>';
-  h+=P.trades.length?P.trades.map(function(t){var L=t.side==='Buy';return '<div class="line"><span style="min-width:0"><b>'+esc(coinOf(t.symbol))+'</b> <span class="'+(L?'long':'short')+'">'+(L?'LONG':'SHORT')+'</span> <span class="mist">· '+esc(t.profile)+' · '+esc(t.mode||'')+'</span><br><span class="hint2">Best so far '+Number(t.peakR||0).toFixed(1)+'R · stop '+esc(t.stop||'none')+(t.floor?' · guard floor '+esc(t.floor):'')+(t.shadowStop?' · would set '+esc(t.shadowStop):'')+(t.scaled?' · '+t.scaled+' slice(s) banked':'')+(t.why?' · '+esc(t.why):'')+'</span></span></div>'}).join(''):'<p class="mist small">No open trades right now.</p>';
-  [['fast','Fast trades'],['swing','Swing trades']].forEach(function(pp){
-    var c=C[pp[0]],id='pg-'+pp[0]+'-';
-    h+='<h3 style="margin:16px 0 4px;font-size:13px">'+pp[1]+'</h3><div class="seg" role="group" aria-label="'+pp[1]+' mode">'+[['inherit','Follow overall'],['off','Off'],['shadow','Shadow'],['live','Live']].map(function(m){return '<button data-act="pgProf" data-p="'+pp[0]+'" data-v="'+m[0]+'" aria-pressed="'+(c.mode===m[0])+'">'+m[1]+'</button>'}).join('')+'</div>';
-    h+='<p class="mist small" style="margin:6px 0">Lock profit: at the start level the stop moves to breakeven, then each step keeps that share of the best profit reached (R = what the trade risked).</p><div class="fgrid"><div><label class="l" for="'+id+'be">Breakeven at (R)</label><input type="number" step="0.1" id="'+id+'be" value="'+esc(c.beR)+'"></div></div><div class="fgrid">';
-    for(var i=0;i<3;i++){var st=c.ladder[i]||['',''];h+='<div><label class="l" for="'+id+'r'+i+'">Step '+(i+1)+' at (R)</label><input type="number" step="0.5" id="'+id+'r'+i+'" value="'+esc(st[0])+'"></div><div><label class="l" for="'+id+'k'+i+'">Keep % of best profit</label><input type="number" step="5" id="'+id+'k'+i+'" value="'+(st[1]===''?'':Math.round(st[1]*100))+'"></div>'}
-    h+='</div><label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="'+id+'son"'+(c.scale.on?' checked':'')+'> Bank a slice of profit (scale-out). A runner always stays.</label><div class="fgrid">';
-    for(var n=0;n<2;n++){var ss=c.scale.steps[n]||['',''];h+='<div><label class="l" for="'+id+'sr'+n+'">Slice '+(n+1)+' at (R)</label><input type="number" step="0.5" id="'+id+'sr'+n+'" value="'+esc(ss[0])+'"></div><div><label class="l" for="'+id+'sk'+n+'">Close % of the position</label><input type="number" step="5" id="'+id+'sk'+n+'" value="'+(ss[1]===''?'':Math.round(ss[1]*100))+'"></div>'}
-    h+='</div>';
-  });
-  var re=C.reentry;
-  h+='<h3 style="margin:16px 0 4px;font-size:13px">Re-entry recorder <span class="chip">records only</span></h3><label class="small" style="display:block"><input type="checkbox" id="pg-re-on"'+(re.on?' checked':'')+'> After a winner closes, note when a pullback-and-resume entry would have appeared and how it ended. It never places a trade.</label><div class="fgrid"><div><label class="l" for="pg-re-pull">Pullback needed (R)</label><input type="number" step="0.1" id="pg-re-pull" value="'+esc(re.minPullR)+'"></div><div><label class="l" for="pg-re-res">Resume signal (% of the pullback regained)</label><input type="number" step="5" id="pg-re-res" value="'+esc(re.resumePct)+'"></div><div><label class="l" for="pg-re-tgt">Counts as a win at (R)</label><input type="number" step="0.5" id="pg-re-tgt" value="'+esc(re.targetR)+'"></div></div>';
-  h+='<div class="fgrid" style="margin-top:8px"><div><label class="l" for="pg-gap">Never closer to the price than (%)</label><input type="number" step="0.05" id="pg-gap" value="'+esc(C.minGapPct)+'"></div></div>';
-  h+='<div class="btns" style="margin-top:10px"><button class="btn pri" data-act="pgSave">Save settings</button></div>';
-  var SC=P.scorecard||{recent:[],summary:[],reentry:{},watching:[]};
-  h+='<h3 style="margin:16px 0 4px;font-size:13px">Scorecard <span class="mist small">(closed trades: how much profit each gave back from its best point)</span></h3>';
-  h+=SC.summary.length?SC.summary.map(function(x){return '<div class="line"><span><b>'+esc(x.profile)+'</b> <span class="mist">· '+esc(x.mode)+' · '+x.n+' trade(s)</span></span><span class="mist small">best +'+pgNum(x.peak)+'% · exit '+pgNum(x.exit)+'% · gave back '+pgNum(x.giveback)+'%</span></div>'}).join(''):'<p class="mist small">No closed trades recorded yet.</p>';
-  h+=SC.recent.slice(0,8).map(function(x){return '<div class="line"><span style="min-width:0"><b>'+esc(coinOf(x.symbol))+'</b> <span class="mist">'+esc(x.profile)+' · '+esc(x.mode)+' · '+ago(x.at)+'</span></span><span class="mist small">best +'+pgNum(x.peak_pct)+'% → exit '+(x.exit_pct===null?'unknown':pgNum(x.exit_pct)+'%')+(x.scaled?' · '+x.scaled+' slice(s)':'')+'</span></div>'}).join('');
-  var rs=SC.reentry||{};
-  h+='<div class="line"><span><b>Re-entry recorder</b><br><span class="hint2">Watching '+((SC.watching||[]).length)+' closed trade(s)</span></span><span class="mist small">spotted '+(rs.spotted||0)+' · finished '+(rs.done||0)+' · won '+(rs.wins||0)+' · average '+(rs.avg_r===null||rs.avg_r===undefined?'–':pgNum(rs.avg_r)+'R')+' · no chance '+(rs.none||0)+'</span></div>';
-  h+='<h3 style="margin:14px 0 4px;font-size:13px">Recent activity</h3>';
-  var names={would_raise:'Would raise',would_exit:'Would have exited',raised:'Raised',held:'Held a looser stop',failed:'Failed',closed:'Trade closed',would_scale:'Would bank a slice',scaled:'Banked a slice',scale_skipped:'Slice skipped',would_reenter:'Would re-enter',reentry_result:'Re-entry result',no_reentry:'No re-entry chance'};
-  h+=P.log.length?P.log.slice(0,14).map(function(x){return '<div class="sig" style="grid-template-columns:62px minmax(0,1fr)"><span class="tm">'+ago(x.at)+'</span><span style="min-width:0"><b>'+esc(coinOf(x.symbol))+'</b> <span class="mist">'+esc(names[x.event]||x.event)+(x.new_sl?' · '+esc(Number(x.new_sl)):'')+(x.event==='reentry_result'&&x.result_r!==null?' · '+pgNum(x.result_r)+'R':(x.peak_r?' · '+Number(x.peak_r).toFixed(1)+'R':''))+'</span><br><span class="mist small">'+esc(x.detail||'')+'</span></span></div>'}).join(''):'<p class="mist small">Nothing yet.</p>';
-  return h+'</div>';
-}
 function arPost(body,msg){return j('/api/admin/alert-routes','POST',body).then(function(r){if(r.success){S.ar=r;toast(msg||'Saved');render()}else toast(r.message||'Could not save');return r}).catch(function(){toast('Could not reach the server')})}
 function alertCard(){
   var A=S.ar,h='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0 0 4px">Telegram alert control</h2>';
@@ -883,11 +833,6 @@ document.addEventListener('click',function(e){
   if(a==='sync'){t.textContent='Syncing…';j('/api/admin/sync-now','POST').then(function(){t.textContent='Sync PnL';toast('PnL synced');refreshAll(true)});return}
   if(a==='csv'){exportCsv();return}
   if(a==='testAlert'){var to=t.getAttribute('data-to')||'',lab=t.textContent;t.textContent='Sending…';j('/api/admin/test-alert','POST',to?{target:to}:{}).then(function(r){t.textContent=lab;toast(!r.configured?'No alert channel is set up on Render yet (Telegram token and chat id)':r.muted?'Muted by your alert settings ('+(r.reason||'see the panel')+'): nothing was sent':r.success?'Test sent'+(to==='group'?' to the group':to==='dm'?' to your DM':'')+(r.telegram&&r.telegram.indexOf('sent')===0?'':'')+(r.email==='sent'?' and email':''):'Sending failed: Telegram '+r.telegram+(r.email!=='off'?', email '+r.email:''))}).catch(function(){t.textContent=lab;toast('Could not reach the server')});return}
-  if(a==='pgMode'){var pm=t.getAttribute('data-v');pgPost({mode:pm},pm==='live'?'Profit Guard is LIVE':pm==='shadow'?'Shadow mode: recording only':'Profit Guard is off');return}
-  if(a==='pgProf'){var pp=t.getAttribute('data-p'),pv=t.getAttribute('data-v'),pb={};pb[pp]={mode:pv};pgPost(pb,pp+': '+(pv==='inherit'?'follows the overall mode':pv));return}
-  if(a==='pgSave'){pgPost(pgSettingsBody(),'Settings saved');return}
-  if(a==='pgConfirm'){var pend=S.pgPending;if(pend)pgPost(Object.assign({},pend.body,{confirm:'LIVE'}),pend.msg);return}
-  if(a==='pgCancel'){S.pgPending=null;render();return}
   if(a==='arMode'){var m=t.getAttribute('data-v');arPost({mode:m,hours:m==='live'?0:Number(S.arHours)},m==='live'?'Live: alerts go where the table says':m==='dev'?'Dev mode: the group is silent':'Telegram is off');return}
   if(a==='arHours'){S.arHours=Number(t.getAttribute('data-v'));if(S.ar&&S.ar.mode!=='live')arPost({mode:S.ar.mode,hours:S.arHours},'Timer updated');else render();return}
   if(a==='arChats'){arPost({groupChat:($('#ar-group')||{}).value||'',dmChat:($('#ar-dm')||{}).value||''},'Chat ids saved');return}

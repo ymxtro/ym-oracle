@@ -115,10 +115,7 @@ const fleetStatus = {}; // { "YM ORACLE I": epochMs, ... }
 const fleetInfo = {}; // { "YM ORACLE I": { uptimeMin, resetReason, freeHeap, build } }
 const HEARTBEAT_INTERVAL_SEC = 180;
 const HEARTBEAT_LATE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 1.5;      // 270s
-// 4 beats (720s), was 2.5 (450s). The manager forwards each bot's alive-signal over a home Wi-Fi link to here; losing two in a row there is routine
-// (a measured 3-hour run lost about a third of them), so 2.5 beats raised a false "gone offline" every half hour or so. Override: HEARTBEAT_OFFLINE_FACTOR.
-const HEARTBEAT_OFFLINE_FACTOR = Math.min(10, Math.max(2.5, Number(process.env.HEARTBEAT_OFFLINE_FACTOR) || 4));
-const HEARTBEAT_OFFLINE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * HEARTBEAT_OFFLINE_FACTOR;   // 720s by default
+const HEARTBEAT_OFFLINE_AFTER_SEC = HEARTBEAT_INTERVAL_SEC * 2.5;   // 450s
 const HEARTBEAT_OFFLINE_THRESHOLD_MS = HEARTBEAT_OFFLINE_AFTER_SEC * 1000;
 // REAL BUG FOUND, and it is the actual root cause of offline alerts never firing: there is ALSO a constant
 // literally named ACTIVE_BOT_NAMES down inside public/dashboard.html -- but that one is CLIENT-SIDE
@@ -562,7 +559,6 @@ async function processOrder(body) {
       body = { ...body, qty: String(sz.qty) };
     } else if (sz && sz.skipped) console.warn(`[master-sizing] plan size not possible (${sz.skipped}): using the manager's quantity. ${sz.detail}`);
   }
-  if (body.reduceOnly && multiuser.guardFitClose) body = await multiuser.guardFitClose(body);   // after a Profit Guard scale-out, a close is fitted to what is really left
   const response = await submitMasterOrder(body);
   const isOpen = !body.reduceOnly;
   const landed = TRADE_MODE === 'paper' || response.retCode === 0 || response.retCode === 110072;
@@ -618,13 +614,12 @@ app.post('/api/trading-stop', requireDevice, async (req, res) => {
     return res.status(503).json({ success: false, message: 'Trading halted', status: breakerStatus() });
   }
   try {
-    const stopBody = multiuser.guardClamp ? multiuser.guardClamp(req.body) : req.body;   // Profit Guard (when live): a bot's looser stop is held at the guard's floor
-    multiuser.fanOutTradingStop(stopBody).catch(e => console.error('[multiuser] fanOutTradingStop:', e.message));
+    multiuser.fanOutTradingStop(req.body).catch(e => console.error('[multiuser] fanOutTradingStop:', e.message));
     let response;
     if (TRADE_MODE === 'paper') {
-      response = { paper: true, wouldHaveSubmitted: stopBody, retCode: 0, retMsg: 'PAPER MODE — not sent to Bybit' };
+      response = { paper: true, wouldHaveSubmitted: req.body, retCode: 0, retMsg: 'PAPER MODE — not sent to Bybit' };
     } else {
-      response = await restClient.setTradingStop(stopBody);
+      response = await restClient.setTradingStop(req.body);
     }
     return res.status(200).json(response);
   } catch (error) {
@@ -1022,9 +1017,10 @@ const EXEC_ALERT_TEXT = {
 };
 
 let reconcileTimer = null;
-app.post('/api/exec-report', requireDevice, (req, res) => {
-  const b = req.body || {};
-  if (!b.id || !b.kind) return res.status(400).json({ success: false, message: 'id and kind are required' });
+// Records one execution report (dashboard row, trade-log healing, alerts). Used by POST /api/exec-report (the manager ESP32)
+// and by the server's own trade execution (POST /api/trade). Returns false when the report has no id or kind.
+function ingestExecReport(b) {
+  if (!b || !b.id || !b.kind) return false;
   const rec = {
     id: cleanExecText(b.id, 20), bot: cleanExecText(b.bot || '?', 30), kind: cleanExecText(b.kind, 10),
     side: cleanExecText(b.side, 5), symbol: cleanExecText(b.symbol, 20), ok: b.ok === true,
@@ -1054,6 +1050,10 @@ app.post('/api/exec-report', requireDevice, (req, res) => {
       sendOfflineAlertTelegram('⚠️ ' + who + ' ' + rec.symbol.replace('USDT', '') + ' ' + (rec.side === 'BUY' ? 'long' : 'short') + ': ' + EXEC_ALERT_TEXT[rec.code] + '.' + (noUsers ? ' This trade was not placed on the master account, so it was not copied to users.' : ''));
     }
   }
+  return true;
+}
+app.post('/api/exec-report', requireDevice, (req, res) => {
+  if (!ingestExecReport(req.body || {})) return res.status(400).json({ success: false, message: 'id and kind are required' });
   return res.status(200).json({ success: true });
 });
 
@@ -1238,6 +1238,31 @@ app.post('/api/clear-trade-log', requireDashboardAuth, (req, res) => {
 // Global Exception Safety Net
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// ---- SERVER-SIDE TRADE EXECUTION (POST /api/trade) -------------------------------------------------------------------------
+// A bot sends ONE request with its decision; the server does what the manager ESP32 used to do with ~8 HTTPS calls (balance, held-pair
+// check, instrument rules, leverage, quantity, order, wait for the position, trailing stop). See tradeexec.js. The manager path
+// (/api/order etc.) is unchanged and keeps working, so bots can be moved over one at a time.
+// A 200 answer is final for that id (ok:true/false + a code); a 5xx or a timeout means "ask again with the same id" (safe: ids are idempotent).
+const tradeExec = require('./tradeexec').create({
+  rest: () => restClient,
+  mode: () => TRADE_MODE,
+  halted: () => breakerIsTripped(),
+  placeOrder: body => processOrder(body),
+  fanOutLeverage: b => multiuser.fanOutLeverage(b),
+  fanOutTradingStop: b => multiuser.fanOutTradingStop(b),
+  report: rec => ingestExecReport(rec),
+  log: (...a) => console.log(...a),
+});
+app.post('/api/trade', requireDevice, async (req, res) => {
+  try {
+    const r = await tradeExec.run(req.body);
+    return res.status(r.http).json(r.body);
+  } catch (error) {
+    console.error('[trade]', error && error.message);
+    return res.status(500).json({ success: false, error: 'trade execution failed, ask again with the same id' });
+  }
 });
 
 process.on('uncaughtException', (err) => {

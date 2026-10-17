@@ -332,6 +332,7 @@ function init(deps) {
   // deliverAlert (optional dep) = async text => { ok, configured, telegram, email }: waits for the real result. Falls back to fire-and-forget sendAlert.
   const deliverAlert = deps.deliverAlert || (async (t, _o) => { if (!sendAlert) return { ok: false, configured: false }; sendAlert(t); return { ok: true, configured: true, telegram: 'sent' }; });
   const getSecurityInfo = deps.getSecurityInfo || (() => ({}));
+  const alertRouter = deps.alertRouter || null;   // { state, route, envChats, tokenSet }: where Telegram alerts go (see alertroute.js)
   const getMasterSync = deps.getMasterSync || (() => ({}));
   const getExecReports = deps.getExecReports || (() => []);
   const getFleet = deps.getFleet || (() => ({ last: {}, info: {}, offlineMs: 0 }));
@@ -540,6 +541,10 @@ function init(deps) {
   const globalReady = ready.then(async () => {
     const r = await q(`SELECT v FROM meta WHERE k='users_paused_all'`);
     pausedAll = !!(r.rows[0] && r.rows[0].v === '1');
+    if (alertRouter) {                                   // the saved Telegram routing (group / DM / dev / off); defaults apply if nothing is saved or it cannot be read
+      try { const ar = await q(`SELECT v FROM meta WHERE k='alert_routes'`); if (ar.rows[0]) alertRouter.state.cfg = alertRouter.route.normalize(JSON.parse(ar.rows[0].v)); }
+      catch (e) { console.error('[multiuser] alert routes not loaded, using defaults:', e.message); }
+    }
     const dr = await q(`SELECT v FROM meta WHERE k='dry_run_all'`);
     dryAll = !!(dr.rows[0] && dr.rows[0].v === '1');
     const mp = await q(`SELECT v FROM meta WHERE k='master_plan'`);
@@ -1125,15 +1130,15 @@ function init(deps) {
       lastBotTestAt = Date.now();
     }
     if (ev === 'test') { // the "test alert" button on a bot: proves bot -> relay -> Telegram/email works end to end
-      const r = await deliverAlert('✅ Test alert from ' + bot.replace('YM ORACLE ', 'Oracle ') + '. The bot reached Render and Render can reach you. Trade alerts will arrive the same way.');
-      return { status: 200, message: r.ok ? 'delivered' : (r.configured === false ? 'alerts are not configured on Render' : 'delivery failed') };
+      const r = await deliverAlert('✅ Test alert from ' + bot.replace('YM ORACLE ', 'Oracle ') + '. The bot reached Render and Render can reach you. Trade alerts will arrive the same way.', { cat: 'tests' });
+      return { status: 200, message: r.muted ? 'delivered (muted by the alert settings: ' + (r.reason || 'see the console') + ')' : r.ok ? 'delivered' : (r.configured === false ? 'alerts are not configured on Render' : 'delivery failed') };
     }
     if (ev === 'msg') { // an alert the bot composed itself (zone found, trade management, daily summary, the full entry/result text): stored first, then delivered with retries
       const k = String(b.k || '');
       if (!KEY_RE.test(k)) return { status: 400, message: 'bad key' };
       const text = String(b.text === undefined || b.text === null ? '' : b.text).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ').slice(0, 3800);
       if (!text.trim()) return { status: 400, message: 'empty message' };
-      const kind = ['entry', 'result', 'daily', 'zone', 'mgmt', 'other'].includes(b.kind) ? b.kind : 'other';
+      const kind = ['entry', 'result', 'daily', 'zone', 'mgmt', 'ops', 'other'].includes(b.kind) ? b.kind : 'other';
       const sym = String(b.sym || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 20) || null;
       await q(`INSERT INTO bot_msgs(k,bot,kind,sym,priv,text) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (k) DO NOTHING`, [k, bot, kind, sym, b.priv === true || b.priv === 1, text]);
       pushBotMsgs().then(() => (kind === 'entry' || kind === 'result') ? pushSignalAlerts() : 0).catch(e => console.error('[multiuser] bot msg:', e.message));
@@ -1197,6 +1202,9 @@ function init(deps) {
   const symKey = v => String(v || '').toUpperCase().replace(/USDT$/, '').replace(/[^A-Z0-9]/g, '');
   const HOLD_S = () => (process.env.TRADE_ALERT_HOLD_S !== undefined && Number.isFinite(Number(process.env.TRADE_ALERT_HOLD_S)) ? Number(process.env.TRADE_ALERT_HOLD_S) : 45);
   // Alerts the bot composed itself. Stored on arrival (the bot gets its 200 at once and drops its copy), then delivered here, retried up to 8 times.
+  // Which alert category a bot message belongs to (the firmware tags entry/result/zone/mgmt/daily/ops; an untagged one from older firmware is guessed from where it was addressed).
+  const catOfMsg = m => (m.kind === 'entry' || m.kind === 'result') ? 'signals' : m.kind === 'zone' ? 'zones' : m.kind === 'daily' ? 'daily' : m.kind === 'mgmt' ? 'updates' : m.kind === 'ops' ? 'ops'
+    : m.priv ? (/zone/i.test(stripTags(m.text)) ? 'zones' : 'ops') : 'updates';
   async function pushBotMsgs() {
     if (!tradeAlertsOn()) return 0;
     await ready;
@@ -1205,7 +1213,7 @@ function init(deps) {
     for (const row of r.rows) {
       const c = await q(`UPDATE bot_msgs SET claimed_at=now() WHERE k=$1 AND sent_at IS NULL AND (claimed_at IS NULL OR claimed_at < now() - interval '40 seconds') RETURNING *`, [row.k]);
       const m = c.rows[0]; if (!m) continue;
-      let res; try { res = await deliverAlert(m.text, { html: true, priv: m.priv, email: m.kind === 'daily' }); } catch (e) { res = { ok: false, configured: true }; }
+      let res; try { res = await deliverAlert(m.text, { html: true, priv: m.priv, email: m.kind === 'daily', cat: catOfMsg(m) }); } catch (e) { res = { ok: false, configured: true }; }
       if (res && res.ok) { sent++; await q(`UPDATE bot_msgs SET sent_at=now(), last_result=$2 WHERE k=$1`, [m.k, [res.telegram && 'telegram ' + res.telegram, res.email && res.email !== 'off' && 'email ' + res.email].filter(Boolean).join(', ')]); continue; }
       const cfgd = !(res && res.configured === false);
       await q(`UPDATE bot_msgs SET claimed_at=NULL, tries=tries+$2, last_result=$3 WHERE k=$1`, [m.k, cfgd ? 1 : 0, res ? [res.telegram, res.email].filter(x => x && x !== 'off').join(', ') || 'not configured' : 'failed']);
@@ -1234,7 +1242,7 @@ function init(deps) {
         const x = c.rows[0];
         if (!x) continue;                                    // another call took it
         let res;
-        try { res = await deliverAlert(kind === 'open' ? openAlertText(x) : closeAlertText(x)); } catch (e) { res = { ok: false, configured: true }; }
+        try { res = await deliverAlert(kind === 'open' ? openAlertText(x) : closeAlertText(x), { cat: 'signals' }); } catch (e) { res = { ok: false, configured: true }; }
         if (res && res.ok) { sent++; continue; }
         await q(`UPDATE signals SET ${col}=NULL, alert_tries=alert_tries+(CASE WHEN $2 THEN 1 ELSE 0 END) WHERE k=$1`, [x.k, !(res && res.configured === false)]);
         if (res && res.configured === false) return sent;    // nothing is set up: don't spin
@@ -2155,8 +2163,38 @@ function init(deps) {
     res.json({ success: true, undelivered: un.rows[0].n, alerts: r.rows.map(x => ({ key: x.k, bot: x.bot, kind: x.kind, sym: x.sym, text: stripTags(x.text).split('\n').filter(Boolean).slice(0, 2).join(' · ').slice(0, 160), at: x.created_at, sent: !!x.sent_at, tries: x.tries, result: x.last_result })) });
   }));
   app.post('/api/admin/test-alert', adminAuth, h(async (req, res) => {
-    const r = await deliverAlert('✅ Test alert from the YM Oracle admin page. If you can read this, trade alerts from Render will reach you.');
-    res.json({ success: !!r.ok, configured: r.configured !== false, telegram: r.telegram || null, email: r.email || null, tradeAlerts: tradeAlertsOn() });
+    const to = (req.body && (req.body.target === 'group' || req.body.target === 'dm')) ? req.body.target : null;
+    const label = to === 'group' ? 'the GROUP' : to === 'dm' ? 'your DM' : 'the chat(s) your alert settings choose';
+    const r = await deliverAlert('✅ Test alert from the YM Oracle admin page, sent to ' + label + '. If you can read this, alerts from Render reach it.', to ? { force: to } : { cat: 'tests' });
+    res.json({ success: !!r.ok, configured: r.configured !== false, telegram: r.telegram || null, email: r.email || null, muted: !!r.muted, reason: r.reason || null, tradeAlerts: tradeAlertsOn() });
+  }));
+
+  // Telegram routing: who gets what (group / DM / both / off), the Dev and Off modes, and an optional timer. Saved in the database, effective at once.
+  const routeView = () => {
+    const R = alertRouter.route, env = alertRouter.envChats(), cfg = alertRouter.state.cfg, now = Date.now();
+    return { ...R.describe(cfg, now), tokenSet: alertRouter.tokenSet(), groupSet: !!(cfg.groupChat || env.groupChat), dmSet: !!(cfg.dmChat || env.dmChat),
+      groupFromEnv: !cfg.groupChat && !!env.groupChat, dmFromEnv: !cfg.dmChat && !!env.dmChat, tradeAlerts: tradeAlertsOn(), now,
+      cats: R.CAT_IDS.map(id => ({ id, label: R.CATS[id].label, hint: R.CATS[id].hint, def: R.CATS[id].def })) };
+  };
+  app.get('/api/admin/alert-routes', adminAuth, h(async (req, res) => {
+    if (!alertRouter) return res.status(503).json({ success: false, message: 'not available' });
+    res.json({ success: true, ...routeView() });
+  }));
+  app.post('/api/admin/alert-routes', adminAuth, h(async (req, res) => {
+    if (!alertRouter) return res.status(503).json({ success: false, message: 'not available' });
+    const R = alertRouter.route, b = req.body || {};
+    if (b.mode !== undefined && !R.MODES.includes(b.mode)) return res.status(400).json({ success: false, message: 'mode must be live, dev or off' });
+    if (b.routes && typeof b.routes === 'object') for (const [k, v] of Object.entries(b.routes)) if (!R.CAT_IDS.includes(k) || !R.DESTS.includes(v)) return res.status(400).json({ success: false, message: 'bad route for ' + k });
+    for (const k of ['groupChat', 'dmChat']) if (b[k] !== undefined && String(b[k]).trim() !== '' && R.normalize({ [k]: b[k] })[k] === '') return res.status(400).json({ success: false, message: 'that chat id does not look right (use the number, e.g. -1001234567890, or @channelname)' });
+    const next = R.fromRequest(b, Date.now(), alertRouter.state.cfg);
+    // never let a setting silently swallow everything: dev mode and "DM" routes need a DM chat to land in
+    const env = alertRouter.envChats();
+    const dmKnown = !!(next.dmChat || env.dmChat);
+    if (next.mode === 'dev' && !dmKnown) return res.status(400).json({ success: false, message: 'Dev mode sends everything to your DM, but no DM chat is set yet. Add your DM chat id first (ALERT_TELEGRAM_PRIVATE_CHAT_ID on Render, or the field on this panel).' });
+    await q(`INSERT INTO meta(k,v) VALUES('alert_routes',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(next)]);
+    alertRouter.state.cfg = next;
+    await audit('admin', 'alert_routes_changed', null, req, (next.mode === 'live' ? 'live' : next.mode + (next.until ? ' until ' + new Date(next.until).toISOString() : ' until changed')) + ' ' + JSON.stringify(next.routes));
+    res.json({ success: true, ...routeView() });
   }));
 
   // signal-first view: one row per bot signal with what the bot said, whether the order reached the relay, the master result and the copies
