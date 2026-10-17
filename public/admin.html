@@ -707,7 +707,7 @@ function viewBots(){
   var h='<div class="g2"><div class="stack">';
   h+=S.bots?botsCard():'<div class="card"><p class="mist" style="padding:6px 0">Loading…</p></div>';
   h+='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><h2 style="margin:0">Ping all bots</h2><button class="btn pri" data-act="ping"'+(S.ping&&S.ping.state==='wait'?' disabled':'')+'>'+(S.ping&&S.ping.state==='wait'?'Pinging…':'Ping now')+'</button></div>'
-    +'<p class="mist small" style="margin:6px 0 4px">Asks each bot through the manager to answer, and shows how long it took.</p>';
+    +'<p class="mist small" style="margin:6px 0 4px">Asks each bot directly (they check in with the server about every 15 s) and shows each bot's own round trip to the server.</p>';
   if(S.ping)h+=BOT_NAMES.map(function(n){var r=S.ping.results[n],txt,c='';
     if(!r){txt=S.ping.state==='wait'?'Waiting… '+Math.floor((Date.now()-S.ping.started)/1000)+'s':'No response';c=S.ping.state==='wait'?'warn':'short'}
     else if(r.timeout){txt='Timeout';c='short'}else{txt=r.ms+' ms';c='long'}

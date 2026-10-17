@@ -185,6 +185,22 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
   assert(!JSON.stringify(fl).includes('<'), 'no markup survives in a bot name');
   ok('heartbeats: name-only (old firmware), the new state beacon and junk are all handled; bot IV is tracked');
 
+  // 12b. the bots check in with the server themselves (no manager): proof of life + the fleet ping
+  assert.strictEqual((await A.get('/api/bot-poll')).s, 400, 'a poll must name the bot');
+  let pl = (await A.get('/api/bot-poll?name=YM%20ORACLE%20II')).j;
+  assert(pl.success === true && pl.pingId === null, 'no round yet: nothing waiting');
+  let fl2 = (await A.get('/api/fleet-status', DASH)).j;
+  assert(fl2.bots.find(b => b.name === 'YM ORACLE II'), 'the poll itself counts as proof of life');
+  const round = (await A.post('/api/ping-fleet', {}, DASH)).j; assert(round.success && round.pingId);
+  const pollII = (await A.get('/api/bot-poll?name=YM%20ORACLE%20II')).j, pollIII = (await A.get('/api/bot-poll?name=YM%20ORACLE%20III')).j;
+  assert.strictEqual(pollII.pingId, round.pingId); assert.strictEqual(pollIII.pingId, round.pingId, 'every bot is told about the round');
+  assert.strictEqual((await A.post('/api/ping-result', { pingId: round.pingId, name: 'YM ORACLE II', ms: 640 })).s, 200);
+  assert.strictEqual((await A.get('/api/bot-poll?name=YM%20ORACLE%20II')).j.pingId, null, 'II answered: not asked again');
+  assert.strictEqual((await A.get('/api/bot-poll?name=YM%20ORACLE%20III')).j.pingId, round.pingId, 'III has not answered (its answer may have been lost): asked again');
+  const st = (await A.get('/api/ping-status/' + round.pingId, DASH)).j;
+  assert(st.success && st.results['YM ORACLE II'] && st.results['YM ORACLE II'].ms === 640 && !st.results['YM ORACLE III']);
+  ok('bot-poll: proof of life, every bot is told about a ping round until it answers, the dashboard sees the answers');
+
   s1.kill();
 
   // 10. the device key: with DEVICE_KEY_MODE=enforce a forged signal is refused
@@ -197,6 +213,8 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
     assert.strictEqual((await B.post(p, body)).s, 401, p + ' refuses without the key');
   assert.strictEqual((await B.get('/api/ping-check')).s, 401);
   assert.strictEqual((await B.get('/api/ping-check', { 'X-Device-Key': 'device-secret-1' })).s, 200);
+  assert.strictEqual((await B.get('/api/bot-poll?name=YM%20ORACLE%20I')).s, 401);
+  assert.strictEqual((await B.get('/api/bot-poll?name=YM%20ORACLE%20I', { 'X-Device-Key': 'device-secret-1' })).s, 200);
   assert.strictEqual((await B.get('/api/health')).s, 200);
   ok('device key (enforce mode): every bot-facing route refuses requests without it and nothing reaches Bybit; the health ping stays open');
   s2.kill();
