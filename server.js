@@ -566,6 +566,7 @@ async function processOrder(body) {
       body = { ...body, qty: String(sz.qty) };
     } else if (sz && sz.skipped) console.warn(`[master-sizing] plan size not possible (${sz.skipped}): using the manager's quantity. ${sz.detail}`);
   }
+  if (body.reduceOnly && multiuser.guardFitClose) body = await multiuser.guardFitClose(body);   // after a Profit Guard scale-out, a close is fitted to what is really left
   const response = await submitMasterOrder(body);
   const isOpen = !body.reduceOnly;
   const landed = TRADE_MODE === 'paper' || response.retCode === 0 || response.retCode === 110072;

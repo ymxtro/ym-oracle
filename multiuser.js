@@ -331,6 +331,7 @@ function init(deps) {
   const { app, restClient, getMode, breakerIsTripped, sendAlert, baseOpts } = deps;
   const PG = require('./profitguard.js');
   const SN = require('./sentinel.js');
+  const LQ = require('./livequality.js');
   let snCfg = SN.defaults();            // Trade Sentinel settings (off until switched on from the admin console)
   let pgCfg = PG.defaults();            // Profit Guard settings (off until switched on from the admin console)
   const pgWatch = new Map();            // re-entry watches (recording only); filled and used further down
@@ -1593,9 +1594,19 @@ function init(deps) {
         }
 
         // ---- profit lock ----
+        // ADAPT: the pair's own speed (1-minute ATR) and BTC's direction, from the candles the Sentinel already keeps. If they cannot be read, the plain rules apply.
+        let adaptNow = {};
+        if (pgCfg.smart.adapt && pgCfg.smart.adapt.on) {
+          try {
+            const bars = await snBars(symbol), btcRaw = await snBtcMove();
+            const risk0 = st.initialSl > 0 ? Math.abs(entry - st.initialSl) : 0, peakR0 = risk0 > 0 ? Math.max(0, (long ? st.peak - entry : entry - st.peak) / risk0) : 0;
+            adaptNow = PG.adaptOf(pgCfg, { atr: SN.atrOf(bars), btcPct: long ? btcRaw : -btcRaw, peakR: peakR0, maxPull: st.maxPull });
+            st.adapt = { atrPct: adaptNow.atrPrice ? Math.round(adaptNow.atrPrice / pgCfg.smart.adapt.atrMult / mark * 10000) / 100 : null, keepAdj: adaptNow.keepAdj || 0 };
+          } catch { adaptNow = {}; }
+        }
         const eff = em === 'shadow' && st.shadowSl > 0 ? (long ? Math.max(curSl, st.shadowSl) : (curSl > 0 ? Math.min(curSl, st.shadowSl) : st.shadowSl)) : curSl;
         const d = PG.decide({ side, entry, mark, peak: st.peak, curSl: eff, initialSl: st.initialSl, tick: inst && inst.tickSize || 0, profile: pf, cfg: pgCfg,
-          smart: { ...PG.noiseOf(pgCfg, st.maxPull), stallExtra: PG.stallExtra(pgCfg, st.profile, Date.now(), st.peakAt) } });
+          smart: { ...PG.noiseOf(pgCfg, st.maxPull), ...adaptNow, stallExtra: PG.stallExtra(pgCfg, st.profile, Date.now(), st.peakAt) } });
         st.lastWhy = d.action === 'raise' ? d.label : d.why; st.peakR = d.peakR !== undefined ? d.peakR : st.peakR;
         if (em === 'shadow' && st.shadowSl > 0 && !st.shadowHit && (long ? mark <= st.shadowSl : mark >= st.shadowSl)) {
           st.shadowHit = true;
@@ -1957,12 +1968,20 @@ function init(deps) {
   }
   async function runBackupIfDue(force) {
     await ready;
-    if (!tgOn || !TG_ADMIN_CHAT) return { sent: false, reason: 'Telegram is not configured' };
+    // The ledger holds every user's trades, so it goes to YOUR private chat only, never the public group. (Without the routing layer: the old single chat.)
+    let chat = TG_ADMIN_CHAT;
+    if (alertRouter) {
+      const cfg = alertRouter.state.cfg, env = alertRouter.envChats();
+      chat = cfg.dmChat || env.dmChat || '';
+      if (!chat) return { sent: false, reason: 'No private chat set: add ALERT_TELEGRAM_PRIVATE_CHAT_ID on Render (the ledger is never sent to the group)' };
+      if (!force && alertRouter.route.effectiveMode(cfg, Date.now()) === 'off') return { sent: false, reason: 'Telegram is switched off' };
+    }
+    if (!tgOn || !chat) return { sent: false, reason: 'Telegram is not configured' };
     const last = await q(`SELECT v FROM meta WHERE k='last_backup_ms'`);
     if (!force && last.rows[0] && Date.now() - Number(last.rows[0].v) < 23 * 3600 * 1000) return { sent: false, reason: 'not due yet' };
     const { csv, rows } = await buildCsv();
     if (!rows && !force) return { sent: false, reason: 'nothing to back up yet' };
-    const ok = await tgSendDoc(TG_ADMIN_CHAT, 'ym-ledger-' + new Date().toISOString().slice(0, 10) + '.csv', csv);
+    const ok = await tgSendDoc(chat, 'ym-ledger-' + new Date().toISOString().slice(0, 10) + '.csv', csv);
     if (ok) await q(`INSERT INTO meta(k,v) VALUES('last_backup_ms',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [String(Date.now())]);
     return { sent: ok, rows };
   }
@@ -2813,6 +2832,52 @@ function init(deps) {
   }));
 
   // Trade Sentinel: settings, what it is watching, its log and scorecard, the self-backfill from history, and the weight suggestion.
+
+  // ---- LIVE TRADES (final-18): every open position with a plain quality reading, for the admin "Live" tab. Read-only: it never touches an order or a stop. ----
+  let liveCache = { at: 0, v: null };
+  async function liveView() {
+    if (liveCache.v && Date.now() - liveCache.at < 4000) return liveCache.v;
+    await ready;
+    const mode = getMode();
+    const out = { mode, at: Date.now(), trades: [], note: '' };
+    if (mode !== 'live') { out.note = 'Paper mode: nothing is open on Bybit.'; liveCache = { at: Date.now(), v: out }; return out; }
+    let positions;
+    try { positions = await listOpenPositions(restClient); } catch (e) { out.note = 'Could not read positions from Bybit: ' + (e.message || e); return out; }
+    let btcRaw = 0; try { btcRaw = await snBtcMove(); } catch { /* the market part is then left out */ }
+    for (const p of positions) {
+      if (p.side !== 'Buy' && p.side !== 'Sell') continue;
+      const symbol = p.symbol, side = p.side, key = symbol + '|' + side, long = side === 'Buy';
+      const entry = parseFloat(p.avgPrice), mark = parseFloat(p.markPrice);
+      if (!(entry > 0) || !(mark > 0)) continue;
+      let sig = null;
+      try { sig = (await q(`SELECT bot, eng, sl, tp, opened_at FROM signals WHERE symbol=$1 AND side=$2 AND opened_at > now() - interval '30 days' ORDER BY opened_at DESC LIMIT 1`, [symbol, long ? 'BUY' : 'SELL'])).rows[0] || null; } catch { sig = null; }
+      const created = Number(p.createdTime) > 0 ? Number(p.createdTime) : (sig ? new Date(sig.opened_at).getTime() : Date.now());
+      let bars = null; try { bars = await snBars(symbol); } catch { bars = null; }
+      const gst = pgState.get(key), sst = snState.get(key);
+      let peak = (gst && gst.peak > 0) ? gst.peak : (sst && sst.peak > 0) ? sst.peak : entry;
+      if (bars) for (const b of bars) { if (b.t < created - 60000) continue; const ex = long ? b.h : b.l; if (long ? ex > peak : ex < peak) peak = ex; }
+      if (long ? mark > peak : mark < peak) peak = mark;
+      const initialSl = (gst && gst.initialSl > 0 ? gst.initialSl : 0) || (sst && sst.initialSl > 0 ? sst.initialSl : 0) || (sig && Number(sig.sl) > 0 ? Number(sig.sl) : 0);
+      const atr = bars ? SN.atrOf(bars) : 0;
+      let adv = NaN; if (bars && bars.length >= 4) { const last = bars[bars.length - 1], back = bars[bars.length - 4]; adv = long ? back.c - last.c : last.c - back.c; }
+      const as = LQ.assess({ side, entry, mark, curSl: parseFloat(p.stopLoss) || 0, tp: parseFloat(p.takeProfit) || (sig ? Number(sig.tp) : 0) || 0, initialSl, peak, atr, btcPct: bars ? (long ? btcRaw : -btcRaw) : NaN, recent: { adv } });
+      let trail = [];
+      if (as && as.risk > 0 && bars) trail = bars.filter(b => b.t >= created - 60000).map(b => Math.round((long ? b.c - entry : entry - b.c) / as.risk * 100) / 100).slice(-60);
+      const size = parseFloat(p.size) || 0, lev = parseFloat(p.leverage) || 1;
+      out.trades.push({ symbol, side, bot: sig ? sig.bot : '', engine: sig ? sig.eng : null, entry, mark, peak, stopLoss: parseFloat(p.stopLoss) || 0, takeProfit: parseFloat(p.takeProfit) || (sig ? Number(sig.tp) : 0) || 0,
+        initialSl, size, leverage: lev, upl: parseFloat(p.unrealisedPnl) || 0, margin: size * entry / lev, openedAt: created, atr,
+        quality: as, trail,
+        profitGuard: gst ? { mode: gst.em || null, why: gst.lastWhy || '', shadowSl: gst.shadowSl || 0 } : null,
+        sentinel: sst ? { mode: sst.em || null, state: sst.mem && sst.mem.state, score: sst.score === undefined ? null : sst.score } : null });
+    }
+    out.trades.sort((a, b) => ((a.quality && a.quality.score) ?? 999) - ((b.quality && b.quality.score) ?? 999));
+    const sc = out.trades.map(t => t.quality && t.quality.score).filter(x => x !== null && x !== undefined);
+    out.summary = { open: out.trades.length, upl: out.trades.reduce((t, x) => t + x.upl, 0), margin: out.trades.reduce((t, x) => t + x.margin, 0), avgScore: sc.length ? Math.round(sc.reduce((t, x) => t + x, 0) / sc.length) : null,
+      bands: out.trades.reduce((o, x) => { const b = x.quality ? x.quality.band : 'unknown'; o[b] = (o[b] || 0) + 1; return o; }, {}) };
+    liveCache = { at: Date.now(), v: out };
+    return out;
+  }
+  app.get('/api/admin/live-trades', adminAuth, h(async (req, res) => { res.json({ success: true, ...(await liveView()) }); }));
   app.get('/api/admin/sentinel', adminAuth, h(async (req, res) => { res.json({ success: true, ...(await snView()) }); }));
   app.post('/api/admin/sentinel', adminAuth, h(async (req, res) => {
     const b = req.body || {};

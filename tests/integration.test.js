@@ -581,7 +581,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
   assert(csv.status === 200 && /^username,kind,at,symbol/.test(csvText) && /alice,FUNDING/.test(csvText) && /,-30\.0*,|,-30,/.test(csvText.replace(/\.0+/g, '')) && !/'-30/.test(csvText));
   assert.strictEqual((await realFetch(base + '/api/admin/export.csv')).status, 401);
   ok('CSV export: trades + funding, negatives intact, admin only');
-  const bk = await T.runBackupIfDue(true); assert(bk.sent && tg.docs.length === 1 && tg.docs[0].chat === '9001' && /ym-ledger-\d{4}-\d\d-\d\d\.csv/.test(tg.docs[0].name) && /alice/.test(tg.docs[0].text));
+  const bk = await T.runBackupIfDue(true); assert(bk.sent && tg.docs.length === 1 && tg.docs[0].chat === '900' && /ym-ledger-\d{4}-\d\d-\d\d\.csv/.test(tg.docs[0].name) && /alice/.test(tg.docs[0].text));
   assert.strictEqual((await T.runBackupIfDue(false)).sent, false);
   ok('daily backup goes to the admin Telegram chat, and is not re-sent until due');
 
@@ -1482,6 +1482,25 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     assert(Math.abs(cf.swing.ladder[0][1] - 0.45) < 1e-9 && cf.smart.tune.lastAtN.swing === 35, JSON.stringify(cf.swing.ladder));
     assert.strictEqual((await db.query(`SELECT 1 FROM profit_guard_log WHERE event='tuned'`)).rowCount, 2);
     ok('profit guard smart: automatic tuning needs the confirm to switch on, acts at most once per 10 new live trades, and logs every change');
+    // ADAPT wiring: with candles available the loop reads the pair's own ATR and BTC's direction; with none it quietly uses the plain rules
+    await reset();
+    await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','swing',100,90) ON CONFLICT (k) DO NOTHING`);
+    assert.strictEqual((await POST({ mode: 'live' }, { confirm: 'LIVE' })).j.cfg.mode, 'live');
+    P(111, 90); await mu._test.pgTick(); assert.strictEqual(mu._test.pgState.get('BTCUSDT|Buy').adapt, undefined, 'no candles known: nothing adaptive is applied');
+    const t0 = Date.now() - 61 * 60000, bars = [];
+    for (let i = 0; i < 60; i++) bars.push([String(t0 + i * 60000), '104', '106', '102', '104', '10']);                 // every 1-minute bar is 4 wide
+    Stub.prototype.getKline = async () => ({ retCode: 0, result: { list: bars.slice().reverse() } });
+    try {
+      mu._test.pgState.clear(); P(111, 90); await mu._test.pgTick(); const ad = mu._test.pgState.get('BTCUSDT|Buy').adapt;
+      assert(ad && Math.abs(ad.atrPct - 4 / 111 * 100) < 0.05 && ad.keepAdj === 0, JSON.stringify(ad));
+    } finally { delete Stub.prototype.getKline; }
+    ok('profit guard adapt: the loop reads the pair\'s own ATR from the 1-minute candles, and falls back to the plain rules when there are none');
+    // LIVE TRADES: the admin visual reads every open position and gives it a quality reading
+    assert.strictEqual((await call('/api/admin/live-trades', 'GET')).s, 401);
+    P(125, 112); const lv = (await call('/api/admin/live-trades', 'GET', null, admin)).j;
+    assert(lv.success && lv.trades.length === 1 && lv.summary.open === 1, JSON.stringify(lv));
+    const lt = lv.trades[0]; assert(lt.symbol === 'BTCUSDT' && lt.quality && lt.quality.score > 60 && lt.quality.stopR > 1 && lt.initialSl === 90 && lt.trail !== undefined, JSON.stringify(lt));
+    ok('live trades: the admin endpoint lists each open position with entry, stop, best price, a 0-100 quality reading and its parts (admin only)');
     await reset();
     await POST({ mode: 'off', smart: { tune: { mode: 'suggest' } }, swing: { mode: 'inherit' }, fast: { mode: 'inherit' } });
   }

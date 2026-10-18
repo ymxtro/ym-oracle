@@ -33,6 +33,12 @@ const DEFAULT_SMART = {
   noise: { on: true, mult: 1.0, capR: 1.5 },                                   // breathing room: gap >= mult x the trade's largest pullback, never more than capR x R
   stall: { on: true, fastMin: 30, swingMin: 360, stepPts: 0.10, maxPts: 0.20 }, // every stalled period adds stepPts to the keep share, up to maxPts
   tune:  { mode: 'suggest', minTrades: 20, every: 10, step: 0.05, lastAtN: { fast: 0, swing: 0 } },   // off | suggest | auto
+  // final-18 ADAPT: reads the pair's own speed and the market around the trade (needs the 1-minute candles; with none, nothing here applies).
+  //   a. Volatility gap: the stop never goes closer to the price than atrMult x this pair's 1-minute ATR (capped at capR x R). A fast coin gets room at once, before it
+  //      has shown a pullback of its own; a flat coin keeps the plain minimum gap.
+  //   b. Market keep: the share of the best profit kept moves by at most +/- pts: UP while BTC is moving against the trade, DOWN (let it run) while the trade is trending
+  //      cleanly (deep in profit, pullbacks smaller than the pair's ATR). Same shift for every rung, so a higher rung never keeps less than a lower one.
+  adapt: { on: true, atrMult: 0.8, capR: 1.5, mkt: { on: true, pts: 0.08 } },
 };
 const copySmart = d => JSON.parse(JSON.stringify(d));
 
@@ -82,6 +88,12 @@ function normReentry(raw, d) {
     targetR: num(r.targetR, 0.5, 10, d.targetR), hoursFast: num(r.hoursFast, 1, 72, d.hoursFast), hoursSwing: num(r.hoursSwing, 1, 240, d.hoursSwing) };
 }
 
+function normAdapt(raw, d) {
+  const a = (raw && typeof raw === 'object') ? raw : {}, m = (a.mkt && typeof a.mkt === 'object') ? a.mkt : {};
+  return { on: a.on === undefined ? d.on : a.on === true, atrMult: num(a.atrMult, 0, 3, d.atrMult), capR: num(a.capR, 0.2, 5, d.capR),
+           mkt: { on: m.on === undefined ? d.mkt.on : m.on === true, pts: num(m.pts, 0, 0.2, d.mkt.pts) } };
+}
+
 function normSmart(raw, d) {
   const r = (raw && typeof raw === 'object') ? raw : {}, n = (r.noise && typeof r.noise === 'object') ? r.noise : {}, st = (r.stall && typeof r.stall === 'object') ? r.stall : {}, t = (r.tune && typeof r.tune === 'object') ? r.tune : {};
   const la = (t.lastAtN && typeof t.lastAtN === 'object') ? t.lastAtN : {};
@@ -89,6 +101,7 @@ function normSmart(raw, d) {
     noise: { on: n.on === undefined ? d.noise.on : n.on === true, mult: num(n.mult, 0, 3, d.noise.mult), capR: num(n.capR, 0.2, 5, d.noise.capR) },
     stall: { on: st.on === undefined ? d.stall.on : st.on === true, fastMin: num(st.fastMin, 5, 720, d.stall.fastMin), swingMin: num(st.swingMin, 30, 4320, d.stall.swingMin),
              stepPts: num(st.stepPts, 0.02, 0.3, d.stall.stepPts), maxPts: num(st.maxPts, 0.02, 0.5, d.stall.maxPts) },
+    adapt: normAdapt(r.adapt, d.adapt),
     tune: { mode: ['off', 'suggest', 'auto'].includes(t.mode) ? t.mode : d.tune.mode, minTrades: Math.round(num(t.minTrades, 5, 500, d.tune.minTrades)), every: Math.round(num(t.every, 3, 200, d.tune.every)),
             step: num(t.step, 0.01, 0.1, d.tune.step), lastAtN: { fast: Math.round(num(la.fast, 0, 1e6, 0)), swing: Math.round(num(la.swing, 0, 1e6, 0)) } },
   };
@@ -144,21 +157,24 @@ function decide(i) {
   const pf = i.profile;
   if (peakR < pf.beR) return { action: 'none', why: 'peak ' + peakR.toFixed(2) + 'R is below the ' + pf.beR + 'R start', peakR };
   let target = long ? entry * (1 + cfg.beOffsetPct / 100) : entry * (1 - cfg.beOffsetPct / 100), label = 'breakeven', keepFrac = 0;
-  for (const [thr, frac] of pf.ladder) {
-    if (peakR < thr) continue;
-    const cand = long ? entry + frac * peakDist : entry - frac * peakDist;
-    if (long ? cand > target : cand < target) { target = cand; label = 'keep ' + Math.round(frac * 100) + '% of the peak'; keepFrac = frac; }
-  }
   const sm = i.smart || {};
+  const adj = Number.isFinite(Number(sm.keepAdj)) ? Math.max(-0.2, Math.min(0.2, Number(sm.keepAdj))) : 0;   // market-aware shift of the keep share (see ADAPT)
+  for (const [thr, base] of pf.ladder) {
+    if (peakR < thr) continue;
+    const frac = adj ? Math.max(0.1, Math.min(0.9, base + adj)) : base;
+    const cand = long ? entry + frac * peakDist : entry - frac * peakDist;
+    if (long ? cand > target : cand < target) { target = cand; label = 'keep ' + Math.round(frac * 100) + '% of the peak' + (adj ? ' (' + (adj > 0 ? '+' : '') + Math.round(adj * 100) + ' pts: market)' : ''); keepFrac = frac; }
+  }
   const noiseGap = Number(sm.noisePrice) > 0 ? Math.min(Number(sm.noisePrice), (Number(sm.noiseCapR) > 0 ? Number(sm.noiseCapR) : 1.5) * risk) : 0;   // breathing room from this trade's own wobble
   const stallExtra = Number(sm.stallExtra) > 0 ? Math.min(0.5, Number(sm.stallExtra)) : 0;
   if (stallExtra > 0) {                       // stalled: no new best for a while, so keep a bit more of what was made
     const f = Math.min(0.9, keepFrac + stallExtra), cand = long ? entry + f * peakDist : entry - f * peakDist;
     if (long ? cand > target : cand < target) { target = cand; label = keepFrac > 0 ? label + ' +' + Math.round(stallExtra * 100) + ' pts (stalled)' : 'keep ' + Math.round(f * 100) + '% of the peak (stalled)'; keepFrac = f; }
   }
-  const gapDist = Math.max(mark * cfg.minGapPct / 100, noiseGap);
+  const atrGap = Number(sm.atrPrice) > 0 ? Math.min(Number(sm.atrPrice), (Number(sm.atrCapR) > 0 ? Number(sm.atrCapR) : 1.5) * risk) : 0;   // breathing room from this pair's own speed
+  const gapDist = Math.max(mark * cfg.minGapPct / 100, noiseGap, atrGap);
   const limit = long ? mark - gapDist : mark + gapDist;          // never closer to the price than this
-  if (long ? target > limit : target < limit) { target = limit; label += noiseGap > mark * cfg.minGapPct / 100 ? ' (held back: breathing room)' : ' (held back from the price)'; }
+  if (long ? target > limit : target < limit) { target = limit; label += Math.max(noiseGap, atrGap) > mark * cfg.minGapPct / 100 ? (atrGap > noiseGap ? ' (held back: pair volatility)' : ' (held back: breathing room)') : ' (held back from the price)'; }
   target = roundTo(target, tick);
   if (tick > 0) { if (long && target > limit) target -= tick; if (!long && target < limit) target += tick; }
   target = fixTick(target, tick);
@@ -191,6 +207,22 @@ function updatePull(prev, side, peak, mark) {
   return pull > p ? pull : p;
 }
 const noiseOf = (cfg, maxPull) => (cfg.smart.noise.on && maxPull > 0 ? { noisePrice: cfg.smart.noise.mult * maxPull, noiseCapR: cfg.smart.noise.capR } : {});
+// ADAPT: what the pair's own speed and the market around the trade say. in: { atr (1-minute ATR, price units), btcPct (BTC's % move over ~15 min in the TRADE's direction, + = with it),
+// peakR, maxPull (price units) }. Returns the extra inputs for decide(); {} when the feature is off or there is nothing to read.
+function adaptOf(cfg, x) {
+  const a = cfg.smart.adapt;
+  if (!a || !a.on || !x) return {};
+  const out = {};
+  const atr = Number(x.atr);
+  if (atr > 0 && a.atrMult > 0) { out.atrPrice = a.atrMult * atr; out.atrCapR = a.capR; }
+  if (a.mkt.on && a.mkt.pts > 0) {
+    const btc = Number(x.btcPct);
+    const against = Number.isFinite(btc) ? Math.min(1, Math.max(0, -btc / 0.6)) : 0;                       // same scale the Sentinel uses: -0.6% in 15 min = fully against
+    const clean = atr > 0 && Number(x.peakR) >= 2 && Number(x.maxPull) >= 0 && Number(x.maxPull) < atr ? 1 : 0;   // deep in profit and every pullback so far smaller than one ATR
+    out.keepAdj = Math.round(a.mkt.pts * (against - clean) * 1000) / 1000;
+  }
+  return out;
+}
 // Extra share of the best profit to keep because the trade has made no new best for a while. 0 when it is still pushing or the feature is off.
 function stallExtra(cfg, profile, nowMs, peakAt) {
   const st = cfg.smart.stall;
@@ -272,4 +304,4 @@ function reentryStep(w, mark, nowMs, rc) {
   return { events: ev, finished: false };
 }
 
-module.exports = { updatePull, noiseOf, stallExtra, suggestTuning, DEFAULT_SMART, PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };
+module.exports = { adaptOf, updatePull, noiseOf, stallExtra, suggestTuning, DEFAULT_SMART, PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };

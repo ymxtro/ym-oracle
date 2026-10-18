@@ -49,6 +49,35 @@
   .box.plain{background:var(--inset);color:var(--mist);border-color:var(--line)}
   code{background:var(--bg);padding:2px 6px;border-radius:6px;font-size:12px;user-select:all;word-break:break-all}
 
+
+  /* live trades */
+  .lt-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
+  .lt{background:var(--panel);border-radius:14px;padding:14px 14px 12px;min-width:0;display:grid;gap:10px;border:1px solid transparent}
+  .lt.b-strong{border-color:rgba(34,197,94,.28)}.lt.b-fragile{border-color:rgba(242,177,52,.32)}.lt.b-risk{border-color:rgba(239,68,68,.4)}
+  .lt-h{display:flex;align-items:center;gap:12px}.lt-h .t{min-width:0;flex:1}.lt-h .t b{font-size:15px}
+  .ring{width:54px;height:54px;flex:none;position:relative}.ring svg{width:54px;height:54px;transform:rotate(-90deg)}
+  .ring .bg{fill:none;stroke:var(--line);stroke-width:5}.ring .fg{fill:none;stroke-width:5;stroke-linecap:round;transition:stroke-dasharray .4s}
+  .ring b{position:absolute;inset:0;display:grid;place-items:center;font-size:15px;font-variant-numeric:tabular-nums}
+  .bnd-strong{color:var(--long)}.bnd-steady{color:#60a5fa}.bnd-fragile{color:var(--pending)}.bnd-risk{color:var(--short)}.bnd-unknown{color:var(--mist)}
+  .fg-strong{stroke:var(--long)}.fg-steady{stroke:#60a5fa}.fg-fragile{stroke:var(--pending)}.fg-risk{stroke:var(--short)}.fg-unknown{stroke:var(--mist)}
+  .lad{position:relative;height:30px;margin:2px 4px 0}
+  .lad .trk{position:absolute;left:0;right:0;top:12px;height:6px;border-radius:999px;background:var(--inset);overflow:hidden}
+  .lad .zr{position:absolute;top:0;bottom:0;background:rgba(239,68,68,.35)}.lad .zg{position:absolute;top:0;bottom:0;background:rgba(34,197,94,.3)}.lad .zl{position:absolute;top:0;bottom:0;background:rgba(242,177,52,.45)}
+  .lad .mk{position:absolute;top:6px;width:2px;height:18px;margin-left:-1px;border-radius:2px;background:var(--mist)}
+  .lad .mk.sl{background:var(--short)}.lad .mk.st{background:var(--pending)}.lad .mk.en{background:var(--paper)}.lad .mk.tp{background:var(--long)}.lad .mk.pk{background:var(--mist);opacity:.55;height:10px;top:10px}
+  .lad .nw{position:absolute;top:8px;width:14px;height:14px;margin-left:-7px;border-radius:50%;border:3px solid var(--panel);background:var(--mist)}
+  .lad .nw.up{background:var(--long)}.lad .nw.dn{background:var(--short)}
+  .lt-v{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;font-size:11px}.lt-v div{background:var(--inset);border-radius:9px;padding:6px 8px;min-width:0}.lt-v span{display:block;color:var(--mist);font-size:10px}.lt-v b{font-weight:500;font-size:12px;font-variant-numeric:tabular-nums}
+  .pt{display:grid;grid-template-columns:72px minmax(0,1fr) 28px;align-items:center;gap:8px;font-size:11px;color:var(--mist)}
+  .pt i{display:block;height:6px;border-radius:999px;background:var(--inset);overflow:hidden}.pt i u{display:block;height:100%;border-radius:999px;text-decoration:none}
+  .pt em{font-style:normal;text-align:right;color:var(--paper);font-variant-numeric:tabular-nums}
+  .lt-f{display:flex;gap:6px;flex-wrap:wrap}.lt-tr{display:block;width:100%;height:34px}.lt-tr .ln{fill:none;stroke:var(--mist);stroke-width:1.6;vector-effect:non-scaling-stroke}.lt-tr .g{stroke:var(--line);stroke-dasharray:3 4;vector-effect:non-scaling-stroke}
+  .bandbar{display:flex;height:8px;border-radius:999px;overflow:hidden;background:var(--inset);gap:2px}.bandbar i{display:block;height:100%}
+  .sumrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+  .g2g{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:12px;align-items:start}
+  .pagehd{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 12px}.pagehd p{color:var(--mist);font-size:12px;max-width:62ch}
+  .sec2{margin:22px 0 10px;display:flex;align-items:center;gap:10px}.sec2 h3{margin:0;font-size:13px;font-weight:600}.sec2 .mist{font-size:11px}
+
   /* login */
   #login{max-width:340px;margin:60px auto}
   #login input{margin-top:10px}
@@ -161,7 +190,9 @@
   <nav id="nav" role="tablist" aria-label="Sections"><div class="navhead"><span class="logo">YM</span><div><b>YM Oracle</b><div class="mist small">Admin console</div></div></div>
     <div class="navlbl">Run</div>
     <button role="tab" data-tab="overview" aria-selected="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10v9.5h13V10"/></svg><span>Overview</span><span class="badge" id="attBadge" hidden></span></button>
+    <button role="tab" data-tab="live" aria-selected="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8M8.5 8.5a5 5 0 0 0 0 7M15.5 8.5a5 5 0 0 1 0 7"/></svg><span>Live trades</span></button>
     <button role="tab" data-tab="trading" aria-selected="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17 9 11l4 4 8-9"/><path d="M15 6h6v6"/></svg><span>Trading</span></button>
+    <button role="tab" data-tab="guards" aria-selected="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5.5c0 4.2 2.8 7.5 7 9.5 4.2-2 7-5.3 7-9.5V6z"/><path d="m9 12 2.2 2.2L15.5 10"/></svg><span>Guards</span></button>
     <button role="tab" data-tab="bots" aria-selected="false"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="8" width="14" height="10" rx="2.5"/><path d="M12 8V5"/><circle cx="12" cy="4" r="1"/><circle cx="9.5" cy="13" r=".6"/><circle cx="14.5" cy="13" r=".6"/></svg><span>Bots &amp; alerts</span></button>
     <div class="navlbl">Manage</div>
     <button role="tab" data-tab="users" aria-selected="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8.5" r="3.2"/><path d="M3 19c.6-3.3 3-5 6-5s5.4 1.7 6 5"/><path d="M16 5.5a3 3 0 0 1 0 6"/><path d="M18 14.2c1.8.5 2.8 2 3 4.3"/></svg><span>Users</span></button>
@@ -224,8 +255,8 @@ function j(path,method,body){return api(path,method,body).then(function(r){retur
 function jq(path){return j(path).catch(function(){return null})}   // a card that cannot load simply stays hidden
 
 /* ---------- state ---------- */
-var TABS=['overview','trading','bots','users','plan','activity','payments','settings'];
-var TITLES={overview:'Overview',trading:'Trading',bots:'Bots & alerts',users:'Users',plan:'Plan & risk',activity:'Activity',payments:'Payments',settings:'Settings'};
+var TABS=['overview','live','trading','guards','bots','users','plan','activity','payments','settings'];
+var TITLES={overview:'Overview',live:'Live trades',trading:'Trading',guards:'Guards',bots:'Bots & alerts',users:'Users',plan:'Plan & risk',activity:'Activity',payments:'Payments',settings:'Settings'};
 var S={pg:null,pgPending:null,ar:null,arHours:4,tab:'overview',tr:null,ping:null,mk:{info:null,open:false,env:'live',key:'',sec:'',msg:null,busy:false,confirm:false,arm:false},liveAsk:false,liveTxt:'',users:[],pausedAll:false,dryAll:false,planVersion:null,plan:null,ov:null,period:30,series:null,bots:null,signals:null,sec:null,
   filter:'all',q:'',ofilter:'all',ouser:'',orders:null,audit:null,openId:null,planDraft:null,planPreview:null,planCounts:null,hist:null,drySummary:null,hash:'',timer:null,drawerMsg:''};
 var HOLD={};
@@ -245,7 +276,7 @@ function start(){
   var h=(location.hash||'').replace('#','');if(TABS.indexOf(h)>-1)S.tab=h;
   refreshAll();
   if(S.timer)clearInterval(S.timer);
-  S.tick=0;S.timer=setInterval(function(){if(document.hidden||S.planEditing)return;S.tick++;if(S.tab==='trading'||S.tick%2===0)refreshAll(true)},10000);
+  S.tick=0;S.timer=setInterval(function(){if(document.hidden||S.planEditing)return;S.tick++;if(S.tab==='trading'||S.tab==='live'||S.tick%2===0)refreshAll(true)},10000);
 }
 
 /* ---------- loading ---------- */
@@ -284,9 +315,12 @@ function loadTab(){
     jobs.push(jq('/api/admin/plan').then(function(r){if(r&&r.success){S.planCounts=r;if(!S.planDraft)S.planDraft=draftFrom(r.plan)}}));
     jobs.push(jq('/api/admin/plan/history?limit=12').then(function(r){S.hist=r&&r.success?r:null}));
     jobs.push(jq('/api/admin/orders/summary?hours=24').then(function(r){S.drySummary=r&&r.success?r.users:null}));
+  }
+  if(t==='guards'){
     jobs.push(jq('/api/admin/profit-guard').then(function(r){S.pg=r&&r.success?r:S.pg}));
     jobs.push(jq('/api/admin/sentinel').then(function(r){S.sn=r&&r.success?r:S.sn}));
   }
+  if(t==='live'||t==='overview')jobs.push(jq('/api/admin/live-trades').then(function(r){S.live=r&&r.success?r:S.live}));
   if(t==='activity'){
     jobs.push(loadOrders());
     jobs.push(jq('/api/admin/signal-ledger?hours=48&limit=25').then(function(r){S.ledger=r&&r.success?r:null}));
@@ -393,6 +427,12 @@ function viewOverview(){
     }).join(''):'<p class="mist" style="padding:10px 0">No signals in the last 24 hours.</p>')+'</div>';
   }
   h+='</div><div class="stack">';
+  /* open trades at a glance */
+  if(S.live&&S.live.trades&&S.live.trades.length){var LV=S.live,sm2=LV.summary||{};
+    h+='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0">Open trades <span class="chip">'+LV.trades.length+'</span></h2><button class="btn" data-tab="live">See all</button></div>'
+      +'<div class="hint2" style="margin:4px 0 6px">Average quality '+(sm2.avgScore==null?'–':sm2.avgScore)+' · <span class="'+cls(sm2.upl)+' num">'+pnlTxt(sm2.upl)+'</span> unrealised · weakest first</div>'
+      +LV.trades.slice(0,4).map(function(t){var q=t.quality||{band:'unknown'},bk=q.band==='at risk'?'risk':q.band;return '<div class="line"><span style="display:flex;align-items:center;gap:10px;min-width:0"><span class="bnd-'+bk+'" style="font-weight:600;min-width:26px;font-variant-numeric:tabular-nums">'+(q.score==null?'–':q.score)+'</span><span style="min-width:0"><b>'+esc(coinOf(t.symbol))+'</b> <span class="'+(t.side==='Buy'?'long':'short')+'">'+(t.side==='Buy'?'LONG':'SHORT')+'</span><div class="hint2">'+esc(q.band)+(q.nowR==null?'':' · '+(q.nowR>=0?'+':'')+q.nowR.toFixed(2)+'R')+'</div></span></span><span class="num '+cls(t.upl)+'">'+pnlTxt(t.upl)+'</span></div>'}).join('')+'</div>';
+  }
   /* needs attention */
   h+='<div class="card"><h2 style="margin:0 0 4px">Needs attention</h2>';
   if(o&&o.attention.length){
@@ -536,7 +576,6 @@ function viewPlan(){
   h+='</div><div class="stack sticky"><div class="card" id="review">'+reviewHtml()+'</div>';
   h+='<div class="card" id="planPreviewCard">'+previewHtml(d)+'</div>';
   h+='<div class="card"><h2 style="margin:0 0 8px">Dry run</h2><div class="line" style="padding-top:0"><span>'+(S.dryAll?'<b class="warn">On for everyone.</b> No orders are being sent.':'Off for everyone.')+'</span><label class="sw"><input type="checkbox" data-dryplan '+(S.dryAll?'checked':'')+' aria-label="Dry run for everyone"><i></i></label></div>'+dryTable()+'</div>';
-  h+=guardCard();h+=sentinelCard();
   h+='<div class="card"><h2 style="margin:0 0 8px">Version history</h2>'+histHtml()+'</div></div></div>';
   return h;
 }
@@ -688,7 +727,7 @@ function pgSettingsBody(){
     for(var i=0;i<3;i++){var r=g('pg-'+p+'-r'+i),k=g('pg-'+p+'-k'+i);if(r>0&&k>0)pr.ladder.push([r,k/100])}
     for(var n=0;n<2;n++){var sr=g('pg-'+p+'-sr'+n),sk=g('pg-'+p+'-sk'+n);if(sr>0&&sk>0)pr.scale.steps.push([sr,sk/100])}
     o[p]=pr});
-  var tmE=$('#pg-tune');o.smart={noise:{on:c('pg-sn-on'),mult:g('pg-sn-mult')},stall:{on:c('pg-ss-on'),fastMin:g('pg-ss-fast'),swingMin:g('pg-ss-swing')},tune:{mode:tmE?tmE.value:'suggest'}};
+  var tmE=$('#pg-tune');o.smart={noise:{on:c('pg-sn-on'),mult:g('pg-sn-mult')},stall:{on:c('pg-ss-on'),fastMin:g('pg-ss-fast'),swingMin:g('pg-ss-swing')},adapt:{on:c('pg-ad-on'),atrMult:g('pg-ad-mult'),mkt:{on:c('pg-am-on'),pts:g('pg-am-pts')/100}},tune:{mode:tmE?tmE.value:'suggest'}};
   o.reentry={on:c('pg-re-on'),minPullR:g('pg-re-pull'),resumePct:g('pg-re-res'),targetR:g('pg-re-tgt')};
   return o;
 }
@@ -764,9 +803,12 @@ function guardCard(){
   var re=C.reentry;
   h+='<h3 style="margin:16px 0 4px;font-size:13px">Re-entry recorder <span class="chip">records only</span></h3><label class="small" style="display:block"><input type="checkbox" id="pg-re-on"'+(re.on?' checked':'')+'> After a winner closes, note when a pullback-and-resume entry would have appeared and how it ended. It never places a trade.</label><div class="fgrid"><div><label class="l" for="pg-re-pull">Pullback needed (R)</label><input type="number" step="0.1" id="pg-re-pull" value="'+esc(re.minPullR)+'"></div><div><label class="l" for="pg-re-res">Resume signal (% of the pullback regained)</label><input type="number" step="5" id="pg-re-res" value="'+esc(re.resumePct)+'"></div><div><label class="l" for="pg-re-tgt">Counts as a win at (R)</label><input type="number" step="0.5" id="pg-re-tgt" value="'+esc(re.targetR)+'"></div></div>';
   var SM=C.smart||{noise:{},stall:{},tune:{}},TU=P.tuning||{};
-  h+='<h3 style="margin:16px 0 4px;font-size:13px">Smart mode <span class="chip">learns from each trade</span></h3><p class="mist small" style="margin:0 0 6px">Three helpers that sit on top of the rules above. Switch any off and the plain rules apply. They only ever make a stop <b>tighter</b> or <b>later</b>, never looser.</p>';
+  h+='<h3 style="margin:16px 0 4px;font-size:13px">Smart mode <span class="chip">learns from each trade</span></h3><p class="mist small" style="margin:0 0 6px">Helpers that sit on top of the rules above. Switch any off and the plain rules apply. They only ever make a stop <b>tighter</b> or <b>later</b>, never looser.</p>';
   h+='<label class="small" style="display:block"><input type="checkbox" id="pg-sn-on"'+(SM.noise.on?' checked':'')+'> <b>Breathing room.</b> Do not raise a stop closer to the price than the largest pullback that trade has already shown (capped at '+esc(SM.noise.capR)+'R).</label><div class="fgrid"><div><label class="l" for="pg-sn-mult">Times that pullback</label><input type="number" step="0.1" id="pg-sn-mult" value="'+esc(SM.noise.mult)+'"></div></div>';
   h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-ss-on"'+(SM.stall.on?' checked':'')+'> <b>Stall tightening.</b> A trade in profit that has made no new best for a while keeps a few more points of its profit (+'+Math.round((SM.stall.stepPts||0)*100)+' per quiet period, up to +'+Math.round((SM.stall.maxPts||0)*100)+').</label><div class="fgrid"><div><label class="l" for="pg-ss-fast">Quiet period, fast (minutes)</label><input type="number" step="5" id="pg-ss-fast" value="'+esc(SM.stall.fastMin)+'"></div><div><label class="l" for="pg-ss-swing">Quiet period, swing (minutes)</label><input type="number" step="30" id="pg-ss-swing" value="'+esc(SM.stall.swingMin)+'"></div></div>';
+  var AD=SM.adapt||{on:true,atrMult:0.8,mkt:{on:true,pts:0.08}};
+  h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-ad-on"'+(AD.on?' checked':'')+'> <b>Pair speed.</b> Do not raise a stop closer to the price than a share of that pair\'s own 1-minute ATR, so a fast coin gets room before it has shown a pullback.</label><div class="fgrid"><div><label class="l" for="pg-ad-mult">Share of ATR</label><input type="number" step="0.1" id="pg-ad-mult" value="'+esc(AD.atrMult)+'"></div></div>';
+  h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-am-on"'+((AD.mkt||{}).on?' checked':'')+'> <b>Market awareness.</b> Keep a few more points of the profit while BTC moves against the trade, and a few less while the trade is trending cleanly.</label><div class="fgrid"><div><label class="l" for="pg-am-pts">Most it may shift (points)</label><input type="number" step="1" id="pg-am-pts" value="'+esc(Math.round(((AD.mkt||{}).pts||0)*100))+'"></div></div>';
   h+='<div class="fgrid" style="margin-top:8px"><div><label class="l" for="pg-tune"><b>Self-tuning</b> of the keep %</label><select id="pg-tune">'+[['off','Off'],['suggest','Suggest only'],['auto','Apply automatically']].map(function(m){return '<option value="'+m[0]+'"'+(SM.tune.mode===m[0]?' selected':'')+'>'+m[1]+'</option>'}).join('')+'</select></div></div><p class="mist small" style="margin:4px 0">It reads the scorecard of trades that ran <b>Live</b> (at least '+esc(SM.tune.minTrades)+' that reached the first step) and nudges the keep % by '+Math.round((SM.tune.step||0)*100)+' points at most, between 15% and 85%. Automatic changes happen at most once per '+esc(SM.tune.every)+' new trades and ask you to confirm when you switch them on.</p>';
   ['fast','swing'].forEach(function(pr){var t=TU[pr];if(!t)return;
     h+='<div class="line"><span style="min-width:0"><b>'+(pr==='fast'?'Fast':'Swing')+'</b> <span class="mist">· '+(t.n||0)+' live trade(s) counted'+(t.share===null||t.share===undefined?'':' · gave back '+Math.round(t.share*100)+'% of best profit on average')+'</span><br><span class="hint2">'+esc((t.reasons||[]).join(' '))+'</span>'+((t.changes||[]).length?'<br><span class="hint2"><b>Suggestion:</b> '+t.changes.map(function(c){return 'step at '+esc(c.atR)+'R keep '+Math.round(c.from*100)+'% → '+Math.round(c.to*100)+'%'}).join('; ')+'</span>':'')+'</span>'+((t.changes||[]).length?'<button class="btn" data-act="pgApply" data-p="'+pr+'">Apply</button>':'')+'</div>'});
@@ -879,10 +921,87 @@ function mkReset(){
   j('/api/master-key/reset','POST').then(function(r){M.msg=r.success?{ok:true,text:'Back on the Render settings ('+r.hint+').'}:{ok:false,text:r.message||'Could not reset.'};loadTab()});
 }
 
+
+/* ---------- live trades ---------- */
+function fmtP(v){v=Number(v);if(!(v>0))return '–';return String(parseFloat(v.toPrecision(6)))}
+function ringHtml(q){var s=q&&q.score!=null?q.score:null,b=q?q.band:'unknown',c=2*Math.PI*21,k=b==='at risk'?'risk':b;
+  return '<div class="ring" title="Quality '+(s==null?'unknown':s+' of 100 · '+esc(b))+'"><svg viewBox="0 0 54 54"><circle class="bg" cx="27" cy="27" r="21"/><circle class="fg fg-'+k+'" cx="27" cy="27" r="21" stroke-dasharray="'+((s==null?0:s)/100*c).toFixed(1)+' '+c.toFixed(1)+'"/></svg><b class="bnd-'+k+'">'+(s==null?'–':s)+'</b></div>'}
+function ladderHtml(t){
+  var q=t.quality||{},L=t.side==='Buy',vals=[t.entry,t.mark,t.peak,t.stopLoss,t.takeProfit,t.initialSl].filter(function(v){return v>0}),lo=Math.min.apply(null,vals),hi=Math.max.apply(null,vals),span=(hi-lo)||1;
+  lo-=span*0.06;hi+=span*0.06;span=hi-lo;var X=function(v){return Math.max(0,Math.min(100,(v-lo)/span*100)).toFixed(2)+'%'},xn=function(v){return Math.max(0,Math.min(100,(v-lo)/span*100))};
+  var z='',sl=t.initialSl>0?t.initialSl:0,e=xn(t.entry);
+  if(sl>0){var a=Math.min(xn(sl),e),w=Math.abs(e-xn(sl));z+='<span class="zr" style="left:'+a.toFixed(2)+'%;width:'+w.toFixed(2)+'%"></span>'}
+  if(t.takeProfit>0){var a2=Math.min(e,xn(t.takeProfit)),w2=Math.abs(xn(t.takeProfit)-e);z+='<span class="zg" style="left:'+a2.toFixed(2)+'%;width:'+w2.toFixed(2)+'%"></span>'}
+  if(q.stopR!=null&&q.stopR>0.02&&t.stopLoss>0){var a3=Math.min(e,xn(t.stopLoss)),w3=Math.abs(xn(t.stopLoss)-e);z+='<span class="zl" style="left:'+a3.toFixed(2)+'%;width:'+w3.toFixed(2)+'%"></span>'}
+  var up=(L?t.mark>=t.entry:t.mark<=t.entry);
+  var m='';
+  if(sl>0)m+='<span class="mk sl" style="left:'+X(sl)+'" title="Original stop '+fmtP(sl)+'"></span>';
+  if(t.stopLoss>0&&Math.abs(t.stopLoss-sl)>1e-12)m+='<span class="mk st" style="left:'+X(t.stopLoss)+'" title="Stop now '+fmtP(t.stopLoss)+'"></span>';
+  m+='<span class="mk en" style="left:'+X(t.entry)+'" title="Entry '+fmtP(t.entry)+'"></span>';
+  if(t.peak>0&&t.peak!==t.entry)m+='<span class="mk pk" style="left:'+X(t.peak)+'" title="Best price '+fmtP(t.peak)+'"></span>';
+  if(t.takeProfit>0)m+='<span class="mk tp" style="left:'+X(t.takeProfit)+'" title="Target '+fmtP(t.takeProfit)+'"></span>';
+  m+='<span class="nw '+(up?'up':'dn')+'" style="left:'+X(t.mark)+'" title="Price now '+fmtP(t.mark)+'"></span>';
+  return '<div class="lad" role="img" aria-label="Where price is between the stop, entry and target"><div class="trk">'+z+'</div>'+m+'</div>';
+}
+function trailHtml(tr){
+  if(!tr||tr.length<3)return '';var mn=Math.min.apply(null,tr.concat([0])),mx=Math.max.apply(null,tr.concat([0])),r=(mx-mn)||1,w=300,h=34,pd=3;
+  var pts=tr.map(function(v,i){return (pd+i*(w-pd*2)/(tr.length-1)).toFixed(1)+','+(h-pd-(v-mn)/r*(h-pd*2)).toFixed(1)}).join(' ');
+  var y0=(h-pd-(0-mn)/r*(h-pd*2)).toFixed(1);
+  return '<svg class="lt-tr" viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none" role="img" aria-label="Result in R over the last hour"><line class="g" x1="0" x2="'+w+'" y1="'+y0+'" y2="'+y0+'"/><polyline class="ln" points="'+pts+'"/></svg>';
+}
+var PARTS=[['progress','Progress'],['protection','Protection'],['momentum','Momentum'],['market','Market']];
+function partRow(q,k,label){var v=q.parts&&q.parts[k],col=v==null?'var(--mist)':v>=70?'var(--long)':v>=50?'#60a5fa':v>=30?'var(--pending)':'var(--short)';
+  return '<div class="pt"><span>'+label+'</span><i><u style="width:'+(v==null?0:v)+'%;background:'+col+'"></u></i><em>'+(v==null?'–':v)+'</em></div>'}
+function tradeCard(t){
+  var q=t.quality||{band:'unknown',parts:{},flags:[]},L=t.side==='Buy',bk=q.band==='at risk'?'risk':q.band,age=t.openedAt?ago(t.openedAt).replace(' ago',''):'';
+  var pct=t.margin>0?t.upl/t.margin*100:0;
+  var h='<div class="lt b-'+bk+'"><div class="lt-h">'+ringHtml(q)+'<div class="t"><div><b>'+esc(coinOf(t.symbol))+'</b> <span class="'+(L?'long':'short')+'">'+(L?'LONG':'SHORT')+'</span> <span class="chip bnd-'+bk+'">'+esc(q.band)+'</span></div>'
+    +'<div class="hint2">'+esc((t.bot||'bot unknown').replace('YM ORACLE ','Oracle '))+(t.engine?' · '+esc(t.engine):'')+' · '+t.leverage+'x · open '+esc(age)+'</div></div>'
+    +'<div style="text-align:right"><div class="num '+cls(t.upl)+'" style="font-size:15px">'+pnlTxt(t.upl)+'</div><div class="hint2 num">'+(pct>=0?'+':'-')+Math.abs(pct).toFixed(1)+'% · '+(q.nowR==null?'':(q.nowR>=0?'+':'')+q.nowR.toFixed(2)+'R')+'</div></div></div>';
+  h+=ladderHtml(t);
+  h+='<div class="lt-v"><div><span>Stop</span><b>'+fmtP(t.stopLoss)+'</b></div><div><span>Entry</span><b>'+fmtP(t.entry)+'</b></div><div><span>Now</span><b>'+fmtP(t.mark)+'</b></div><div><span>Target</span><b>'+fmtP(t.takeProfit)+'</b></div></div>';
+  h+=trailHtml(t.trail);
+  h+='<div style="display:grid;gap:5px">'+PARTS.map(function(x){return partRow(q,x[0],x[1])}).join('')+'</div>';
+  var chips='';
+  if(q.peakR!=null&&q.peakR>0.05)chips+='<span class="chip">best +'+q.peakR.toFixed(2)+'R</span>';
+  if(t.profitGuard)chips+='<span class="chip '+(t.profitGuard.mode==='live'?'long':t.profitGuard.mode==='shadow'?'warn':'')+'" title="'+esc(t.profitGuard.why||'')+'">Profit Guard · '+esc(t.profitGuard.mode||'')+'</span>';
+  if(t.sentinel)chips+='<span class="chip '+(t.sentinel.state==='danger'?'short':t.sentinel.state==='alert'?'warn':'')+'" title="Sentinel score '+esc(t.sentinel.score)+'">Sentinel · '+esc(t.sentinel.state||'calm')+'</span>';
+  (q.flags||[]).slice(0,3).forEach(function(f){chips+='<span class="chip warn">'+esc(f)+'</span>'});
+  if(chips)h+='<div class="lt-f">'+chips+'</div>';
+  return h+'</div>';
+}
+function viewLive(){
+  var V=S.live;
+  var h='<div class="pagehd"><div><p>Every open trade on the master account, with a plain 0–100 reading of how it is going. The reading is built from four visible parts (progress 35, protection 20, momentum 25, market 20). It describes the present; it does not predict.</p></div><span class="mist small">'+(V?'Updated '+ago(V.at):'')+' · refreshes by itself</span></div>';
+  if(!V)return h+'<div class="card"><p class="mist" style="padding:6px 0">Loading…</p></div>';
+  if(!V.trades||!V.trades.length)return h+'<div class="card"><p class="mist" style="padding:14px 0;text-align:center">'+esc(V.note||'No open trades right now.')+'</p></div>';
+  var sm=V.summary||{},b=sm.bands||{},tot=sm.open||1,attn=(b.fragile||0)+(b['at risk']||0);
+  var col={strong:'var(--long)',steady:'#60a5fa',fragile:'var(--pending)','at risk':'var(--short)',unknown:'var(--mist)'};
+  h+='<div class="sumrow"><div class="stat"><div class="k">Open trades</div><div class="v num">'+sm.open+'</div><div class="s">'+usd(sm.margin,0)+' margin in use</div></div>'
+    +'<div class="stat"><div class="k">Unrealised result</div><div class="v num '+cls(sm.upl)+'">'+pnlTxt(sm.upl)+'</div></div>'
+    +'<div class="stat"><div class="k">Average quality</div><div class="v num">'+(sm.avgScore==null?'–':sm.avgScore)+'<span class="mist small"> / 100</span></div></div>'
+    +'<div class="stat"><div class="k">Need attention</div><div class="v num '+(attn?'warn':'')+'">'+attn+'</div><div class="s">fragile or at risk</div></div></div>';
+  h+='<div class="bandbar" style="margin:12px 0 4px" role="img" aria-label="Trades by quality band">'+['strong','steady','fragile','at risk','unknown'].map(function(k){return b[k]?'<i style="flex:'+b[k]+';background:'+col[k]+'" title="'+b[k]+' '+k+'"></i>':''}).join('')+'</div>';
+  h+='<div class="hint2" style="margin-bottom:12px">'+['strong','steady','fragile','at risk'].map(function(k){return '<span class="bnd-'+(k==='at risk'?'risk':k)+'">●</span> '+(b[k]||0)+' '+k}).join(' &nbsp; ')+'</div>';
+  var tr=V.trades.slice();
+  if(S.liveSort==='best')tr.sort(function(a,c){return ((c.quality&&c.quality.score)||0)-((a.quality&&a.quality.score)||0)});
+  else if(S.liveSort==='new')tr.sort(function(a,c){return c.openedAt-a.openedAt});
+  else if(S.liveSort==='pnl')tr.sort(function(a,c){return c.upl-a.upl});
+  h+='<div class="sec2"><h3>Trades</h3><div class="seg" role="group" aria-label="Sort">'+[['worst','Needs attention first'],['best','Best first'],['new','Newest'],['pnl','Result']].map(function(m){return '<button data-ls="'+m[0]+'" aria-pressed="'+((S.liveSort||'worst')===m[0])+'">'+m[1]+'</button>'}).join('')+'</div></div>';
+  h+='<div class="lt-grid">'+tr.map(tradeCard).join('')+'</div>';
+  h+='<p class="hint2" style="margin-top:12px">The bar runs from the original stop (red) through the entry (white) to the target (green). The amber part is profit the stop has already locked. The dot is the price now; the faint tick is the best price so far. The small line is the last hour, in R.</p>';
+  return h;
+}
+function viewGuards(){
+  var h='<div class="pagehd"><div><p>Profit Guard locks profit by raising stops. The Trade Sentinel watches for trades that look like they are turning against you. Both only ever tighten a stop, and both start Off: use Shadow to record what they would do without touching anything.</p></div></div>';
+  h+='<div class="g2g">'+guardCard()+sentinelCard()+'</div>';
+  return h;
+}
+
 /* ---------- render ---------- */
 function render(){
   renderHeader();
-  var f={overview:viewOverview,trading:viewTrading,bots:viewBots,users:viewUsers,plan:viewPlan,activity:viewActivity,payments:viewPayments,settings:viewSettings}[S.tab]||viewOverview;
+  var f={overview:viewOverview,live:viewLive,guards:viewGuards,trading:viewTrading,bots:viewBots,users:viewUsers,plan:viewPlan,activity:viewActivity,payments:viewPayments,settings:viewSettings}[S.tab]||viewOverview;
   var keep=document.activeElement&&document.activeElement.id,pos=document.activeElement&&document.activeElement.selectionStart;
   $('#body').innerHTML=f();bindHolds($('#body'));
   if(keep&&$('#'+keep)&&/^(uq|oq|p-|mk-|live-)/.test(keep)){var el=$('#'+keep);el.focus();try{if(pos!=null)el.setSelectionRange(pos,pos)}catch(e){}}
@@ -912,6 +1031,7 @@ document.addEventListener('click',function(e){
   if(t.id==='signoutBtn'){api('/api/admin/logout','POST').catch(function(){}).then(function(){setTok('');showLogin()});return}
   if(t.id==='inviteBtn'){j('/api/admin/invites','POST',{count:1}).then(function(r){if(r.success){$('#inviteOut').innerHTML='New invite code: <code>'+esc(r.codes[0])+'</code> (single use) <button class="btn" id="copyInvite" style="margin-left:6px">Copy</button>';var b=$('#copyInvite');if(b)b.onclick=function(){copy(r.codes[0],'Invite code copied')}}else toast(r.message||'Failed')});return}
   if(t.hasAttribute('data-tab')){S.tab=t.getAttribute('data-tab');S.planEditing=false;try{history.replaceState(null,'','#'+S.tab)}catch(x){}loadTab();return}
+  if(t.hasAttribute('data-ls')){S.liveSort=t.getAttribute('data-ls');render();return}
   if(t.hasAttribute('data-period')){S.period=Number(t.getAttribute('data-period'));loadTab();return}
   if(t.hasAttribute('data-att')){var p=t.getAttribute('data-att').split(':'),body={clearKeyError:{clearKeyError:true},resume:{paused:false},forceAuto:{controlMode:'auto'}}[p[1]];if(body)setUser(Number(p[0]),body,'Done');return}
   if(t.hasAttribute('data-open')){openDrawer(Number(t.getAttribute('data-open')));return}

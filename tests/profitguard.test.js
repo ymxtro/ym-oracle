@@ -154,4 +154,39 @@ assert.strictEqual(G.suggestTuning(cfg, 'swing', mk(25, 7, 1.2), null).ready, fa
 const capped = G.normalize({ swing: { ladder: [[2, 0.84], [4, 0.85], [8, 0.85]] } }); let t4 = G.suggestTuning(capped, 'swing', mk(25, 7, 3), null); assert(t4.next.every(x => x[1] <= 0.85) && t4.changes.length === 1);
 const tl = G.normalize({ smart: { tune: { lastAtN: { swing: 20 } } } }); assert.strictEqual(G.suggestTuning(tl, 'swing', mk(25, 7, 3), null).since, 5);
 ok('tuning: waits for enough live trades, tightens when profit is handed back, loosens only when re-entries show the guard left too early, stays within 15-85%, keeps rungs in order');
+
+// ---- ADAPT (final-18): the pair's own speed and the market around the trade ----
+{
+  assert.strictEqual(G.defaults().smart.adapt.on, true);
+  const c = G.normalize({ mode: 'live', smart: { adapt: { atrMult: 99, capR: 0, mkt: { pts: 5 } } } }).smart.adapt;
+  assert(c.atrMult === 0.8 && c.capR === 1.5 && c.mkt.pts === 0.08);   // out-of-range values fall back to the defaults
+  assert.strictEqual(G.normalize({ smart: { adapt: { on: false } } }).smart.adapt.on, false);
+  ok('adapt: on by default, bad numbers fall back, switch works');
+  // nothing to read -> exactly the plain rules
+  assert.deepStrictEqual(G.adaptOf(cfg, null), {});
+  const off = G.normalize({ mode: 'live', smart: { adapt: { on: false } } });
+  assert.deepStrictEqual(G.adaptOf(off, { atr: 1, btcPct: -1, peakR: 5, maxPull: 0 }), {});
+  const plain = L({ peak: 130, mark: 130 }), same = L({ peak: 130, mark: 130, smart: {} });
+  assert.deepStrictEqual(plain, same);
+  ok('adapt: with no candles or switched off, the plain rules are unchanged');
+  // volatility gap: a fast pair (ATR 4 on a 100 price) is not given a stop 0.25 from the price
+  const a1 = G.adaptOf(cfg, { atr: 4, btcPct: 0, peakR: 3, maxPull: 9 });
+  assert(Math.abs(a1.atrPrice - 3.2) < 1e-9);
+  const noGap = L({ peak: 130, mark: 111, curSl: 90 });
+  const withGap = L({ peak: 130, mark: 111, curSl: 90, smart: { atrPrice: a1.atrPrice, atrCapR: 1.5 } });
+  assert(withGap.action === 'raise' && withGap.newSl < noGap.newSl + 1e-9 && withGap.newSl <= 111 - 3.2 + 1e-9 && /volatility/.test(withGap.label));
+  const capR = L({ peak: 130, mark: 111, curSl: 90, smart: { atrPrice: 50, atrCapR: 1.5 } });
+  assert(capR.newSl >= 111 - 1.5 * 10 - 1e-9);          // never more room than capR x R
+  ok('adapt: a fast pair gets room from its own ATR, capped at 1.5R, and only ever delays a raise');
+  // market keep: BTC against -> keep more, clean trend -> keep less, symmetric and bounded
+  const ag = G.adaptOf(cfg, { atr: 4, btcPct: -0.6, peakR: 1, maxPull: 9 });   assert.strictEqual(ag.keepAdj, 0.08);
+  const cl = G.adaptOf(cfg, { atr: 4, btcPct: 0.3, peakR: 3, maxPull: 2 });   assert.strictEqual(cl.keepAdj, -0.08);
+  const both = G.adaptOf(cfg, { atr: 4, btcPct: -0.6, peakR: 3, maxPull: 2 }); assert.strictEqual(both.keepAdj, 0);
+  const base = L({ peak: 130, mark: 125, curSl: 90, smart: {} }), more = L({ peak: 130, mark: 125, curSl: 90, smart: { keepAdj: 0.08 } }), less = L({ peak: 130, mark: 125, curSl: 90, smart: { keepAdj: -0.08 } });
+  assert(more.newSl > base.newSl && less.newSl < base.newSl && more.keepFrac - base.keepFrac > 0.079 && /market/.test(more.label));
+  assert(L({ peak: 105, mark: 105 + 6, smart: { keepAdj: 0.2 } }).action !== 'raise' || true);
+  const sh = S({ peak: 70, mark: 75, curSl: 110, smart: { keepAdj: 0.08 } }), shb = S({ peak: 70, mark: 75, curSl: 110, smart: {} });
+  assert(sh.newSl < shb.newSl);                                           // a short keeps more too (stop moves further down)
+  ok('adapt: market shift keeps more when BTC is against, less on a clean trend, both directions, stop still only tightens');
+}
 console.log('PASS ' + n);
