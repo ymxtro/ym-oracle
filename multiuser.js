@@ -330,8 +330,11 @@ function init(deps) {
 
   const { app, restClient, getMode, breakerIsTripped, sendAlert, baseOpts } = deps;
   const PG = require('./profitguard.js');
+  const SN = require('./sentinel.js');
+  let snCfg = SN.defaults();            // Trade Sentinel settings (off until switched on from the admin console)
   let pgCfg = PG.defaults();            // Profit Guard settings (off until switched on from the admin console)
   const pgWatch = new Map();            // re-entry watches (recording only); filled and used further down
+  const snState = new Map();            // Trade Sentinel: 'SYMBOL|Side' -> what it knows about that open trade
   const pgState = new Map();            // 'SYMBOL|Buy' -> { entry, initialSl, peak, floor, shadowSl, profile, ... } for every trade being watched
   // deliverAlert (optional dep) = async text => { ok, configured, telegram, email }: waits for the real result. Falls back to fire-and-forget sendAlert.
   const deliverAlert = deps.deliverAlert || (async (t, _o) => { if (!sendAlert) return { ok: false, configured: false }; sendAlert(t); return { ok: true, configured: true, telegram: 'sent' }; });
@@ -526,6 +529,19 @@ function init(deps) {
       entry NUMERIC, initial_sl NUMERIC, peak_price NUMERIC, exit_price NUMERIC, peak_pct NUMERIC, exit_pct NUMERIC, giveback_pct NUMERIC,
       peak_r NUMERIC, exit_r NUMERIC, guard_floor NUMERIC, scaled INT, pnl NUMERIC
     );
+    CREATE TABLE IF NOT EXISTS trade_path (
+      id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(), symbol TEXT, side TEXT, mark NUMERIC, now_r NUMERIC, peak_r NUMERIC, atr NUMERIC, score NUMERIC, state TEXT
+    );
+    CREATE INDEX IF NOT EXISTS trade_path_at_idx ON trade_path(at);
+    CREATE TABLE IF NOT EXISTS sentinel_log (
+      id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(), symbol TEXT, side TEXT, mode TEXT, profile TEXT, event TEXT, state TEXT, score NUMERIC,
+      entry NUMERIC, mark NUMERIC, old_sl NUMERIC, new_sl NUMERIC, detail TEXT
+    );
+    CREATE INDEX IF NOT EXISTS sentinel_log_at_idx ON sentinel_log(at DESC);
+    CREATE TABLE IF NOT EXISTS sentinel_trades (
+      id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(), symbol TEXT, side TEXT, profile TEXT, mode TEXT, label TEXT, entry NUMERIC, initial_sl NUMERIC,
+      peak_r NUMERIC, max_score NUMERIC, first_alert_at TIMESTAMPTZ, first_danger_at TIMESTAMPTZ, moves INT, shadow_exit_r NUMERIC, exit_price NUMERIC, exit_r NUMERIC, pnl NUMERIC
+    );
     -- when a user switches between a demo key and a live key, the results of the environment they leave are moved here
     -- (kept, never mixed into their current numbers or the admin totals)
     CREATE TABLE IF NOT EXISTS pnl_ledger_old (LIKE pnl_ledger);
@@ -568,9 +584,11 @@ function init(deps) {
       catch (e) { console.error('[multiuser] alert routes not loaded, using defaults:', e.message); }
     }
     try {                                                // Profit Guard: saved settings and the peaks/floors of trades that were open (so a restart forgets nothing)
-      const pg = await q(`SELECT k, v FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch')`);
+      const pg = await q(`SELECT k, v FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch','sentinel','sentinel_state')`);
       for (const row of pg.rows) {
         if (row.k === 'profit_guard') pgCfg = PG.normalize(JSON.parse(row.v));
+        else if (row.k === 'sentinel') snCfg = SN.normalize(JSON.parse(row.v));
+        else if (row.k === 'sentinel_state') { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) snState.set(k, v); }
         else if (row.k === 'profit_guard_watch') { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) pgWatch.set(k, v); }
         else { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) pgState.set(k, v); }
       }
@@ -1635,17 +1653,236 @@ function init(deps) {
     } catch (e) { pgRun.at = Date.now(); pgRun.ok = false; pgRun.err = e.message; console.error('[multiuser] profit guard:', e.message); }
     finally { pgRun.busy = false; }
   }
+  // ---------- Trade Sentinel ----------
+  // Scores how much an OPEN master trade looks like a trap (see sentinel.js) from its own path and 1-minute candles. At alert/danger it may TIGHTEN the stop on Bybit
+  // (never loosen), for the master and the copy users. Shadow records what it would do. It shares the stop floor with the Profit Guard (guardClamp), takes no new orders,
+  // and when anything is missing (candles, the original stop) it does nothing.
+  const snRun = { at: 0, ok: null, note: '', err: null, positions: 0, busy: false, moves: 0 };
+  const snCandles = new Map();     // symbol -> { at, bars }
+  const snClosing = [];
+  let snBtc = { at: 0, pct: 0 }, snSavedAt = 0, snPathAt = new Map();
+  const snEm = st => SN.effMode(snCfg, st.profile);
+  const snSleep = ms => new Promise(r => setTimeout(r, ms));
+  async function snLog(row) {
+    try {
+      await q(`INSERT INTO sentinel_log(symbol,side,mode,profile,event,state,score,entry,mark,old_sl,new_sl,detail) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [row.symbol, row.side || null, row.mode || snCfg.mode, row.profile || null, row.event, row.state || null, row.score ?? null, row.entry ?? null, row.mark ?? null, row.oldSl ?? null, row.newSl ?? null, String(row.detail || '').slice(0, 300)]);
+    } catch (e) { console.error('[multiuser] sentinel log:', e.message); }
+  }
+  async function snSaveState(force) {
+    if (!force && Date.now() - snSavedAt < 15000) return;
+    snSavedAt = Date.now();
+    try { await q(`INSERT INTO meta(k,v) VALUES('sentinel_state',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(Object.fromEntries(snState))]); }
+    catch (e) { console.error('[multiuser] sentinel state:', e.message); }
+  }
+  const snBarsFrom = list => (list || []).map(x => ({ t: Number(x[0]), o: parseFloat(x[1]), h: parseFloat(x[2]), l: parseFloat(x[3]), c: parseFloat(x[4]), v: parseFloat(x[5]) })).filter(b => b.t > 0 && b.c > 0).sort((a, b) => a.t - b.t);
+  async function snBars(symbol) {
+    const hit = snCandles.get(symbol);
+    if (hit && Date.now() - hit.at < snCfg.candleSec * 1000) return hit.bars;
+    const r = await restClient.getKline({ category: 'linear', symbol, interval: '1', limit: 60 });
+    if (r.retCode !== 0) throw new Error('kline ' + (r.retMsg || r.retCode));
+    const bars = snBarsFrom(r.result && r.result.list);
+    snCandles.set(symbol, { at: Date.now(), bars });
+    return bars;
+  }
+  async function snBtcMove() {                 // BTC's move over ~15 minutes in %, direction as it happened (the caller flips it for a short)
+    if (Date.now() - snBtc.at < 60000) return snBtc.pct;
+    try { const b = await snBars('BTCUSDT'); if (b.length > 16) snBtc = { at: Date.now(), pct: (b[b.length - 1].c - b[b.length - 16].c) / b[b.length - 16].c * 100 }; else snBtc.at = Date.now(); }
+    catch { snBtc.at = Date.now() - 30000; }
+    return snBtc.pct;
+  }
+  async function snExitOf(symbol, sinceMs) {
+    try {
+      const r = await restClient.getClosedPnL({ category: 'linear', symbol, limit: 10 });
+      const rows = ((r.result && r.result.list) || []).filter(x => x.symbol === symbol && Number(x.updatedTime || x.createdTime || 0) >= sinceMs - 60000);
+      if (rows.length && parseFloat(rows[0].avgExitPrice) > 0) return { exit: parseFloat(rows[0].avgExitPrice), pnl: rows.reduce((t, x) => t + (Number(x.closedPnl) || 0), 0) };
+    } catch { /* retried */ }
+    return null;
+  }
+  async function snRecordClose(it) {
+    const st = it.st, [symbol, side] = it.key.split('|'), long = side === 'Buy';
+    const ex = await snExitOf(symbol, st.entryAt || st.since);
+    if (!ex && it.tries < 6) { it.tries++; return false; }
+    const risk = st.initialSl > 0 ? Math.abs(st.entry - st.initialSl) : 0;
+    const rOf = px => (risk > 0 && px > 0 ? (long ? px - st.entry : st.entry - px) / risk : null);
+    const peakR = risk > 0 ? (long ? st.peak - st.entry : st.entry - st.peak) / risk : null;
+    try {
+      await q(`INSERT INTO sentinel_trades(symbol,side,profile,mode,label,entry,initial_sl,peak_r,max_score,first_alert_at,first_danger_at,moves,shadow_exit_r,exit_price,exit_r,pnl) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+        [symbol, side, st.profile, it.em, st.label || null, st.entry, st.initialSl || null, peakR, st.maxScore || 0, st.firstAlertAt ? new Date(st.firstAlertAt) : null, st.firstDangerAt ? new Date(st.firstDangerAt) : null, st.moves || 0,
+         st.shadowHit ? rOf(st.shadowSl) : null, ex ? ex.exit : null, ex ? rOf(ex.exit) : null, ex ? ex.pnl : null]);
+    } catch (e) { console.error('[multiuser] sentinel scorecard:', e.message); }
+    return true;
+  }
+  async function snTick() {
+    if (snRun.busy || snCfg.mode === 'off') return;
+    if (getMode() !== 'live' || breakerIsTripped()) { snRun.note = 'paused: the relay is not live or trading is halted'; return; }
+    snRun.busy = true;
+    const pathRows = [];
+    try {
+      await ready;
+      const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
+      for (const p of positions) {
+        if (p.side !== 'Buy' && p.side !== 'Sell') continue;
+        const symbol = p.symbol, side = p.side, key = symbol + '|' + side, long = side === 'Buy'; seen.add(key);
+        const entry = parseFloat(p.avgPrice), mark = parseFloat(p.markPrice), curSl = parseFloat(p.stopLoss) || 0;
+        if (!(entry > 0) || !(mark > 0)) continue;
+        let st = snState.get(key);
+        if (st && Math.abs(st.entry - entry) / st.entry > 0.005) st = null;
+        if (!st) {
+          const lk = await pgLookup(symbol, side);
+          let init = lk.sl > 0 && (long ? lk.sl < entry : lk.sl > entry) ? lk.sl : 0;
+          if (!init && curSl > 0 && (long ? curSl < entry : curSl > entry)) init = curSl;
+          const created = Number(p.createdTime) > 0 ? Number(p.createdTime) : now;
+          st = { entry, initialSl: init, peak: entry, peakAt: created, entryAt: created, profile: PG.profileOf(pgCfg, lk.eng, lk.bot), bot: lk.bot, since: now, mem: { state: 'calm', want: null, n: 0 }, moves: 0, lastMoveAt: 0, floor: 0, shadowSl: 0, shadowHit: false, label: 'unlabeled', maxScore: 0, alerted: false };
+          snState.set(key, st);
+        }
+        st.mark = mark; st.curSl = curSl;
+        const em = snEm(st); st.em = em;
+        if (em === 'off') { st.why = 'switched off for this profile'; continue; }
+        let bars;
+        try { bars = await snBars(symbol); } catch (e) { st.why = 'no candles: ' + e.message; continue; }   // nothing known about the market: do nothing
+        for (const b of bars) { if (b.t < st.entryAt - 60000) continue; const ex = long ? b.h : b.l; if (long ? ex > st.peak : ex < st.peak) { st.peak = ex; st.peakAt = b.t; } }
+        if (long ? mark > st.peak : mark < st.peak) { st.peak = mark; st.peakAt = now; }
+        const btcRaw = await snBtcMove(), btcPct = long ? btcRaw : -btcRaw;
+        const f = SN.features({ side, entry, mark, peak: st.peak, peakAt: st.peakAt, entryAt: st.entryAt, now, initialSl: st.initialSl, candles: bars, btcPct, profile: st.profile, cfg: snCfg });
+        if (!f) { st.why = 'cannot judge (no original stop or too few candles)'; continue; }
+        if (st.label === 'unlabeled' && f.elapsedMin >= snCfg.label.afterMin) {
+          let crosses = 0, prev = 0;
+          for (const b of bars) { if (b.t < st.entryAt) continue; const s = Math.sign(b.c - entry); if (s && prev && s !== prev) crosses++; if (s) prev = s; }
+          st.label = SN.labelTrade({ elapsedMin: f.elapsedMin, peakR: f.peakR, crosses }, snCfg);
+        }
+        const nf = SN.normFeatures(f, st.profile, snCfg), sc = SN.score(nf, snCfg.weights, SN.labelMult(st.label, snCfg));
+        const prevState = st.mem.state;
+        st.mem = SN.step(st.mem, sc, snCfg.th); st.score = sc; st.f = { peakR: f.peakR, nowR: f.nowR, giveback: f.giveback, advAtr: f.advAtr, stallMin: f.stallMin };
+        if (sc > (st.maxScore || 0)) st.maxScore = sc;
+        if (st.mem.state !== prevState) {
+          if (st.mem.state === 'alert' && !st.firstAlertAt) st.firstAlertAt = now;
+          if (st.mem.state === 'danger' && !st.firstDangerAt) st.firstDangerAt = now;
+          await snLog({ symbol, side, profile: st.profile, mode: em, event: 'state', state: st.mem.state, score: sc, entry, mark, detail: prevState + ' -> ' + st.mem.state + ' (peak ' + f.peakR.toFixed(2) + 'R, now ' + f.nowR.toFixed(2) + 'R, label ' + st.label + ')' });
+          if (snCfg.alerts && !st.alerted && (st.mem.state === 'alert' || st.mem.state === 'danger')) {
+            st.alerted = true;
+            deliverAlert('⚠️ Sentinel: ' + symbol.replace(/USDT$/, '') + ' ' + (long ? 'long' : 'short') + ' looks like it is turning against the trade (' + st.mem.state + ', score ' + sc + '). ' + (em === 'live' ? 'It may tighten the stop.' : 'Shadow mode: nothing was changed.'), { cat: 'updates' }).catch(() => {});
+          }
+        }
+        if (now - (snPathAt.get(key) || 0) >= 10000) { snPathAt.set(key, now); pathRows.push([symbol, side, mark, f.nowR, f.peakR, f.atr, sc, st.mem.state]); }
+        // the shadow stop would have been touched
+        if (em === 'shadow' && st.shadowSl > 0 && !st.shadowHit && (long ? mark <= st.shadowSl : mark >= st.shadowSl)) {
+          st.shadowHit = true;
+          await snLog({ symbol, side, profile: st.profile, mode: em, event: 'would_exit', state: st.mem.state, score: sc, entry, mark, newSl: st.shadowSl, detail: 'price touched the Sentinel\'s shadow stop: the trade would have been closed here' });
+        }
+        // act (tighten only)
+        if (st.mem.state !== 'alert' && st.mem.state !== 'danger') { st.why = 'state ' + st.mem.state; continue; }
+        if ((st.moves || 0) >= snCfg.limits.maxMoves || now - (st.lastMoveAt || 0) < snCfg.limits.moveGapSec * 1000) { st.why = 'move limit or pause between moves'; continue; }
+        const inst = await getInstrument(symbol).catch(() => null);
+        const eff = em === 'shadow' && st.shadowSl > 0 ? (long ? Math.max(curSl, st.shadowSl) : (curSl > 0 ? Math.min(curSl, st.shadowSl) : st.shadowSl)) : curSl;
+        const d = SN.decide({ side, entry, mark, peak: st.peak, curSl: eff, initialSl: st.initialSl, tick: inst && inst.tickSize || 0, atr: f.atr, state: st.mem.state, cfg: snCfg });
+        st.why = d.action === 'raise' ? d.label : d.why;
+        if (d.action !== 'raise') continue;
+        if (em === 'shadow') {
+          st.shadowSl = d.newSl; st.moves = (st.moves || 0) + 1; st.lastMoveAt = now;
+          await snLog({ symbol, side, profile: st.profile, mode: em, event: 'would_raise', state: st.mem.state, score: sc, entry, mark, oldSl: curSl || null, newSl: d.newSl, detail: d.label });
+          continue;
+        }
+        const body = { category: 'linear', symbol, positionIdx: Number(p.positionIdx) || 0, stopLoss: String(d.newSl) };
+        let res;
+        try { res = await restClient.setTradingStop(body); }
+        catch (e) { await snLog({ symbol, side, profile: st.profile, mode: em, event: 'failed', state: st.mem.state, score: sc, entry, mark, oldSl: curSl || null, newSl: d.newSl, detail: 'Bybit call failed: ' + (e.message || e) }); st.lastMoveAt = now; continue; }
+        if (res.retCode !== 0 && res.retCode !== 34040) { await snLog({ symbol, side, profile: st.profile, mode: em, event: 'failed', state: st.mem.state, score: sc, entry, mark, oldSl: curSl || null, newSl: d.newSl, detail: 'Bybit refused: ' + (res.retMsg || res.retCode) }); st.lastMoveAt = now; continue; }
+        st.floor = d.newSl; st.curSl = d.newSl; st.moves = (st.moves || 0) + 1; st.lastMoveAt = now; snRun.moves++;
+        await snLog({ symbol, side, profile: st.profile, mode: em, event: 'raised', state: st.mem.state, score: sc, entry, mark, oldSl: curSl || null, newSl: d.newSl, detail: d.label });
+        fanOutTradingStop({ symbol, positionIdx: Number(p.positionIdx) || 0, stopLoss: String(d.newSl) }).catch(e => console.error('[multiuser] sentinel fan-out:', e.message));
+      }
+      for (const [key, st] of [...snState.entries()]) {
+        if (seen.has(key)) continue;
+        snClosing.push({ key, st, em: st.em || snEm(st), at: now, tries: 0 });
+        snState.delete(key); snPathAt.delete(key);
+      }
+      for (let i = 0; i < snClosing.length;) { if (await snRecordClose(snClosing[i]).catch(() => false)) snClosing.splice(i, 1); else i++; }
+      if (pathRows.length) {
+        const vals = [], ph = pathRows.map((r, i) => { vals.push(...r); const b = i * 8; return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8})`; });
+        await q(`INSERT INTO trade_path(symbol,side,mark,now_r,peak_r,atr,score,state) VALUES ${ph.join(',')}`, vals).catch(e => console.error('[multiuser] sentinel path:', e.message));
+      }
+      snRun.at = Date.now(); snRun.ok = true; snRun.err = null; snRun.note = ''; snRun.positions = positions.length;
+      await snSaveState(false);
+    } catch (e) { snRun.at = Date.now(); snRun.ok = false; snRun.err = e.message; console.error('[multiuser] sentinel:', e.message); }
+    finally { snRun.busy = false; }
+  }
+
+  // ---- learn from the history the server already has: the bot signals (entry, original stop, exit) + Bybit's public candles. Nothing to upload. ----
+  const snBack = { running: false, at: 0, done: 0, total: 0, used: 0, err: null, note: '' };
+  async function snRangeBars(symbol, fromMs, toMs) {
+    const all = new Map();
+    let end = toMs;
+    for (let page = 0; page < 6; page++) {
+      const r = await restClient.getKline({ category: 'linear', symbol, interval: '1', start: fromMs, end, limit: 1000 });
+      if (r.retCode !== 0) throw new Error('kline ' + (r.retMsg || r.retCode));
+      const bars = snBarsFrom(r.result && r.result.list);
+      if (!bars.length) break;
+      for (const b of bars) all.set(b.t, b);
+      if (bars[0].t <= fromMs) break;
+      end = bars[0].t - 1;
+      await snSleep(250);
+    }
+    return [...all.values()].sort((a, b) => a.t - b.t);
+  }
+  async function snBackfill(opts) {
+    if (snBack.running) return { started: false, note: 'already running' };
+    const days = Math.min(90, Math.max(3, Number(opts && opts.days) || 60)), max = Math.min(300, Math.max(10, Number(opts && opts.max) || 120));
+    Object.assign(snBack, { running: true, at: Date.now(), done: 0, total: 0, used: 0, err: null, note: 'reading the bot signals' });
+    (async () => {
+      try {
+        await ready;
+        const rows = (await q(`SELECT symbol, side, eng, opened_at, closed_at, entry, sl FROM signals WHERE relay_ok = true AND closed_at IS NOT NULL AND sl > 0 AND entry > 0 AND opened_at > now() - ($1 || ' days')::interval AND closed_at > opened_at ORDER BY opened_at DESC LIMIT $2`, [String(days), max])).rows;
+        snBack.total = rows.length; snBack.note = 'replaying ' + rows.length + ' closed trades';
+        const samples = []; let traps = 0, usedTrades = 0;
+        for (const s of rows) {
+          try {
+            const side = s.side === 'BUY' ? 'Buy' : 'Sell', entryAt = new Date(s.opened_at).getTime(), exitAt = new Date(s.closed_at).getTime();
+            if (exitAt - entryAt > 36 * 3600000) { snBack.done++; continue; }
+            const bars = await snRangeBars(s.symbol, entryAt - 45 * 60000, exitAt + 60000);
+            const profile = s.eng === 'swing' ? 'swing' : 'fast';
+            const rep = SN.replay({ side, entry: Number(s.entry), initialSl: Number(s.sl), entryAt, exitAt }, bars, snCfg, profile);
+            if (rep.length) { usedTrades++; if (rep.some(x => x.y === 1)) traps++; for (let i = 0; i < rep.length; i += 2) samples.push(rep[i]); }
+          } catch (e) { snBack.note = 'a trade was skipped: ' + e.message; }
+          snBack.done++; snBack.used = usedTrades;
+          await snSleep(300);
+        }
+        const w = (usedTrades >= snCfg.fit.minTrades && traps >= snCfg.fit.minTraps) ? SN.fitWeights(samples, snCfg) : null;
+        const fit = { at: Date.now(), trades: usedTrades, samples: samples.length, traps, weights: w, current: snCfg.weights, before: SN.evalWeights(samples, snCfg.weights, snCfg.th), after: w ? SN.evalWeights(samples, w, snCfg.th) : null,
+          note: w ? '' : 'not enough evidence yet: needs ' + snCfg.fit.minTrades + ' replayed trades with at least ' + snCfg.fit.minTraps + ' that reached the original stop (' + usedTrades + ' and ' + traps + ' so far)' };
+        await q(`INSERT INTO meta(k,v) VALUES('sentinel_fit',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(fit)]);
+        snBack.note = fit.note || 'done: a weight suggestion is ready';
+      } catch (e) { snBack.err = e.message; snBack.note = 'failed'; console.error('[multiuser] sentinel backfill:', e.message); }
+      finally { snBack.running = false; }
+    })();
+    return { started: true };
+  }
+  async function snView() {
+    const trades = [...snState.entries()].map(([key, st]) => ({ symbol: key.split('|')[0], side: key.split('|')[1], profile: st.profile, mode: st.em || snEm(st), state: st.mem && st.mem.state, score: st.score ?? null, label: st.label, peakR: st.f ? st.f.peakR : null, nowR: st.f ? st.f.nowR : null, moves: st.moves || 0, stop: st.curSl || null, shadowStop: st.shadowSl || null, why: st.why || '' }));
+    const log = (await q(`SELECT at, symbol, side, mode, event, state, score, old_sl, new_sl, detail FROM sentinel_log ORDER BY id DESC LIMIT 30`)).rows;
+    const card = (await q(`SELECT at, symbol, side, mode, label, peak_r, max_score, first_alert_at, moves, shadow_exit_r, exit_r FROM sentinel_trades ORDER BY id DESC LIMIT 20`)).rows;
+    const agg = (await q(`SELECT mode, COUNT(*)::int AS n, COUNT(first_alert_at)::int AS alerted, AVG(exit_r) AS avg_exit_r, AVG(shadow_exit_r) FILTER (WHERE shadow_exit_r IS NOT NULL) AS avg_shadow_exit_r, COUNT(shadow_exit_r)::int AS shadow_hits FROM sentinel_trades GROUP BY mode ORDER BY mode`)).rows;
+    let fit = null; try { const r = await q(`SELECT v FROM meta WHERE k='sentinel_fit'`); if (r.rows[0]) fit = JSON.parse(r.rows[0].v); } catch { /* none yet */ }
+    return { cfg: snCfg, run: { at: snRun.at, ok: snRun.ok, note: snRun.note, err: snRun.err, positions: snRun.positions, moves: snRun.moves, relayMode: getMode(), halted: !!breakerIsTripped() }, trades, log, scorecard: { recent: card, summary: agg }, fit, backfill: { ...snBack } };
+  }
   const PG_BAD_RISK = (long, entry, init) => !(init > 0) || (long ? init >= entry : init <= entry);
   // Called by the stop route before a bot's stop is applied: while the guard is live for that trade, a looser stop is held at the guard's floor (and a stop removal is refused).
   function guardClamp(body) {
     try {
       if (!body || typeof body !== 'object' || body.stopLoss === undefined) return body;
-      const cands = ['Buy', 'Sell'].map(s => [s, pgState.get(String(body.symbol) + '|' + s)]).filter(([, st]) => st && st.floor > 0 && pgEm(st) === 'live');
+      const sym = String(body.symbol), cands = [];
+      for (const side of ['Buy', 'Sell']) {                       // the tighter of the Profit Guard's and the Sentinel's floor, each only while it is live
+        let floor = 0, st = pgState.get(sym + '|' + side);
+        if (st && st.floor > 0 && pgEm(st) === 'live') floor = st.floor; else st = null;
+        const sn = snState.get(sym + '|' + side);
+        if (sn && sn.floor > 0 && snEm(sn) === 'live' && (!floor || (side === 'Buy' ? sn.floor > floor : sn.floor < floor))) { floor = sn.floor; st = sn; }
+        if (floor > 0) cands.push([side, floor, st]);
+      }
       if (cands.length !== 1) return body;
-      const [side, st] = cands[0];
-      const use = PG.clampStop(side, body.stopLoss, st.floor);
+      const [side, floor, st] = cands[0];
+      const use = PG.clampStop(side, body.stopLoss, floor);
       if (use === null) return body;
-      pgLog({ symbol: body.symbol, side, profile: st.profile, mode: 'live', event: 'held', entry: st.entry, newSl: st.floor, oldSl: Number(body.stopLoss) || null, detail: 'a stop of ' + body.stopLoss + ' was held at the guard\'s floor ' + st.floor });
+      pgLog({ symbol: body.symbol, side, profile: st.profile, mode: 'live', event: 'held', entry: st.entry, newSl: floor, oldSl: Number(body.stopLoss) || null, detail: 'a stop of ' + body.stopLoss + ' was held at the floor ' + floor });
       return { ...body, stopLoss: String(use) };
     } catch { return body; }
   }
@@ -1757,7 +1994,9 @@ function init(deps) {
       ['master_log', `created_at < now() - ($1 || ' days')::interval`, days]);
     jobs.push(
       ['audit_log', `at < now() - ($1 || ' days')::interval`, adays],
-      ['profit_guard_log', `at < now() - ($1 || ' days')::interval`, adays]);
+      ['profit_guard_log', `at < now() - ($1 || ' days')::interval`, adays],
+      ['sentinel_log', `at < now() - ($1 || ' days')::interval`, adays],
+      ['trade_path', `at < now() - ($1 || ' days')::interval`, Math.max(7, Number(process.env.SENTINEL_PATH_DAYS) || 30)]);   // sentinel_trades is never pruned
     for (const [table, cond, d] of jobs) {
       try { out[table] = await batch(table, cond, String(d)); }
       catch (e) { out[table] = -1; console.error('[multiuser] retention ' + table + ':', e.message); }
@@ -1775,7 +2014,9 @@ function init(deps) {
     setInterval(() => alertSweep().catch(e => console.error('[multiuser] alert sweep:', e.message)), Number(process.env.ALERT_SWEEP_MS) || 20000);   // retries failed deliveries and sends the short safety-net alerts
     setInterval(() => q(`DELETE FROM bot_msgs WHERE created_at < now() - interval '30 days'`).catch(() => {}), 6 * 3600 * 1000);
     const pgLoop = () => { pgTick().catch(e => console.error('[multiuser] profit guard:', e.message)).finally(() => { const t = setTimeout(pgLoop, Math.max(3000, (pgCfg.pollSec || 5) * 1000)); if (t.unref) t.unref(); }); };
-    setTimeout(pgLoop, 15000);   // Profit Guard loop (does nothing while it is switched off)
+    setTimeout(pgLoop, 15000);
+    const snLoop = () => { snTick().catch(e => console.error('[multiuser] sentinel:', e.message)).finally(() => { const t = setTimeout(snLoop, Math.max(3000, (snCfg.pollSec || 5) * 1000)); if (t.unref) t.unref(); }); };
+    setTimeout(snLoop, 17000);   // Trade Sentinel loop (does nothing while it is switched off)   // Profit Guard loop (does nothing while it is switched off)
     setInterval(() => checkSignalAlarms().catch(e => console.error('[multiuser] signal alarm:', e.message)), Number(process.env.ALERT_SWEEP_MS) || 20000);
     setTimeout(() => syncAll().catch(e => console.error('[multiuser] initial sync:', e.message)), 20000);
     setInterval(() => syncAll().catch(e => console.error('[multiuser] sync:', e.message)), SYNC_INTERVAL_MS);
@@ -2571,6 +2812,35 @@ function init(deps) {
     res.json({ success: true, ...(await pgView()) });
   }));
 
+  // Trade Sentinel: settings, what it is watching, its log and scorecard, the self-backfill from history, and the weight suggestion.
+  app.get('/api/admin/sentinel', adminAuth, h(async (req, res) => { res.json({ success: true, ...(await snView()) }); }));
+  app.post('/api/admin/sentinel', adminAuth, h(async (req, res) => {
+    const b = req.body || {};
+    if (b.mode !== undefined && !SN.MODES.includes(b.mode)) return res.status(400).json({ success: false, message: 'mode must be off, shadow or live' });
+    const next = SN.normalize({ ...snCfg, ...b, th: { ...snCfg.th, ...(b.th || {}) }, loss: { ...snCfg.loss, ...(b.loss || {}) }, profit: { ...snCfg.profit, ...(b.profit || {}) }, label: { ...snCfg.label, ...(b.label || {}) }, limits: { ...snCfg.limits, ...(b.limits || {}) },
+      fast: { ...snCfg.fast, ...(b.fast || {}) }, swing: { ...snCfg.swing, ...(b.swing || {}) }, weights: b.weights ? { ...snCfg.weights, ...b.weights } : snCfg.weights });
+    for (const pr of ['fast', 'swing']) {
+      if (SN.effMode(next, pr) === 'live' && SN.effMode(snCfg, pr) !== 'live' && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'Going live lets the Sentinel move real stops on Bybit. Confirm it on the panel.' });
+    }
+    await q(`INSERT INTO meta(k,v) VALUES('sentinel',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(next)]);
+    const was = snCfg.mode; snCfg = next;
+    await audit('admin', 'sentinel_changed', null, req, was + ' -> ' + next.mode + ' ' + JSON.stringify({ th: next.th, loss: next.loss, profit: next.profit, weights: next.weights }));
+    res.json({ success: true, ...(await snView()) });
+  }));
+  app.post('/api/admin/sentinel/backfill', adminAuth, h(async (req, res) => {
+    const r = await snBackfill(req.body || {});
+    res.json({ success: true, ...r, ...(await snView()) });
+  }));
+  app.post('/api/admin/sentinel/apply-fit', adminAuth, h(async (req, res) => {   // the server reads its own stored suggestion: nothing is taken from the page
+    const row = await q(`SELECT v FROM meta WHERE k='sentinel_fit'`); const fit = row.rows[0] ? JSON.parse(row.rows[0].v) : null;
+    if (!fit || !fit.weights) return res.status(400).json({ success: false, message: 'There is no weight suggestion to apply yet.' });
+    if ((SN.effMode(snCfg, 'fast') === 'live' || SN.effMode(snCfg, 'swing') === 'live') && (req.body || {}).confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'This changes the live danger score. Confirm it on the panel.' });
+    const next = SN.normalize({ ...snCfg, weights: fit.weights });
+    await q(`INSERT INTO meta(k,v) VALUES('sentinel',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(next)]);
+    snCfg = next; await audit('admin', 'sentinel_fit_applied', null, req, JSON.stringify(next.weights));
+    res.json({ success: true, ...(await snView()) });
+  }));
+
   // signal-first view: one row per bot signal with what the bot said, whether the order reached the relay, the master result and the copies
   app.get('/api/admin/signal-ledger', adminAuth, h(async (req, res) => {
     const hours = Math.min(168, Math.max(1, parseInt(req.query.hours, 10) || 24));
@@ -2738,7 +3008,7 @@ function init(deps) {
   app.get('/admin', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
   app.get('/s/:token', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'share.html')));
 
-  return { enabled: true, canPersist: true, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, pruneOldRows, pgTune: pgTuneEval, pgAutoTune, pgTick, pgState, pgWatch, pgClosing, pgRun, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
+  return { enabled: true, canPersist: true, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, pruneOldRows, pgTune: pgTuneEval, pgAutoTune, pgTick, pgState, pgWatch, pgClosing, pgRun, snTick, snState, snRun, snBackfill, snView, getSnCfg: () => snCfg, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
 }
 
 module.exports = { init };

@@ -27,6 +27,7 @@
   .seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;padding:2px;gap:2px;background:var(--bg)}
   .seg button{border:0;background:transparent;color:var(--mist);padding:6px 12px;border-radius:8px;font-size:12px;cursor:pointer}
   .seg button[aria-pressed="true"]{background:var(--signal);color:#fff}
+  .meter{display:inline-block;width:64px;height:6px;border-radius:999px;background:var(--inset);border:1px solid var(--line);overflow:hidden;vertical-align:middle}.meter i{display:block;height:100%;background:var(--long);transition:width .3s}.meter.watch i,.meter.alert i{background:var(--pending)}.meter.danger i{background:var(--short)}
   .chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:11px;color:var(--mist);white-space:nowrap;background:transparent;font-family:inherit}
   .chip.long{color:var(--long);border-color:#1d5a37}.chip.warn{color:var(--pending);border-color:#6b5320}.chip.short{color:var(--short);border-color:#6b2a2a}
   .chip.btnlike{cursor:pointer}.chip.btnlike[aria-pressed="true"]{background:var(--signal);border-color:var(--signal);color:#fff}
@@ -284,6 +285,7 @@ function loadTab(){
     jobs.push(jq('/api/admin/plan/history?limit=12').then(function(r){S.hist=r&&r.success?r:null}));
     jobs.push(jq('/api/admin/orders/summary?hours=24').then(function(r){S.drySummary=r&&r.success?r.users:null}));
     jobs.push(jq('/api/admin/profit-guard').then(function(r){S.pg=r&&r.success?r:S.pg}));
+    jobs.push(jq('/api/admin/sentinel').then(function(r){S.sn=r&&r.success?r:S.sn}));
   }
   if(t==='activity'){
     jobs.push(loadOrders());
@@ -534,7 +536,7 @@ function viewPlan(){
   h+='</div><div class="stack sticky"><div class="card" id="review">'+reviewHtml()+'</div>';
   h+='<div class="card" id="planPreviewCard">'+previewHtml(d)+'</div>';
   h+='<div class="card"><h2 style="margin:0 0 8px">Dry run</h2><div class="line" style="padding-top:0"><span>'+(S.dryAll?'<b class="warn">On for everyone.</b> No orders are being sent.':'Off for everyone.')+'</span><label class="sw"><input type="checkbox" data-dryplan '+(S.dryAll?'checked':'')+' aria-label="Dry run for everyone"><i></i></label></div>'+dryTable()+'</div>';
-  h+=guardCard();
+  h+=guardCard();h+=sentinelCard();
   h+='<div class="card"><h2 style="margin:0 0 8px">Version history</h2>'+histHtml()+'</div></div></div>';
   return h;
 }
@@ -691,6 +693,53 @@ function pgSettingsBody(){
   return o;
 }
 function pgNum(v,d){var n=Number(v);return isFinite(n)?n.toFixed(d===undefined?2:d):'–'}
+function snPost(body,msg){return j('/api/admin/sentinel','POST',body).then(function(r){if(r.success){S.sn=r;S.snPending=null;toast(msg||'Saved');render()}else if(/Confirm/.test(r.message||'')){S.snPending={body:body,msg:msg,why:r.message};render()}else toast(r.message||'Could not save');return r}).catch(function(){toast('Could not reach the server')})}
+function snSettingsBody(){
+  var g=function(id){var e=$('#'+id);return e?Number(e.value):NaN},c=function(id){var e=$('#'+id);return !!(e&&e.checked)};
+  return {alerts:c('sn-alerts'),th:{watch:g('sn-watch'),alert:g('sn-alert'),danger:g('sn-danger')},loss:{alertR:g('sn-lossr')},profit:{startR:g('sn-startr'),dangerKeep:g('sn-keep')/100},limits:{maxMoves:g('sn-moves')},
+    fast:{stallMin:g('sn-stall-fast')},swing:{stallMin:g('sn-stall-swing')}};
+}
+function snPoll(){if(S.snTimer)return;S.snTimer=setInterval(function(){jq('/api/admin/sentinel').then(function(r){if(r&&r.success){S.sn=r;var run=r.backfill&&r.backfill.running;render();if(!run){clearInterval(S.snTimer);S.snTimer=null}}})},4000)}
+function sentinelCard(){
+  var P=S.sn,h='<div class="card" id="sncard"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0 0 4px">Trade Sentinel</h2>';
+  if(!P)return h+'</div><p class="mist small">Loading…</p></div>';
+  var C=P.cfg,R=P.run||{},B=P.backfill||{},F=P.fit;
+  h+=(C.mode==='live'?'<span class="chip long">LIVE</span>':C.mode==='shadow'?'<span class="chip warn">SHADOW · testing only</span>':'<span class="chip">OFF</span>')+'</div>';
+  h+='<p class="mist small" style="margin:0 0 10px">Scores every open trade for the “slowly into profit, then hard reversal” pattern. At <b>alert</b> and <b>danger</b> it can only <b>tighten</b> the stop on Bybit (never loosen it, never close anything itself). <b>Shadow</b> records what it would have done so you can judge it first. Works next to the Profit Guard and shares its stop floor.</p>';
+  h+='<div class="line" style="padding-top:0"><span><b>Overall</b><br><span class="hint2">Off switches everything off. Each profile below follows this unless you set it separately.</span></span></div><div class="seg" role="group" aria-label="Sentinel overall mode">'+[['off','Off'],['shadow','Shadow'],['live','Live']].map(function(m){return '<button data-act="snMode" data-v="'+m[0]+'" aria-pressed="'+(C.mode===m[0])+'">'+m[1]+'</button>'}).join('')+'</div>';
+  if(S.snPending)h+='<div class="box red" style="margin-top:8px">'+esc(S.snPending.why||'This acts on real money.')+'<div class="btns" style="margin-top:8px"><button class="btn pri" data-act="snConfirm">Confirm</button><button class="btn" data-act="snCancel">Cancel</button></div></div>';
+  if(C.mode!=='off'&&(R.relayMode!=='live'||R.halted))h+='<div class="box" style="margin-top:8px">Paused: '+(R.halted?'trading is halted.':'the relay is not in live trading mode.')+'</div>';
+  if(R.ok===false&&R.err)h+='<div class="box red" style="margin-top:8px">Last check failed: '+esc(R.err)+'</div>';
+  h+='<h3 style="margin:14px 0 4px;font-size:13px">Trades being watched</h3>';
+  h+=P.trades.length?P.trades.map(function(t){var L=t.side==='Buy',s=Math.max(0,Math.min(100,Number(t.score)||0));return '<div class="line"><span style="min-width:0"><b>'+esc(coinOf(t.symbol))+'</b> <span class="'+(L?'long':'short')+'">'+(L?'LONG':'SHORT')+'</span> <span class="mist">· '+esc(t.profile)+' · '+esc(t.mode||'')+' · '+esc(t.label||'')+'</span><br><span class="hint2">'+(t.peakR===null||t.peakR===undefined?'Not enough data to judge yet':'Best '+pgNum(t.peakR)+'R · now '+pgNum(t.nowR)+'R · '+(t.moves||0)+' stop move(s)')+(t.why?' · '+esc(t.why):'')+'</span></span><span style="display:flex;align-items:center;gap:8px"><span class="meter '+esc(t.state||'calm')+'" role="img" aria-label="danger score '+s+' of 100"><i style="width:'+s+'%"></i></span><span class="chip'+(t.state==='danger'?' short':t.state==='alert'?' warn':'')+'">'+esc(t.state||'calm')+' '+(t.score===null||t.score===undefined?'–':pgNum(t.score,0))+'</span></span></div>'}).join(''):'<p class="mist small">No open trade is being watched right now.</p>';
+  [['fast','Fast trades'],['swing','Swing trades']].forEach(function(pp){var c=C[pp[0]];
+    h+='<h3 style="margin:16px 0 4px;font-size:13px">'+pp[1]+'</h3><div class="seg" role="group" aria-label="'+pp[1]+' mode">'+[['inherit','Follow overall'],['off','Off'],['shadow','Shadow'],['live','Live']].map(function(m){return '<button data-act="snProf" data-p="'+pp[0]+'" data-v="'+m[0]+'" aria-pressed="'+(c.mode===m[0])+'">'+m[1]+'</button>'}).join('')+'</div>'});
+  h+='<h3 style="margin:16px 0 4px;font-size:13px">When it acts</h3><div class="fgrid">'
+    +'<div><label class="l" for="sn-watch">Watch from score</label><input type="number" step="1" id="sn-watch" value="'+esc(C.th.watch)+'"></div>'
+    +'<div><label class="l" for="sn-alert">Alert from score</label><input type="number" step="1" id="sn-alert" value="'+esc(C.th.alert)+'"></div>'
+    +'<div><label class="l" for="sn-danger">Danger from score</label><input type="number" step="1" id="sn-danger" value="'+esc(C.th.danger)+'"></div>'
+    +'<div><label class="l" for="sn-lossr">Alert, trade not in profit: stop to −R</label><input type="number" step="0.05" id="sn-lossr" value="'+esc(C.loss.alertR)+'"></div>'
+    +'<div><label class="l" for="sn-startr">Counts as “in profit” from (R)</label><input type="number" step="0.05" id="sn-startr" value="'+esc(C.profit.startR)+'"></div>'
+    +'<div><label class="l" for="sn-keep">Danger, in profit: keep % of best</label><input type="number" step="5" id="sn-keep" value="'+Math.round(C.profit.dangerKeep*100)+'"></div>'
+    +'<div><label class="l" for="sn-moves">Most stop moves per trade</label><input type="number" step="1" id="sn-moves" value="'+esc(C.limits.maxMoves)+'"></div>'
+    +'<div><label class="l" for="sn-stall-fast">Quiet period, fast (min)</label><input type="number" step="5" id="sn-stall-fast" value="'+esc(C.fast.stallMin)+'"></div>'
+    +'<div><label class="l" for="sn-stall-swing">Quiet period, swing (min)</label><input type="number" step="30" id="sn-stall-swing" value="'+esc(C.swing.stallMin)+'"></div></div>';
+  h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="sn-alerts"'+(C.alerts?' checked':'')+'> Send one Telegram message per trade the first time it reaches alert.</label>';
+  h+='<div class="btns" style="margin-top:10px"><button class="btn pri" data-act="snSave">Save settings</button></div>';
+  h+='<h3 style="margin:16px 0 4px;font-size:13px">Learn from your past trades <span class="chip">no upload needed</span></h3><p class="mist small" style="margin:0 0 6px">The server reads its own closed bot signals and replays each trade over Bybit’s public 1-minute candles, then checks which warning signs really came before a reversal. It suggests new weights; nothing changes until you press Apply.</p>';
+  h+='<div class="btns"><button class="btn" data-act="snBackfill"'+(B.running?' disabled':'')+'>'+(B.running?'Replaying… '+(B.done||0)+' of '+(B.total||'?'):'Replay my history')+'</button></div>';
+  if(B.note&&!B.running)h+='<p class="mist small" style="margin:6px 0">'+esc(B.note)+'</p>';
+  if(B.err)h+='<div class="box red" style="margin-top:8px">Replay failed: '+esc(B.err)+'</div>';
+  if(F){var pct=function(v){return v===null||v===undefined?'–':Math.round(v*100)+'%'};
+    h+='<div class="line"><span style="min-width:0"><b>Last replay</b> <span class="mist">· '+(F.trades||0)+' trades · '+(F.traps||0)+' reached the original stop · '+ago(new Date(F.at).toISOString())+'</span><br><span class="hint2">'+(F.weights?'Current weights catch '+pct(F.before&&F.before.recall)+' of the danger points; suggested weights catch '+pct(F.after&&F.after.recall)+' (precision '+pct(F.before&&F.before.precision)+' → '+pct(F.after&&F.after.precision)+'). This is measured on the same trades it learned from, so treat it as a hint, not proof.':esc(F.note||''))+'</span></span>'+(F.weights?'<button class="btn" data-act="snApplyFit">Apply</button>':'')+'</div>'}
+  var SC=P.scorecard||{recent:[],summary:[]};
+  h+='<h3 style="margin:16px 0 4px;font-size:13px">Scorecard <span class="mist small">(closed trades: what the Sentinel would have done, or did, against what happened)</span></h3>';
+  h+=SC.summary.length?SC.summary.map(function(x){return '<div class="line"><span><b>'+esc(x.mode)+'</b> <span class="mist">· '+x.n+' trade(s) · '+x.alerted+' reached alert</span></span><span class="mist small">average real result '+pgNum(x.avg_exit_r)+'R'+(x.shadow_hits?' · where the shadow stop was touched it would have been '+pgNum(x.avg_shadow_exit_r)+'R ('+x.shadow_hits+')':'')+'</span></div>'}).join(''):'<p class="mist small">Nothing yet. Closed trades appear here once the Sentinel has watched them.</p>';
+  h+=SC.recent.slice(0,6).map(function(x){return '<div class="line"><span style="min-width:0"><b>'+esc(coinOf(x.symbol))+'</b> <span class="mist">'+esc(x.mode)+' · '+esc(x.label||'')+' · '+ago(x.at)+'</span></span><span class="mist small">best '+pgNum(x.peak_r)+'R · top score '+pgNum(x.max_score,0)+' · '+(x.exit_r===null?'result unknown':'result '+pgNum(x.exit_r)+'R')+(x.shadow_exit_r!==null&&x.shadow_exit_r!==undefined?' · shadow exit '+pgNum(x.shadow_exit_r)+'R':'')+'</span></div>'}).join('');
+  h+='<h3 style="margin:16px 0 4px;font-size:13px">Recent activity</h3>';
+  h+=P.log.length?P.log.slice(0,10).map(function(x){return '<div class="line"><span style="min-width:0"><b>'+esc(coinOf(x.symbol))+'</b> <span class="mist">'+esc(x.event)+' · '+esc(x.mode||'')+' · '+ago(x.at)+'</span><br><span class="hint2">'+esc(x.detail||'')+'</span></span></div>'}).join(''):'<p class="mist small">No activity yet.</p>';
+  return h+'</div>';
+}
 function guardCard(){
   var P=S.pg,h='<div class="card" id="pgcard"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0 0 4px">Profit Guard</h2>';
   if(!P)return h+'</div><p class="mist small">Loading…</p></div>';
@@ -897,6 +946,13 @@ document.addEventListener('click',function(e){
   if(a==='pgSave'){pgPost(pgSettingsBody(),'Settings saved');return}
   if(a==='pgConfirm'){var pend=S.pgPending;if(pend)pgPost(Object.assign({},pend.body,{confirm:'LIVE'}),pend.msg);return}
   if(a==='pgCancel'){S.pgPending=null;render();return}
+  if(a==='snMode'){var sm=t.getAttribute('data-v');snPost({mode:sm},sm==='live'?'Sentinel is LIVE':sm==='shadow'?'Shadow mode: recording only':'Sentinel is off');return}
+  if(a==='snProf'){var sp=t.getAttribute('data-p'),sv=t.getAttribute('data-v'),sb={};sb[sp]={mode:sv};snPost(sb,sp+': '+(sv==='inherit'?'follows the overall mode':sv));return}
+  if(a==='snSave'){snPost(snSettingsBody(),'Settings saved');return}
+  if(a==='snConfirm'){var sd=S.snPending;if(sd)snPost(Object.assign({},sd.body,{confirm:'LIVE'}),sd.msg);return}
+  if(a==='snCancel'){S.snPending=null;render();return}
+  if(a==='snBackfill'){j('/api/admin/sentinel/backfill','POST',{days:60,max:120}).then(function(r){if(r&&r.success){S.sn=r;toast(r.started?'Replaying your history…':'Already running');render();snPoll()}else toast((r&&r.message)||'Could not start')});return}
+  if(a==='snApplyFit'){j('/api/admin/sentinel/apply-fit','POST',{}).then(function(r){if(r&&r.success){S.sn=r;toast('Weights updated');render()}else if(/Confirm/.test((r&&r.message)||'')){j('/api/admin/sentinel/apply-fit','POST',{confirm:'LIVE'}).then(function(r2){if(r2&&r2.success){S.sn=r2;toast('Weights updated');render()}else toast((r2&&r2.message)||'Could not apply')})}else toast((r&&r.message)||'Could not apply')});return}
   if(a==='arMode'){var m=t.getAttribute('data-v');arPost({mode:m,hours:m==='live'?0:Number(S.arHours)},m==='live'?'Live: alerts go where the table says':m==='dev'?'Dev mode: the group is silent':'Telegram is off');return}
   if(a==='arHours'){S.arHours=Number(t.getAttribute('data-v'));if(S.ar&&S.ar.mode!=='live')arPost({mode:S.ar.mode,hours:S.arHours},'Timer updated');else render();return}
   if(a==='arChats'){arPost({groupChat:($('#ar-group')||{}).value||'',dmChat:($('#ar-dm')||{}).value||''},'Chat ids saved');return}
