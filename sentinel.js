@@ -186,10 +186,14 @@ function decide(i) {
   const limit = long ? mark - gap : mark + gap;                                   // never closer to the price than this
   let target, label;
   if (inProfit) {
-    if (i.state === 'alert') { target = be; label = 'alert: breakeven'; }
-    else {
-      const keep = long ? entry + cfg.profit.dangerKeep * peakDist : entry - cfg.profit.dangerKeep * peakDist;
-      target = long ? Math.max(be, keep) : Math.min(be, keep); label = 'danger: keep ' + Math.round(cfg.profit.dangerKeep * 100) + '% of the peak';
+    const kf = Number(i.keepFrac) > 0 ? Number(i.keepFrac) : 0;                    // the Profit Guard curve's share for THIS trade (when given): alert keeps it, danger keeps 15 points more
+    if (i.state === 'alert') {
+      const keepA = kf ? (long ? entry + kf * peakDist : entry - kf * peakDist) : be;
+      target = long ? Math.max(be, keepA) : Math.min(be, keepA); label = kf ? 'alert: keep ' + Math.round(kf * 100) + '% of the peak (curve)' : 'alert: breakeven';
+    } else {
+      const f = kf ? Math.max(cfg.profit.dangerKeep, Math.min(0.85, kf + 0.15)) : cfg.profit.dangerKeep;
+      const keep = long ? entry + f * peakDist : entry - f * peakDist;
+      target = long ? Math.max(be, keep) : Math.min(be, keep); label = 'danger: keep ' + Math.round(f * 100) + '% of the peak' + (kf ? ' (curve)' : '');
     }
   } else if (i.state === 'alert') { target = long ? entry - cfg.loss.alertR * risk : entry + cfg.loss.alertR * risk; label = 'alert: stop to -' + cfg.loss.alertR + 'R'; }
   else { target = limit; label = 'danger: stop just behind the price'; }

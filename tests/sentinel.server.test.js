@@ -26,7 +26,7 @@ function build() {
     getClosedPnL: async () => ({ retCode: 0, result: { list: rec.closedPnl } }),
   };
   const deps = {
-    SN, PG, snCfg: SN.normalize({ mode: 'shadow' }), pgCfg: PG.defaults(), snState: new Map(), restClient,
+    SN, PG, snCfg: SN.normalize({ mode: 'shadow' }), pgCfg: PG.defaults(), snState: new Map(), pgState: new Map(), guardsMaster: true, restClient,
     q: async (text, params) => { rec.q.push({ text, params }); return { rows: [], rowCount: 0 }; },
     ready: Promise.resolve(), getMode: () => 'live', breakerIsTripped: () => false,
     listOpenPositions: async () => st.positions, getInstrument: async () => ({ tickSize: 0.01 }),

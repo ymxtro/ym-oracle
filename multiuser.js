@@ -335,6 +335,7 @@ function init(deps) {
   let snCfg = SN.defaults();            // Trade Sentinel settings (off until switched on from the admin console)
   let pgCfg = PG.defaults();            // Profit Guard settings (off until switched on from the admin console)
   const pgWatch = new Map();            // re-entry watches (recording only); filled and used further down
+  let guardsMaster = true;              // MASTER SWITCH: off = Profit Guard, Sentinel, the stop floor and the early slice all do nothing and trades run on their own stops
   const snState = new Map();            // Trade Sentinel: 'SYMBOL|Side' -> what it knows about that open trade
   const pgState = new Map();            // 'SYMBOL|Buy' -> { entry, initialSl, peak, floor, shadowSl, profile, ... } for every trade being watched
   // deliverAlert (optional dep) = async text => { ok, configured, telegram, email }: waits for the real result. Falls back to fire-and-forget sendAlert.
@@ -585,9 +586,10 @@ function init(deps) {
       catch (e) { console.error('[multiuser] alert routes not loaded, using defaults:', e.message); }
     }
     try {                                                // Profit Guard: saved settings and the peaks/floors of trades that were open (so a restart forgets nothing)
-      const pg = await q(`SELECT k, v FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch','sentinel','sentinel_state')`);
+      const pg = await q(`SELECT k, v FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch','sentinel','sentinel_state','guards_master')`);
       for (const row of pg.rows) {
-        if (row.k === 'profit_guard') pgCfg = PG.normalize(JSON.parse(row.v));
+        if (row.k === 'guards_master') guardsMaster = JSON.parse(row.v).on !== false;
+        else if (row.k === 'profit_guard') pgCfg = PG.normalize(JSON.parse(row.v));
         else if (row.k === 'sentinel') snCfg = SN.normalize(JSON.parse(row.v));
         else if (row.k === 'sentinel_state') { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) snState.set(k, v); }
         else if (row.k === 'profit_guard_watch') { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) pgWatch.set(k, v); }
@@ -1530,6 +1532,7 @@ function init(deps) {
   }
   async function pgTick() {
     if (pgRun.busy || pgCfg.mode === 'off') return;
+    if (!guardsMaster) { pgRun.note = 'master switch is off: trades run on their own stops'; return; }
     if (getMode() !== 'live' || breakerIsTripped()) { pgRun.note = 'paused: the relay is not live or trading is halted'; return; }
     pgRun.busy = true;
     try {
@@ -1595,18 +1598,50 @@ function init(deps) {
 
         // ---- profit lock ----
         // ADAPT: the pair's own speed (1-minute ATR) and BTC's direction, from the candles the Sentinel already keeps. If they cannot be read, the plain rules apply.
-        let adaptNow = {};
-        if (pgCfg.smart.adapt && pgCfg.smart.adapt.on) {
+        let adaptNow = {}, curveNow = {};
+        if ((pgCfg.smart.adapt && pgCfg.smart.adapt.on) || (pgCfg.smart.curve && pgCfg.smart.curve.on)) {
           try {
             const bars = await snBars(symbol), btcRaw = await snBtcMove();
-            const risk0 = st.initialSl > 0 ? Math.abs(entry - st.initialSl) : 0, peakR0 = risk0 > 0 ? Math.max(0, (long ? st.peak - entry : entry - st.peak) / risk0) : 0;
-            adaptNow = PG.adaptOf(pgCfg, { atr: SN.atrOf(bars), btcPct: long ? btcRaw : -btcRaw, peakR: peakR0, maxPull: st.maxPull });
-            st.adapt = { atrPct: adaptNow.atrPrice ? Math.round(adaptNow.atrPrice / pgCfg.smart.adapt.atrMult / mark * 10000) / 100 : null, keepAdj: adaptNow.keepAdj || 0 };
-          } catch { adaptNow = {}; }
+            const risk0 = st.initialSl > 0 ? Math.abs(entry - st.initialSl) : 0, peakD0 = long ? st.peak - entry : entry - st.peak, peakR0 = risk0 > 0 ? Math.max(0, peakD0 / risk0) : 0;
+            const btcDir = long ? btcRaw : -btcRaw;
+            adaptNow = PG.adaptOf(pgCfg, { atr: SN.atrOf(bars), btcPct: btcDir, peakR: peakR0, maxPull: st.maxPull });
+            const sn0 = snState.get(key), snSig = sn0 && sn0.mem && snEm(sn0) !== 'off' && Date.now() - (sn0.seenAt || 0) < 60000 ? { state: sn0.mem.state } : null;
+            curveNow = PG.curveOf(pgCfg, { btcPct: btcDir, peakDist: peakD0, maxPull: st.maxPull, pullNow: long ? st.peak - mark : mark - st.peak, atr: SN.atrOf(bars), sn: snSig });
+            st.curveWhy = curveNow.curveWhy || '';
+            st.adapt = { atrPct: adaptNow.atrPrice ? Math.round(adaptNow.atrPrice / pgCfg.smart.adapt.atrMult / mark * 10000) / 100 : null, keepAdj: adaptNow.keepAdj || 0, curveMul: curveNow.curveMul || null };
+          } catch { adaptNow = {}; curveNow = {}; }
+        }
+        // ---- early slice: bank a share once the trade is a little over 1R; the size and the trigger follow the same per-trade room reading as the curve ----
+        const slc = !pf.scale.on && st.initialSl > 0 && !PG_BAD_RISK(long, entry, st.initialSl) ? PG.sliceOf(pgCfg, { mul: curveNow.curveMul }) : null;
+        if (slc) {
+          const riskS = Math.abs(entry - st.initialSl), curRS = (long ? mark - entry : entry - mark) / riskS, flag = em === 'live' ? 'sliced' : 'slicedShadow';
+          st.slicePlan = { atR: slc.atR, frac: slc.frac, why: slc.why };
+          if (!st[flag] && curRS >= slc.atR && Date.now() >= (st.scaleRetryAt || 0)) {
+            const note = Math.round(slc.frac * 100) + '% at ' + curRS.toFixed(2) + 'R (' + slc.why + ')';
+            if (em === 'shadow') { st[flag] = true; st.dirty = true; await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'would_scale', entry, mark, peakR: curRS, detail: 'early slice: would take ' + note }); }
+            else {
+              const qty = PG.sliceQty(p.size, slc.frac, inst && inst.qtyStep, inst && inst.minQty);
+              if (!qty) { st[flag] = true; st.dirty = true; await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'scale_skipped', entry, mark, detail: 'early slice: position too small to split' }); }
+              else {
+                let res = null, err = null;
+                try { res = await restClient.submitOrder({ category: 'linear', symbol, side: long ? 'Sell' : 'Buy', orderType: 'Market', qty: String(qty), reduceOnly: true, positionIdx: Number(p.positionIdx) || 0 }); }
+                catch (e) { err = e.message || String(e); }
+                if (res && res.retCode === 0) {
+                  st[flag] = true; st.scaled.push('slice'); st.dirty = true; pgForce = true; pgRun.scales++;
+                  await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'scaled', entry, mark, peakR: curRS, detail: 'early slice: took ' + note + ' (' + qty + ')' });
+                  fanOutPartialClose(symbol, side, slc.frac, inst).catch(e => console.error('[multiuser] early slice fan-out:', e.message));
+                  if (pgCfg.alerts) deliverAlert('💰 Profit banked: ' + symbol.replace(/USDT$/, '') + ' ' + (long ? 'long' : 'short') + ' ' + Math.round(slc.frac * 100) + '% closed at ' + curRS.toFixed(1) + 'R. The rest keeps running with its stop.', { cat: 'updates' }).catch(() => {});
+                } else {
+                  st.scaleRetryAt = Date.now() + 60000;
+                  await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'failed', entry, mark, detail: 'early slice: ' + (err || (res && res.retMsg) || 'no answer') });
+                }
+              }
+            }
+          }
         }
         const eff = em === 'shadow' && st.shadowSl > 0 ? (long ? Math.max(curSl, st.shadowSl) : (curSl > 0 ? Math.min(curSl, st.shadowSl) : st.shadowSl)) : curSl;
         const d = PG.decide({ side, entry, mark, peak: st.peak, curSl: eff, initialSl: st.initialSl, tick: inst && inst.tickSize || 0, profile: pf, cfg: pgCfg,
-          smart: { ...PG.noiseOf(pgCfg, st.maxPull), ...adaptNow, stallExtra: PG.stallExtra(pgCfg, st.profile, Date.now(), st.peakAt) } });
+          smart: { ...PG.noiseOf(pgCfg, st.maxPull), ...adaptNow, ...curveNow, stallExtra: PG.stallExtra(pgCfg, st.profile, Date.now(), st.peakAt) } });
         st.lastWhy = d.action === 'raise' ? d.label : d.why; st.peakR = d.peakR !== undefined ? d.peakR : st.peakR;
         if (em === 'shadow' && st.shadowSl > 0 && !st.shadowHit && (long ? mark <= st.shadowSl : mark >= st.shadowSl)) {
           st.shadowHit = true;
@@ -1726,6 +1761,7 @@ function init(deps) {
   }
   async function snTick() {
     if (snRun.busy || snCfg.mode === 'off') return;
+    if (!guardsMaster) { snRun.note = 'master switch is off: trades run on their own stops'; return; }
     if (getMode() !== 'live' || breakerIsTripped()) { snRun.note = 'paused: the relay is not live or trading is halted'; return; }
     snRun.busy = true;
     const pathRows = [];
@@ -1747,7 +1783,7 @@ function init(deps) {
           st = { entry, initialSl: init, peak: entry, peakAt: created, entryAt: created, profile: PG.profileOf(pgCfg, lk.eng, lk.bot), bot: lk.bot, since: now, mem: { state: 'calm', want: null, n: 0 }, moves: 0, lastMoveAt: 0, floor: 0, shadowSl: 0, shadowHit: false, label: 'unlabeled', maxScore: 0, alerted: false };
           snState.set(key, st);
         }
-        st.mark = mark; st.curSl = curSl;
+        st.mark = mark; st.curSl = curSl; st.seenAt = Date.now();
         const em = snEm(st); st.em = em;
         if (em === 'off') { st.why = 'switched off for this profile'; continue; }
         let bars;
@@ -1786,7 +1822,9 @@ function init(deps) {
         if ((st.moves || 0) >= snCfg.limits.maxMoves || now - (st.lastMoveAt || 0) < snCfg.limits.moveGapSec * 1000) { st.why = 'move limit or pause between moves'; continue; }
         const inst = await getInstrument(symbol).catch(() => null);
         const eff = em === 'shadow' && st.shadowSl > 0 ? (long ? Math.max(curSl, st.shadowSl) : (curSl > 0 ? Math.min(curSl, st.shadowSl) : st.shadowSl)) : curSl;
-        const d = SN.decide({ side, entry, mark, peak: st.peak, curSl: eff, initialSl: st.initialSl, tick: inst && inst.tickSize || 0, atr: f.atr, state: st.mem.state, cfg: snCfg });
+        let keepFrac = 0;
+        try { const g0 = pgState.get(key), cm = PG.curveOf(pgCfg, { btcPct, peakDist: long ? st.peak - entry : entry - st.peak, maxPull: g0 ? g0.maxPull : undefined, pullNow: long ? st.peak - mark : mark - st.peak, atr: f.atr, sn: { state: st.mem.state } }); keepFrac = PG.curveKeep(pgCfg, f.peakR, cm.curveMul) || 0; } catch { keepFrac = 0; }
+        const d = SN.decide({ side, entry, mark, peak: st.peak, curSl: eff, initialSl: st.initialSl, tick: inst && inst.tickSize || 0, atr: f.atr, state: st.mem.state, cfg: snCfg, keepFrac });
         st.why = d.action === 'raise' ? d.label : d.why;
         if (d.action !== 'raise') continue;
         if (em === 'shadow') {
@@ -1874,12 +1912,13 @@ function init(deps) {
     const card = (await q(`SELECT at, symbol, side, mode, label, peak_r, max_score, first_alert_at, moves, shadow_exit_r, exit_r FROM sentinel_trades ORDER BY id DESC LIMIT 20`)).rows;
     const agg = (await q(`SELECT mode, COUNT(*)::int AS n, COUNT(first_alert_at)::int AS alerted, AVG(exit_r) AS avg_exit_r, AVG(shadow_exit_r) FILTER (WHERE shadow_exit_r IS NOT NULL) AS avg_shadow_exit_r, COUNT(shadow_exit_r)::int AS shadow_hits FROM sentinel_trades GROUP BY mode ORDER BY mode`)).rows;
     let fit = null; try { const r = await q(`SELECT v FROM meta WHERE k='sentinel_fit'`); if (r.rows[0]) fit = JSON.parse(r.rows[0].v); } catch { /* none yet */ }
-    return { cfg: snCfg, run: { at: snRun.at, ok: snRun.ok, note: snRun.note, err: snRun.err, positions: snRun.positions, moves: snRun.moves, relayMode: getMode(), halted: !!breakerIsTripped() }, trades, log, scorecard: { recent: card, summary: agg }, fit, backfill: { ...snBack } };
+    return { master: guardsMaster, cfg: snCfg, run: { at: snRun.at, ok: snRun.ok, note: snRun.note, err: snRun.err, positions: snRun.positions, moves: snRun.moves, relayMode: getMode(), halted: !!breakerIsTripped() }, trades, log, scorecard: { recent: card, summary: agg }, fit, backfill: { ...snBack } };
   }
   const PG_BAD_RISK = (long, entry, init) => !(init > 0) || (long ? init >= entry : init <= entry);
   // Called by the stop route before a bot's stop is applied: while the guard is live for that trade, a looser stop is held at the guard's floor (and a stop removal is refused).
   function guardClamp(body) {
     try {
+      if (!guardsMaster) return body;
       if (!body || typeof body !== 'object' || body.stopLoss === undefined) return body;
       const sym = String(body.symbol), cands = [];
       for (const side of ['Buy', 'Sell']) {                       // the tighter of the Profit Guard's and the Sentinel's floor, each only while it is live
@@ -1947,7 +1986,7 @@ function init(deps) {
     const re = (await q(`SELECT COUNT(*) FILTER (WHERE event='would_reenter')::int AS spotted, COUNT(*) FILTER (WHERE event='reentry_result')::int AS done, COUNT(*) FILTER (WHERE event='reentry_result' AND result_r>0)::int AS wins, AVG(result_r) FILTER (WHERE event='reentry_result') AS avg_r, COUNT(*) FILTER (WHERE event='no_reentry')::int AS none FROM profit_guard_log`)).rows[0];
     const watching = [...pgWatch.values()].map(w => ({ symbol: w.symbol, side: w.side, profile: w.profile, cand: !!w.cand, expiresAt: w.expiresAt }));
     const tuning = {}; for (const pr of ['fast', 'swing']) { try { const t = await pgTuneEval(pr); delete t.next; tuning[pr] = t; } catch { tuning[pr] = null; } }
-    return { cfg: pgCfg, tuning, run: { at: pgRun.at, ok: pgRun.ok, note: pgRun.note, err: pgRun.err, positions: pgRun.positions, raises: pgRun.raises, scales: pgRun.scales, relayMode: getMode(), halted: !!breakerIsTripped() }, trades, log, scorecard: { recent: card, summary: agg, reentry: re, watching } };
+    return { master: guardsMaster, cfg: pgCfg, tuning, run: { at: pgRun.at, ok: pgRun.ok, note: pgRun.note, err: pgRun.err, positions: pgRun.positions, raises: pgRun.raises, scales: pgRun.scales, relayMode: getMode(), halted: !!breakerIsTripped() }, trades, log, scorecard: { recent: card, summary: agg, reentry: re, watching } };
   };
 
   // ---------- CSV export + daily backup ----------
@@ -2817,12 +2856,12 @@ function init(deps) {
       await pgApplyTuning(pr, sug, 'admin');
       return res.json({ success: true, ...(await pgView()) });
     }
-    const sm = b.smart && typeof b.smart === 'object' ? { noise: { ...pgCfg.smart.noise, ...(b.smart.noise || {}) }, stall: { ...pgCfg.smart.stall, ...(b.smart.stall || {}) }, tune: { ...pgCfg.smart.tune, ...(b.smart.tune || {}), lastAtN: pgCfg.smart.tune.lastAtN } } : pgCfg.smart;
+    const sm = b.smart && typeof b.smart === 'object' ? { noise: { ...pgCfg.smart.noise, ...(b.smart.noise || {}) }, stall: { ...pgCfg.smart.stall, ...(b.smart.stall || {}) }, adapt: { ...pgCfg.smart.adapt, ...(b.smart.adapt || {}), mkt: { ...pgCfg.smart.adapt.mkt, ...((b.smart.adapt || {}).mkt || {}) } }, curve: { ...pgCfg.smart.curve, ...(b.smart.curve || {}) }, slice: { ...pgCfg.smart.slice, ...(b.smart.slice || {}) }, tune: { ...pgCfg.smart.tune, ...(b.smart.tune || {}), lastAtN: pgCfg.smart.tune.lastAtN } } : pgCfg.smart;
     const next = PG.normalize({ ...pgCfg, ...b, smart: sm, reentry: b.reentry ? { ...pgCfg.reentry, ...b.reentry } : pgCfg.reentry, fast: b.fast ? { ...pgCfg.fast, ...b.fast } : pgCfg.fast, swing: b.swing ? { ...pgCfg.swing, ...b.swing } : pgCfg.swing });
     if (next.smart.tune.mode === 'auto' && pgCfg.smart.tune.mode !== 'auto' && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'Auto-tuning changes the live stop rules by itself. Confirm it on the panel.' });
     for (const pr of ['fast', 'swing']) {      // anything that starts acting on real money needs the explicit confirm
       const goesLive = PG.effMode(next, pr) === 'live' && PG.effMode(pgCfg, pr) !== 'live';
-      const scaleLive = PG.effMode(next, pr) === 'live' && next[pr].scale.on && !(PG.effMode(pgCfg, pr) === 'live' && pgCfg[pr].scale.on);
+      const scaleLive = PG.effMode(next, pr) === 'live' && ((next[pr].scale.on && !(PG.effMode(pgCfg, pr) === 'live' && pgCfg[pr].scale.on)) || (next.smart.slice.on && !(PG.effMode(pgCfg, pr) === 'live' && pgCfg.smart.slice.on)));
       if ((goesLive || scaleLive) && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'This moves real stops or closes real positions on Bybit. Confirm it on the panel.' });
     }
     await q(`INSERT INTO meta(k,v) VALUES('profit_guard',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(next)]);
@@ -2839,7 +2878,7 @@ function init(deps) {
     if (liveCache.v && Date.now() - liveCache.at < 4000) return liveCache.v;
     await ready;
     const mode = getMode();
-    const out = { mode, at: Date.now(), trades: [], note: '' };
+    const out = { mode, at: Date.now(), trades: [], note: '', master: guardsMaster };
     if (mode !== 'live') { out.note = 'Paper mode: nothing is open on Bybit.'; liveCache = { at: Date.now(), v: out }; return out; }
     let positions;
     try { positions = await listOpenPositions(restClient); } catch (e) { out.note = 'Could not read positions from Bybit: ' + (e.message || e); return out; }
@@ -2867,17 +2906,34 @@ function init(deps) {
       out.trades.push({ symbol, side, bot: sig ? sig.bot : '', engine: sig ? sig.eng : null, entry, mark, peak, stopLoss: parseFloat(p.stopLoss) || 0, takeProfit: parseFloat(p.takeProfit) || (sig ? Number(sig.tp) : 0) || 0,
         initialSl, size, leverage: lev, upl: parseFloat(p.unrealisedPnl) || 0, margin: size * entry / lev, openedAt: created, atr,
         quality: as, trail,
-        profitGuard: gst ? { mode: gst.em || null, why: gst.lastWhy || '', shadowSl: gst.shadowSl || 0 } : null,
+        profitGuard: gst ? { mode: gst.em || null, why: gst.lastWhy || '', shadowSl: gst.shadowSl || 0, room: gst.curveWhy || '', slice: gst.slicePlan || null, sliced: !!(gst.sliced || gst.slicedShadow), slicedLive: !!gst.sliced } : null,
         sentinel: sst ? { mode: sst.em || null, state: sst.mem && sst.mem.state, score: sst.score === undefined ? null : sst.score } : null });
     }
     out.trades.sort((a, b) => ((a.quality && a.quality.score) ?? 999) - ((b.quality && b.quality.score) ?? 999));
     const sc = out.trades.map(t => t.quality && t.quality.score).filter(x => x !== null && x !== undefined);
+    out.master = guardsMaster;
     out.summary = { open: out.trades.length, upl: out.trades.reduce((t, x) => t + x.upl, 0), margin: out.trades.reduce((t, x) => t + x.margin, 0), avgScore: sc.length ? Math.round(sc.reduce((t, x) => t + x, 0) / sc.length) : null,
       bands: out.trades.reduce((o, x) => { const b = x.quality ? x.quality.band : 'unknown'; o[b] = (o[b] || 0) + 1; return o; }, {}) };
     liveCache = { at: Date.now(), v: out };
     return out;
   }
   app.get('/api/admin/live-trades', adminAuth, h(async (req, res) => { res.json({ success: true, ...(await liveView()) }); }));
+  // MASTER SWITCH: one switch for the Profit Guard, the Sentinel, the stop floor and the early slice. Off = trades run on their own stops (the bots' own trailing and fixed stops).
+  // Turning it off needs no confirm; stops the guards already moved stay where they are on Bybit. Turning it back on starts a fresh watch of the open trades.
+  app.get('/api/admin/guards-master', adminAuth, h(async (req, res) => { res.json({ success: true, master: guardsMaster }); }));
+  app.post('/api/admin/guards-master', adminAuth, h(async (req, res) => {
+    const on = req.body && req.body.on;
+    if (typeof on !== 'boolean') return res.status(400).json({ success: false, message: 'on must be true or false' });
+    if (on !== guardsMaster) {
+      guardsMaster = on;
+      if (!on) { pgState.clear(); snState.clear(); pgClosing.length = 0; snClosing.length = 0; pgWatch.clear(); }
+      await q(`INSERT INTO meta(k,v) VALUES('guards_master',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify({ on })]);
+      try { await q(`INSERT INTO meta(k,v) VALUES('profit_guard_state','{}') ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`); await q(`INSERT INTO meta(k,v) VALUES('sentinel_state','{}') ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`); } catch { /* state is rebuilt anyway */ }
+      liveCache = { at: 0, v: null };
+      await audit('admin', 'guards_master', null, req, on ? 'on: Profit Guard and Sentinel follow their own modes' : 'off: Profit Guard and Sentinel stopped, trades run on their own stops');
+    }
+    res.json({ success: true, master: guardsMaster });
+  }));
   app.get('/api/admin/sentinel', adminAuth, h(async (req, res) => { res.json({ success: true, ...(await snView()) }); }));
   app.post('/api/admin/sentinel', adminAuth, h(async (req, res) => {
     const b = req.body || {};

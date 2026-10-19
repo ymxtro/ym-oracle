@@ -39,6 +39,14 @@ const DEFAULT_SMART = {
   //   b. Market keep: the share of the best profit kept moves by at most +/- pts: UP while BTC is moving against the trade, DOWN (let it run) while the trade is trending
   //      cleanly (deep in profit, pullbacks smaller than the pair's ATR). Same shift for every rung, so a higher rung never keeps less than a lower one.
   adapt: { on: true, atrMult: 0.8, capR: 1.5, mkt: { on: true, pts: 0.08 } },
+  // final-19 SMOOTH CURVE: a continuous keep share instead of only the ladder's steps. keep = peakR / (peakR + h): 1R keeps 33%, 1.3R 39%, 2R 50%, 4R 67% at h = 2.
+  //   h is not fixed: it is scaled per trade by (a) how clean the trade's own pullbacks have been (clean = h up, let it run; choppy = h down, lock more) and
+  //   (b) BTC moving against the trade (h down). The ladder still applies; the stop uses whichever of the two keeps more, so this only fills the gaps between its steps.
+  curve: { on: true, h: 2.0 },
+  // final-20 EARLY SLICE: close a share of the position once the trade is atR in profit, so a trade that then reverses has already paid something. With dyn on, the trigger and size
+  //   follow the same per-trade "room" reading as the curve: a clean trend waits a little longer and takes less, a choppy trade (or BTC / the Sentinel against it) takes it sooner and takes more.
+  //   Off by default because it closes real positions. Skipped while the ladder's own scale-out steps are on for that profile (one or the other, never both).
+  slice: { on: false, atR: 1.2, frac: 0.3, dyn: true },
 };
 const copySmart = d => JSON.parse(JSON.stringify(d));
 
@@ -102,6 +110,9 @@ function normSmart(raw, d) {
     stall: { on: st.on === undefined ? d.stall.on : st.on === true, fastMin: num(st.fastMin, 5, 720, d.stall.fastMin), swingMin: num(st.swingMin, 30, 4320, d.stall.swingMin),
              stepPts: num(st.stepPts, 0.02, 0.3, d.stall.stepPts), maxPts: num(st.maxPts, 0.02, 0.5, d.stall.maxPts) },
     adapt: normAdapt(r.adapt, d.adapt),
+    slice: { on: (r.slice && r.slice.on !== undefined) ? r.slice.on === true : d.slice.on, atR: num(r.slice && r.slice.atR, 0.6, 5, d.slice.atR), frac: num(r.slice && r.slice.frac, 0.1, 0.5, d.slice.frac),
+             dyn: (r.slice && r.slice.dyn !== undefined) ? r.slice.dyn === true : d.slice.dyn },
+    curve: { on: (r.curve && r.curve.on !== undefined) ? r.curve.on === true : d.curve.on, h: num(r.curve && r.curve.h, 0.5, 6, d.curve.h) },
     tune: { mode: ['off', 'suggest', 'auto'].includes(t.mode) ? t.mode : d.tune.mode, minTrades: Math.round(num(t.minTrades, 5, 500, d.tune.minTrades)), every: Math.round(num(t.every, 3, 200, d.tune.every)),
             step: num(t.step, 0.01, 0.1, d.tune.step), lastAtN: { fast: Math.round(num(la.fast, 0, 1e6, 0)), swing: Math.round(num(la.swing, 0, 1e6, 0)) } },
   };
@@ -165,6 +176,12 @@ function decide(i) {
     const cand = long ? entry + frac * peakDist : entry - frac * peakDist;
     if (long ? cand > target : cand < target) { target = cand; label = 'keep ' + Math.round(frac * 100) + '% of the peak' + (adj ? ' (' + (adj > 0 ? '+' : '') + Math.round(adj * 100) + ' pts: market)' : ''); keepFrac = frac; }
   }
+  const cv = cfg.smart.curve;
+  if (cv && cv.on) {                           // smooth curve: fills the gaps between the ladder's steps; whichever keeps more wins
+    const mul = Number(sm.curveMul) > 0 ? Number(sm.curveMul) : 1, h = Math.max(0.5, Math.min(6, cv.h * mul));
+    const f = Math.max(0.1, Math.min(0.85, peakR / (peakR + h))), cand = long ? entry + f * peakDist : entry - f * peakDist;
+    if (long ? cand > target : cand < target) { target = cand; label = 'keep ' + Math.round(f * 100) + '% of the peak (curve' + (sm.curveWhy ? ': ' + sm.curveWhy : '') + ')'; keepFrac = f; }
+  }
   const noiseGap = Number(sm.noisePrice) > 0 ? Math.min(Number(sm.noisePrice), (Number(sm.noiseCapR) > 0 ? Number(sm.noiseCapR) : 1.5) * risk) : 0;   // breathing room from this trade's own wobble
   const stallExtra = Number(sm.stallExtra) > 0 ? Math.min(0.5, Number(sm.stallExtra)) : 0;
   if (stallExtra > 0) {                       // stalled: no new best for a while, so keep a bit more of what was made
@@ -222,6 +239,42 @@ function adaptOf(cfg, x) {
     out.keepAdj = Math.round(a.mkt.pts * (against - clean) * 1000) / 1000;
   }
   return out;
+}
+// CURVE: how much room this trade deserves. in: { btcPct (+ = with the trade), peakDist, maxPull, pullNow (how far price is from its best right now), atr (1-minute ATR) (all price units),
+// sn: { state } (the Sentinel's reading of this trade, if it is running) }. Returns { curveMul, curveWhy } (a multiplier on h; below 1 = lock more, above 1 = more room).
+function curveOf(cfg, x) {
+  const cv = cfg.smart.curve;
+  if (!cv || !cv.on || !x) return {};
+  let mul = 1; const why = [];
+  const pd = Number(x.peakDist), mp = Number(x.maxPull);
+  if (pd > 0 && mp >= 0) {                                                 // pullback share of the best profit: 10% or less = clean (x1.2), 40% or more = choppy (x0.8)
+    const r = Math.min(0.4, Math.max(0.1, mp / pd)), m = 1.2 - (r - 0.1) / 0.3 * 0.4;
+    mul *= m; if (m >= 1.1) why.push('clean trend'); else if (m <= 0.9) why.push('choppy');
+  }
+  const btc = Number(x.btcPct);
+  if (Number.isFinite(btc)) { const against = Math.min(1, Math.max(0, -btc / 0.6)); if (against > 0) { mul *= 1 - 0.3 * against; if (against >= 0.4) why.push('BTC against'); } }
+  const SNM = { calm: 1.05, watch: 0.92, alert: 0.78, danger: 0.62 };       // the Sentinel's own reading of whether this trade looks like it is turning
+  if (x.sn && SNM[x.sn.state]) { mul *= SNM[x.sn.state]; if (x.sn.state === 'alert' || x.sn.state === 'danger') why.push('Sentinel ' + x.sn.state); }
+  const pn = Number(x.pullNow), atr = Number(x.atr);
+  if (pn > 0 && atr > 0 && pd > 0 && pn >= 2 * atr && pn / pd >= 0.25) { mul *= 0.85; why.push('giving back'); }   // already 2+ ATR off the best and a quarter of the profit gone
+  mul = Math.round(Math.min(1.5, Math.max(0.5, mul)) * 1000) / 1000;
+  return { curveMul: mul, curveWhy: why.join(', ') };
+}
+// The keep share the curve gives at this peak (used by the Sentinel so both guards speak the same language). null when the curve is off.
+function curveKeep(cfg, peakR, mul) {
+  const cv = cfg.smart.curve;
+  if (!cv || !cv.on || !(peakR > 0)) return null;
+  const h = Math.max(0.5, Math.min(6, cv.h * (Number(mul) > 0 ? Number(mul) : 1)));
+  return Math.max(0.1, Math.min(0.85, peakR / (peakR + h)));
+}
+// EARLY SLICE: when and how much. in: { mul } (the curve's room reading; 1 = neutral). Returns { atR, frac, why }; null when the slice is off.
+function sliceOf(cfg, x) {
+  const sl = cfg.smart.slice;
+  if (!sl || !sl.on) return null;
+  if (!sl.dyn) return { atR: sl.atR, frac: sl.frac, why: 'fixed' };
+  const mul = Number(x && x.mul) > 0 ? Number(x.mul) : 1, t = Math.max(-1, Math.min(1, (mul - 1) / 0.5));   // + = clean/healthy (more room), - = choppy / against
+  const atR = Math.round(Math.max(0.6, sl.atR * (1 + 0.15 * t)) * 100) / 100, frac = Math.round(Math.max(0.1, Math.min(0.5, sl.frac * (1 - 0.15 * t))) * 100) / 100;
+  return { atR, frac, why: t > 0.2 ? 'clean trade: a bit later and smaller' : t < -0.2 ? 'choppy or turning: sooner and bigger' : 'neutral' };
 }
 // Extra share of the best profit to keep because the trade has made no new best for a while. 0 when it is still pushing or the feature is off.
 function stallExtra(cfg, profile, nowMs, peakAt) {
@@ -304,4 +357,4 @@ function reentryStep(w, mark, nowMs, rc) {
   return { events: ev, finished: false };
 }
 
-module.exports = { adaptOf, updatePull, noiseOf, stallExtra, suggestTuning, DEFAULT_SMART, PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };
+module.exports = { sliceOf, curveKeep, curveOf, adaptOf, updatePull, noiseOf, stallExtra, suggestTuning, DEFAULT_SMART, PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };

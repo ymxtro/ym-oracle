@@ -727,7 +727,7 @@ function pgSettingsBody(){
     for(var i=0;i<3;i++){var r=g('pg-'+p+'-r'+i),k=g('pg-'+p+'-k'+i);if(r>0&&k>0)pr.ladder.push([r,k/100])}
     for(var n=0;n<2;n++){var sr=g('pg-'+p+'-sr'+n),sk=g('pg-'+p+'-sk'+n);if(sr>0&&sk>0)pr.scale.steps.push([sr,sk/100])}
     o[p]=pr});
-  var tmE=$('#pg-tune');o.smart={noise:{on:c('pg-sn-on'),mult:g('pg-sn-mult')},stall:{on:c('pg-ss-on'),fastMin:g('pg-ss-fast'),swingMin:g('pg-ss-swing')},adapt:{on:c('pg-ad-on'),atrMult:g('pg-ad-mult'),mkt:{on:c('pg-am-on'),pts:g('pg-am-pts')/100}},tune:{mode:tmE?tmE.value:'suggest'}};
+  var tmE=$('#pg-tune');o.smart={noise:{on:c('pg-sn-on'),mult:g('pg-sn-mult')},stall:{on:c('pg-ss-on'),fastMin:g('pg-ss-fast'),swingMin:g('pg-ss-swing')},curve:{on:c('pg-cv-on'),h:g('pg-cv-h')},slice:{on:c('pg-sl-on'),atR:g('pg-sl-at'),frac:g('pg-sl-frac')/100,dyn:c('pg-sl-dyn')},adapt:{on:c('pg-ad-on'),atrMult:g('pg-ad-mult'),mkt:{on:c('pg-am-on'),pts:g('pg-am-pts')/100}},tune:{mode:tmE?tmE.value:'suggest'}};
   o.reentry={on:c('pg-re-on'),minPullR:g('pg-re-pull'),resumePct:g('pg-re-res'),targetR:g('pg-re-tgt')};
   return o;
 }
@@ -806,6 +806,10 @@ function guardCard(){
   h+='<h3 style="margin:16px 0 4px;font-size:13px">Smart mode <span class="chip">learns from each trade</span></h3><p class="mist small" style="margin:0 0 6px">Helpers that sit on top of the rules above. Switch any off and the plain rules apply. They only ever make a stop <b>tighter</b> or <b>later</b>, never looser.</p>';
   h+='<label class="small" style="display:block"><input type="checkbox" id="pg-sn-on"'+(SM.noise.on?' checked':'')+'> <b>Breathing room.</b> Do not raise a stop closer to the price than the largest pullback that trade has already shown (capped at '+esc(SM.noise.capR)+'R).</label><div class="fgrid"><div><label class="l" for="pg-sn-mult">Times that pullback</label><input type="number" step="0.1" id="pg-sn-mult" value="'+esc(SM.noise.mult)+'"></div></div>';
   h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-ss-on"'+(SM.stall.on?' checked':'')+'> <b>Stall tightening.</b> A trade in profit that has made no new best for a while keeps a few more points of its profit (+'+Math.round((SM.stall.stepPts||0)*100)+' per quiet period, up to +'+Math.round((SM.stall.maxPts||0)*100)+').</label><div class="fgrid"><div><label class="l" for="pg-ss-fast">Quiet period, fast (minutes)</label><input type="number" step="5" id="pg-ss-fast" value="'+esc(SM.stall.fastMin)+'"></div><div><label class="l" for="pg-ss-swing">Quiet period, swing (minutes)</label><input type="number" step="30" id="pg-ss-swing" value="'+esc(SM.stall.swingMin)+'"></div></div>';
+  var CV=SM.curve||{on:true,h:2};
+  h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-cv-on"'+(CV.on?' checked':'')+'> <b>Smooth profit curve.</b> Keeps a share of the best profit that grows smoothly with it (no dead zone between the ladder steps). The share is worked out per trade: more room while its pullbacks are small, less while they are large or BTC runs against it.</label><div class="fgrid"><div><label class="l" for="pg-cv-h">Give-back factor (higher = more room)</label><input type="number" step="0.1" id="pg-cv-h" value="'+esc(CV.h)+'"></div></div>';
+  var SL=SM.slice||{on:false,atR:1.2,frac:0.3,dyn:true};
+  h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-sl-on"'+(SL.on?' checked':'')+'> <b>Early profit slice.</b> Close a share of the position once the trade is a little over 1R, so a trade that then reverses has already paid something. Shadow records it; Live closes it for real (needs the confirm). Not used while the ladder\'s own scale-out is on.</label><div class="fgrid"><div><label class="l" for="pg-sl-at">Take it at (R)</label><input type="number" step="0.1" id="pg-sl-at" value="'+esc(SL.atR)+'"></div><div><label class="l" for="pg-sl-frac">Share to close (%)</label><input type="number" step="5" id="pg-sl-frac" value="'+esc(Math.round(SL.frac*100))+'"></div></div><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="pg-sl-dyn"'+(SL.dyn?' checked':'')+'> Let each trade set it: a clean trend waits a little longer and takes less, a choppy trade (or one the Sentinel or BTC is against) takes it sooner and takes more.</label>';
   var AD=SM.adapt||{on:true,atrMult:0.8,mkt:{on:true,pts:0.08}};
   h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-ad-on"'+(AD.on?' checked':'')+'> <b>Pair speed.</b> Do not raise a stop closer to the price than a share of that pair\'s own 1-minute ATR, so a fast coin gets room before it has shown a pullback.</label><div class="fgrid"><div><label class="l" for="pg-ad-mult">Share of ATR</label><input type="number" step="0.1" id="pg-ad-mult" value="'+esc(AD.atrMult)+'"></div></div>';
   h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-am-on"'+((AD.mkt||{}).on?' checked':'')+'> <b>Market awareness.</b> Keep a few more points of the profit while BTC moves against the trade, and a few less while the trade is trending cleanly.</label><div class="fgrid"><div><label class="l" for="pg-am-pts">Most it may shift (points)</label><input type="number" step="1" id="pg-am-pts" value="'+esc(Math.round(((AD.mkt||{}).pts||0)*100))+'"></div></div>';
@@ -965,6 +969,8 @@ function tradeCard(t){
   var chips='';
   if(q.peakR!=null&&q.peakR>0.05)chips+='<span class="chip">best +'+q.peakR.toFixed(2)+'R</span>';
   if(t.profitGuard)chips+='<span class="chip '+(t.profitGuard.mode==='live'?'long':t.profitGuard.mode==='shadow'?'warn':'')+'" title="'+esc(t.profitGuard.why||'')+'">Profit Guard · '+esc(t.profitGuard.mode||'')+'</span>';
+  if(t.profitGuard&&t.profitGuard.room)chips+='<span class="chip" title="What the guard reads about this trade when it decides how much room the stop gets">room: '+esc(t.profitGuard.room)+'</span>';
+  if(t.profitGuard&&t.profitGuard.slice){var spl=t.profitGuard.slice;chips+='<span class="chip '+(t.profitGuard.slicedLive?'long':'')+'" title="'+esc(spl.why||'')+'">'+(t.profitGuard.sliced?(t.profitGuard.slicedLive?'slice taken':'slice noted (shadow)'):'slice '+Math.round(spl.frac*100)+'% at '+spl.atR+'R')+'</span>'}
   if(t.sentinel)chips+='<span class="chip '+(t.sentinel.state==='danger'?'short':t.sentinel.state==='alert'?'warn':'')+'" title="Sentinel score '+esc(t.sentinel.score)+'">Sentinel · '+esc(t.sentinel.state||'calm')+'</span>';
   (q.flags||[]).slice(0,3).forEach(function(f){chips+='<span class="chip warn">'+esc(f)+'</span>'});
   if(chips)h+='<div class="lt-f">'+chips+'</div>';
@@ -974,6 +980,7 @@ function viewLive(){
   var V=S.live;
   var h='<div class="pagehd"><div><p>Every open trade on the master account, with a plain 0–100 reading of how it is going. The reading is built from four visible parts (progress 35, protection 20, momentum 25, market 20). It describes the present; it does not predict.</p></div><span class="mist small">'+(V?'Updated '+ago(V.at):'')+' · refreshes by itself</span></div>';
   if(!V)return h+'<div class="card"><p class="mist" style="padding:6px 0">Loading…</p></div>';
+  if(V.master===false)h+='<div class="box red" style="margin-bottom:12px">Guards are switched OFF: these trades run only on their own stops. <button class="btn pri" style="margin-left:8px" data-act="gmaster" data-v="on">Turn guards on</button></div>';
   if(!V.trades||!V.trades.length)return h+'<div class="card"><p class="mist" style="padding:14px 0;text-align:center">'+esc(V.note||'No open trades right now.')+'</p></div>';
   var sm=V.summary||{},b=sm.bands||{},tot=sm.open||1,attn=(b.fragile||0)+(b['at risk']||0);
   var col={strong:'var(--long)',steady:'#60a5fa',fragile:'var(--pending)','at risk':'var(--short)',unknown:'var(--mist)'};
@@ -992,9 +999,15 @@ function viewLive(){
   h+='<p class="hint2" style="margin-top:12px">The bar runs from the original stop (red) through the entry (white) to the target (green). The amber part is profit the stop has already locked. The dot is the price now; the faint tick is the best price so far. The small line is the last hour, in R.</p>';
   return h;
 }
+function masterBar(){
+  var off=S.pg&&S.pg.master===false;
+  return '<div class="card" id="gmaster" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap'+(off?';border-color:var(--short)':'')+'"><div style="min-width:0;flex:1 1 260px"><h2 style="margin:0 0 3px">Master switch '+(off?'<span class="chip short">GUARDS OFF</span>':'<span class="chip long">GUARDS ON</span>')+'</h2><p class="mist small" style="margin:0">'
+    +(off?'Profit Guard and the Sentinel are stopped. Every trade runs only on the stop and trailing its bot set. Stops the guards already moved stay where they are on Bybit.':'Profit Guard and the Sentinel follow the modes set below. Switch this off to stop both at once and let every trade run on its own stop.')
+    +'</p></div><button class="btn '+(off?'pri':'')+'" data-act="gmaster" data-v="'+(off?'on':'off')+'">'+(off?'Turn guards on':'Turn all guards off')+'</button></div>';
+}
 function viewGuards(){
   var h='<div class="pagehd"><div><p>Profit Guard locks profit by raising stops. The Trade Sentinel watches for trades that look like they are turning against you. Both only ever tighten a stop, and both start Off: use Shadow to record what they would do without touching anything.</p></div></div>';
-  h+='<div class="g2g">'+guardCard()+sentinelCard()+'</div>';
+  h+=masterBar()+'<div class="g2g">'+guardCard()+sentinelCard()+'</div>';
   return h;
 }
 
@@ -1060,6 +1073,7 @@ document.addEventListener('click',function(e){
   if(a==='sync'){t.textContent='Syncing…';j('/api/admin/sync-now','POST').then(function(){t.textContent='Sync PnL';toast('PnL synced');refreshAll(true)});return}
   if(a==='csv'){exportCsv();return}
   if(a==='testAlert'){var to=t.getAttribute('data-to')||'',lab=t.textContent;t.textContent='Sending…';j('/api/admin/test-alert','POST',to?{target:to}:{}).then(function(r){t.textContent=lab;toast(!r.configured?'No alert channel is set up on Render yet (Telegram token and chat id)':r.muted?'Muted by your alert settings ('+(r.reason||'see the panel')+'): nothing was sent':r.success?'Test sent'+(to==='group'?' to the group':to==='dm'?' to your DM':'')+(r.telegram&&r.telegram.indexOf('sent')===0?'':'')+(r.email==='sent'?' and email':''):'Sending failed: Telegram '+r.telegram+(r.email!=='off'?', email '+r.email:''))}).catch(function(){t.textContent=lab;toast('Could not reach the server')});return}
+  if(a==='gmaster'){var gon=t.getAttribute('data-v')==='on';j('/api/admin/guards-master','POST',{on:gon}).then(function(r){if(r.success){if(S.pg)S.pg.master=r.master;if(S.live)S.live.master=r.master;toast(r.master?'Guards are on':'Guards are off: trades run on their own stops');refreshAll(true)}else toast(r.message||'Could not change it')});return}
   if(a==='pgMode'){var pm=t.getAttribute('data-v');pgPost({mode:pm},pm==='live'?'Profit Guard is LIVE':pm==='shadow'?'Shadow mode: recording only':'Profit Guard is off');return}
   if(a==='pgProf'){var pp=t.getAttribute('data-p'),pv=t.getAttribute('data-v'),pb={};pb[pp]={mode:pv};pgPost(pb,pp+': '+(pv==='inherit'?'follows the overall mode':pv));return}
   if(a==='pgApply'){var ap=t.getAttribute('data-p');pgPost({applyTuning:ap},'Ladder updated: '+ap);return}

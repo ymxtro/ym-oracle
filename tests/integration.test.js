@@ -1296,7 +1296,10 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     assert.strictEqual((await call('/api/admin/profit-guard', 'POST', { mode: 'live' }, admin)).s, 400, 'going live needs the confirm');
     ok('profit guard: off by default and does nothing; settings need admin and a confirm to go live');
 
-    assert((await call('/api/admin/profit-guard', 'POST', { mode: 'shadow' }, admin)).j.cfg.mode === 'shadow');
+    assert((await call('/api/admin/profit-guard', 'POST', { mode: 'shadow', smart: { curve: { on: false } } }, admin)).j.cfg.mode === 'shadow');   // the ladder-only expectations below; the curve is covered in profitguard.test.js
+    { const sv = await call('/api/admin/profit-guard', 'POST', { smart: { adapt: { atrMult: 1.2, mkt: { pts: 0.05 } }, curve: { h: 2.5 } } }, admin); const g = (await G()).j.cfg.smart;
+      assert(sv.j.success && g.adapt.atrMult === 1.2 && g.adapt.mkt.pts === 0.05 && g.curve.h === 2.5 && g.curve.on === false, 'adapt and curve settings are saved, not dropped');
+      await call('/api/admin/profit-guard', 'POST', { smart: { adapt: { atrMult: 0.8, mkt: { pts: 0.08 } }, curve: { h: 2 } } }, admin); }
     s0 = state.stops.length; P(150, 90); await mu._test.pgTick();
     assert.strictEqual(state.stops.length, s0, 'shadow never touches a stop');
     let wr = await logs('would_raise'); assert.strictEqual(wr.length, 1); assert.strictEqual(Number(wr[0].new_sl), 127.5); assert.strictEqual(wr[0].profile, 'swing');
@@ -1432,7 +1435,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
       await db.query('TRUNCATE profit_guard_log, pg_trades'); await db.query(`DELETE FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch')`);
       mu._test.pgState.clear(); mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 100 };
       for (const kk of Object.keys(state.positions)) delete state.positions[kk]; mode = 'live'; halted = false;
-      await POST({ mode: 'off', smart: { noise: { on: true, mult: 1, capR: 1.5 }, stall: { on: true, fastMin: 30, swingMin: 360, stepPts: 0.1, maxPts: 0.2 }, tune: { mode: 'suggest' } },
+      await POST({ mode: 'off', smart: { slice: { on: false }, noise: { on: true, mult: 1, capR: 1.5 }, stall: { on: true, fastMin: 30, swingMin: 360, stepPts: 0.1, maxPts: 0.2 }, tune: { mode: 'suggest' } },
         swing: { mode: 'inherit', ladder: [[2, 0.35], [4, 0.55], [8, 0.65]], scale: { on: false } }, fast: { mode: 'inherit', ladder: [[1.5, 0.45], [3, 0.6], [6, 0.7]], scale: { on: false } } });
     };
     const P = (mark, sl) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl) }; };
@@ -1491,10 +1494,47 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     for (let i = 0; i < 60; i++) bars.push([String(t0 + i * 60000), '104', '106', '102', '104', '10']);                 // every 1-minute bar is 4 wide
     Stub.prototype.getKline = async () => ({ retCode: 0, result: { list: bars.slice().reverse() } });
     try {
-      mu._test.pgState.clear(); P(111, 90); await mu._test.pgTick(); const ad = mu._test.pgState.get('BTCUSDT|Buy').adapt;
-      assert(ad && Math.abs(ad.atrPct - 4 / 111 * 100) < 0.05 && ad.keepAdj === 0, JSON.stringify(ad));
+      await POST({ smart: { curve: { on: true } } }); mu._test.pgState.clear(); P(111, 90); await mu._test.pgTick(); const ad = mu._test.pgState.get('BTCUSDT|Buy').adapt;
+      assert(ad && Math.abs(ad.atrPct - 4 / 111 * 100) < 0.05 && ad.keepAdj === 0 && ad.curveMul > 0.6 && ad.curveMul <= 1.5, JSON.stringify(ad));
     } finally { delete Stub.prototype.getKline; }
     ok('profit guard adapt: the loop reads the pair\'s own ATR from the 1-minute candles, and falls back to the plain rules when there are none');
+
+    // v2.8.7: early slice + master switch
+    const logs = async (ev) => (await db.query(`SELECT * FROM profit_guard_log WHERE event=$1 ORDER BY id`, [ev])).rows;
+    await reset();
+    await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','swing',100,90) ON CONFLICT (k) DO NOTHING`);
+    assert((await POST({ mode: 'shadow', smart: { slice: { on: true, atR: 1.2, frac: 0.3, dyn: true } } })).j.cfg.smart.slice.on === true);
+    P(113, 90); const nSub = state.submits.length; await mu._test.pgTick();
+    assert.strictEqual(state.submits.length, nSub, 'shadow closes nothing');
+    assert.strictEqual((await logs('would_scale')).length, 1); assert(/early slice/.test((await logs('would_scale'))[0].detail));
+    await mu._test.pgTick(); assert.strictEqual((await logs('would_scale')).length, 1, 'once per trade');
+    ok('early slice: shadow records the slice it would take, closes nothing, once per trade');
+    await reset(); await POST({ smart: { slice: { on: false } } });
+    assert.strictEqual((await POST({ mode: 'live' }, { confirm: 'LIVE' })).j.cfg.mode, 'live');
+    assert.strictEqual((await POST({ smart: { slice: { on: true } } })).s, 400, 'a live slice closes real positions: needs the confirm');
+    assert((await POST({ smart: { slice: { on: true } } }, { confirm: 'LIVE' })).j.cfg.smart.slice.on === true);
+    mu._test.pgState.clear(); P(113, 90); const nSub2 = state.submits.length; await mu._test.pgTick();
+    const sl = state.submits.slice(nSub2).filter(x => x.k === 'ADMINK' && x.body.reduceOnly === true); assert.strictEqual(sl.length, 1, JSON.stringify(state.submits.slice(nSub2).map(x => x.body)));
+    assert(Number(sl[0].body.qty) > 0 && Number(sl[0].body.qty) < 0.1 && sl[0].body.side === 'Sell');
+    assert.strictEqual((await logs('scaled')).length, 1); assert(/early slice/.test((await logs('scaled'))[0].detail));
+    P(114, 90); await mu._test.pgTick(); assert.strictEqual(state.submits.slice(nSub2).filter(x => x.k === 'ADMINK' && x.body.reduceOnly === true).length, 1, 'only one slice per trade');
+    ok('early slice live: closes one slice of the master position with a reduce-only order, once, and needs the confirm to switch on');
+    // master switch
+    P(150, 90); mu._test.pgState.clear(); await mu._test.pgTick();
+    const floorHeld = mu.guardClamp({ symbol: 'BTCUSDT', stopLoss: '95' }).stopLoss; assert.notStrictEqual(floorHeld, '95', 'master on: the floor holds a looser stop');
+    assert.strictEqual((await call('/api/admin/guards-master', 'POST', { on: 'no' }, admin)).s, 400); assert.strictEqual((await call('/api/admin/guards-master', 'POST', { on: false })).s, 401);
+    assert.strictEqual((await call('/api/admin/guards-master', 'POST', { on: false }, admin)).j.master, false);
+    assert.strictEqual(mu._test.pgState.size, 0, 'switching off clears what the guard was watching');
+    const nStops = state.stops.length, nSub3 = state.submits.length; P(200, 90); await mu._test.pgTick(); await mu._test.snTick();
+    assert.strictEqual(state.stops.length, nStops, 'master off: no stop is touched'); assert.strictEqual(state.submits.length, nSub3, 'master off: nothing is closed');
+    assert.strictEqual(mu.guardClamp({ symbol: 'BTCUSDT', stopLoss: '95' }).stopLoss, '95', 'master off: the floor lets the bot\'s own stop through');
+    assert.strictEqual((await call('/api/admin/profit-guard', 'GET', null, admin)).j.master, false); assert.strictEqual((await call('/api/admin/sentinel', 'GET', null, admin)).j.master, false);
+    assert.strictEqual((await call('/api/admin/live-trades', 'GET', null, admin)).j.master, false);
+    assert.strictEqual((await db.query(`SELECT 1 FROM audit_log WHERE action='guards_master'`)).rowCount >= 1, true);
+    assert.strictEqual((await call('/api/admin/guards-master', 'POST', { on: true }, admin)).j.master, true);
+    await mu._test.pgTick(); assert(state.stops.length > nStops, 'master back on: the guard works again from a fresh look');
+    await POST({ smart: { slice: { on: false } } }, { confirm: 'LIVE' });
+    ok('master switch: off = no guard touches a stop or a position and the floor lets the bot\'s stop through; admin-only; on again resumes; audited');
     // LIVE TRADES: the admin visual reads every open position and gives it a quality reading
     assert.strictEqual((await call('/api/admin/live-trades', 'GET')).s, 401);
     P(125, 112); const lv = (await call('/api/admin/live-trades', 'GET', null, admin)).j;

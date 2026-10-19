@@ -62,6 +62,15 @@ ok('in profit + alert: stop to breakeven plus fee cushion (' + d.newSl + ')');
 d = D({ state: 'danger', mark: 100.6, peak: 100.65 });          // keep 50% of the 0.65 peak = 100.325; the price gap (0.25%) allows up to ~100.35
 assert.strictEqual(d.action, 'raise'); assert(d.newSl >= 100.3 && d.newSl <= 100.6 - 0.25, 'got ' + d.newSl);
 ok('in profit + danger: keeps a share of the peak, never closer to the price than the gap (' + d.newSl + ')');
+{ // final-20: with the Profit Guard curve's share the actions follow the trade; without it the old fixed behaviour is unchanged
+  const base = { side: 'Buy', entry: 100, mark: 112, peak: 112.9, curSl: 90, initialSl: 90, tick: 0.01, atr: 0.1, cfg };
+  const aOld = S.decide({ ...base, state: 'alert' }), aNew = S.decide({ ...base, state: 'alert', keepFrac: 0.45 });
+  assert(/breakeven/.test(aOld.label) && Math.abs(aOld.newSl - 100.1) < 0.02 && /curve/.test(aNew.label) && Math.abs(aNew.newSl - (100 + 0.45 * 12.9)) < 0.02);
+  const dOld = S.decide({ ...base, state: 'danger' }), dNew = S.decide({ ...base, state: 'danger', keepFrac: 0.6 }), dLow = S.decide({ ...base, state: 'danger', keepFrac: 0.2 });
+  assert(Math.abs(dOld.newSl - (100 + 0.5 * 12.9)) < 0.02 && Math.abs(dNew.newSl - (100 + 0.75 * 12.9)) < 0.02 && Math.abs(dLow.newSl - (100 + 0.5 * 12.9)) < 0.02, JSON.stringify([dOld, dNew, dLow]));
+  const sh = S.decide({ ...base, side: 'Sell', entry: 100, mark: 88, peak: 87.1, curSl: 110, initialSl: 110, state: 'danger', keepFrac: 0.6 }); assert(sh.newSl < 100 - 0.7 * 12.9 + 0.02 && sh.newSl > 85);
+  ok('sentinel: in profit, alert keeps the curve share and danger 15 points more (never below its own fixed share); without a curve share nothing changes; shorts too');
+}
 d = D({ peak: 100, mark: 99.7, curSl: 99, state: 'alert' });    // loss side: -0.6R = 99.4
 assert.strictEqual(d.newSl, 99.4);
 ok('loss side + alert: stop moves from -1R to -0.6R');

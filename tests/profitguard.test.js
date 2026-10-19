@@ -2,7 +2,7 @@
 const assert = require('assert');
 const G = require(process.env.RELAY_DIR ? process.env.RELAY_DIR + '/profitguard.js' : '../profitguard.js');
 let n = 0; const ok = m => console.log('  ok', ++n, m);
-const cfg = G.normalize({ mode: 'live' });
+const cfg = G.normalize({ mode: 'live', smart: { curve: { on: false } } });   // the older checks below test the ladder alone; the curve has its own checks at the end
 const sw = cfg.swing, fast = cfg.fast;
 const L = (o) => G.decide({ side: 'Buy', entry: 100, initialSl: 90, curSl: 90, mark: 100, peak: 100, tick: 0.01, profile: sw, cfg, ...o });
 const S = (o) => G.decide({ side: 'Sell', entry: 100, initialSl: 110, curSl: 110, mark: 100, peak: 100, tick: 0.01, profile: sw, cfg, ...o });
@@ -188,5 +188,60 @@ ok('tuning: waits for enough live trades, tightens when profit is handed back, l
   const sh = S({ peak: 70, mark: 75, curSl: 110, smart: { keepAdj: 0.08 } }), shb = S({ peak: 70, mark: 75, curSl: 110, smart: {} });
   assert(sh.newSl < shb.newSl);                                           // a short keeps more too (stop moves further down)
   ok('adapt: market shift keeps more when BTC is against, less on a clean trend, both directions, stop still only tightens');
+}
+// final-19: smooth curve
+{
+  const cc = G.normalize({ mode: 'live' }), fastC = cc.fast;
+  assert.strictEqual(G.defaults().smart.curve.on, true); assert.strictEqual(G.defaults().smart.curve.h, 2);
+  assert.strictEqual(G.normalize({ smart: { curve: { h: 99 } } }).smart.curve.h, 2); assert.strictEqual(G.normalize({ smart: { curve: { on: false } } }).smart.curve.on, false);
+  ok('curve: on by default, bad numbers fall back, switch works');
+  // the PENDLE case: short from 100, risk 10, best 1.29R (87.1). The plain ladder (first rung 1.5R) locks almost nothing; the curve keeps a real share
+  const Sf = (o, c) => G.decide({ side: 'Sell', entry: 100, initialSl: 110, curSl: 110, mark: 88, peak: 87.1, tick: 0.01, profile: (c || cc).fast, cfg: c || cc, ...o });
+  const plain = G.decide({ side: 'Sell', entry: 100, initialSl: 110, curSl: 110, mark: 88, peak: 87.1, tick: 0.01, profile: cfg.fast, cfg });
+  const withC = Sf({});
+  assert.strictEqual(plain.label, 'breakeven'); assert.strictEqual(withC.action, 'raise');
+  assert(withC.keepFrac > 0.38 && withC.keepFrac < 0.40 && withC.newSl < plain.newSl - 3 && /curve/.test(withC.label));
+  ok('curve: a 1.29R trade now locks about 39% of its best profit instead of breakeven (no dead zone below the first rung)');
+  // smooth: more peak = more kept, never less than the ladder, capped
+  let prev = 0; for (const pr of [1, 1.2, 1.5, 2, 3, 4, 6, 8]) { const d = Sf({ peak: 100 - pr * 10, mark: 100 - pr * 10 + 1 }); assert.strictEqual(d.action, 'raise', 'peak ' + pr); assert(d.keepFrac >= prev - 1e-9 && d.keepFrac <= 0.85); prev = d.keepFrac; }
+  const l6 = Sf({ peak: 40, mark: 41 }), l6p = G.decide({ side: 'Sell', entry: 100, initialSl: 110, curSl: 110, mark: 41, peak: 40, tick: 0.01, profile: cfg.fast, cfg });
+  assert(l6.keepFrac >= l6p.keepFrac);
+  ok('curve: keep share grows smoothly with the peak, is never below the ladder, and is capped at 85%');
+  // dynamic: per-trade multiplier
+  const clean = G.curveOf(cc, { btcPct: 0.2, peakDist: 20, maxPull: 1 }), choppy = G.curveOf(cc, { btcPct: 0.2, peakDist: 20, maxPull: 9 }), against = G.curveOf(cc, { btcPct: -0.6, peakDist: 20, maxPull: 1 });
+  assert(clean.curveMul > 1.15 && /clean/.test(clean.curveWhy) && choppy.curveMul < 0.85 && /choppy/.test(choppy.curveWhy) && against.curveMul < clean.curveMul * 0.75 && /BTC/.test(against.curveWhy));
+  assert.deepStrictEqual(G.curveOf(G.normalize({ smart: { curve: { on: false } } }), { peakDist: 1, maxPull: 0 }), {}); assert.deepStrictEqual(G.curveOf(cc, null), {});
+  const dc = Sf({ smart: clean }), dch = Sf({ smart: choppy }), dag = Sf({ smart: against });
+  assert(dc.keepFrac < dch.keepFrac && dc.keepFrac < dag.keepFrac);          // clean trend: less kept (more room); choppy or BTC against: more kept
+  assert(clean.curveMul <= 1.5 && choppy.curveMul >= 0.6);
+  ok('curve: per-trade room - clean pullbacks give more room, choppy trades or BTC against lock more');
+  // still tighten-only, and a long behaves like a short
+  const lo = G.decide({ side: 'Buy', entry: 100, initialSl: 90, curSl: 90, mark: 112, peak: 112.9, tick: 0.01, profile: cc.fast, cfg: cc });
+  assert.strictEqual(lo.action, 'raise'); assert(lo.newSl > 100 && lo.keepFrac > 0.38);
+  assert.strictEqual(G.decide({ side: 'Buy', entry: 100, initialSl: 90, curSl: 108, mark: 112, peak: 112.9, tick: 0.01, profile: cc.fast, cfg: cc }).action, 'none');   // already tighter: no change
+  ok('curve: works for longs, and an already tighter stop is never loosened');
+}
+// final-20: early slice, Sentinel-aware room, curveKeep
+{
+  const cc = G.normalize({ mode: 'live' });
+  assert.strictEqual(G.sliceOf(cc, {}), null); assert.strictEqual(G.defaults().smart.slice.on, false);
+  const on = G.normalize({ mode: 'live', smart: { slice: { on: true } } });
+  assert.deepStrictEqual(G.normalize({ smart: { slice: { on: true, atR: 99, frac: 0.9 } } }).smart.slice, { on: true, atR: 1.2, frac: 0.3, dyn: true });
+  const neu = G.sliceOf(on, { mul: 1 }), clean = G.sliceOf(on, { mul: 1.4 }), choppy = G.sliceOf(on, { mul: 0.6 });
+  assert.strictEqual(neu.atR, 1.2); assert.strictEqual(neu.frac, 0.3);
+  assert(clean.atR > neu.atR && clean.frac < neu.frac && choppy.atR < neu.atR && choppy.frac > neu.frac && /later/.test(clean.why) && /sooner/.test(choppy.why));
+  assert(choppy.atR >= 0.6 && choppy.frac <= 0.5 && clean.frac >= 0.1);
+  const fixed = G.sliceOf(G.normalize({ smart: { slice: { on: true, dyn: false } } }), { mul: 0.6 }); assert.strictEqual(fixed.atR, 1.2);
+  ok('slice: off by default, bounded, size and trigger follow the trade (clean = later and smaller, choppy = sooner and bigger), fixed when dynamic is off');
+  const base = G.curveOf(cc, { btcPct: 0.1, peakDist: 20, maxPull: 3 });
+  const calm = G.curveOf(cc, { btcPct: 0.1, peakDist: 20, maxPull: 3, sn: { state: 'calm' } }), alert = G.curveOf(cc, { btcPct: 0.1, peakDist: 20, maxPull: 3, sn: { state: 'alert' } }), danger = G.curveOf(cc, { btcPct: 0.1, peakDist: 20, maxPull: 3, sn: { state: 'danger' } });
+  assert(calm.curveMul > base.curveMul && alert.curveMul < base.curveMul && danger.curveMul < alert.curveMul && /Sentinel danger/.test(danger.curveWhy));
+  const gb = G.curveOf(cc, { btcPct: 0.1, peakDist: 20, maxPull: 3, pullNow: 8, atr: 2 }), nogb = G.curveOf(cc, { btcPct: 0.1, peakDist: 20, maxPull: 3, pullNow: 3, atr: 2 });
+  assert(gb.curveMul < nogb.curveMul && /giving back/.test(gb.curveWhy) && !/giving back/.test(nogb.curveWhy));
+  const worst = G.curveOf(cc, { btcPct: -0.6, peakDist: 20, maxPull: 20, pullNow: 20, atr: 1, sn: { state: 'danger' } }); assert(worst.curveMul >= 0.5 && worst.curveMul <= 1.5);
+  ok('curve: the Sentinel\'s reading and a deep pullback from the best both lower the room (lock more), calm raises it a little, always within bounds');
+  const kHealthy = G.curveKeep(cc, 1.29, G.curveOf(cc, { peakDist: 20, maxPull: 1 }).curveMul), kDanger = G.curveKeep(cc, 1.29, danger.curveMul);
+  assert(kHealthy > 0.3 && kDanger > kHealthy && kDanger <= 0.85); assert.strictEqual(G.curveKeep(G.normalize({ smart: { curve: { on: false } } }), 2, 1), null);
+  ok('curveKeep: the same keep share the curve uses, higher when the trade is turning, null when the curve is off');
 }
 console.log('PASS ' + n);
