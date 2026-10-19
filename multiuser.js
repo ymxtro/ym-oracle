@@ -368,9 +368,41 @@ function init(deps) {
     ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
     max: 5,
     idleTimeoutMillis: 10000,
+    keepAlive: true,                    // keeps a quiet connection from being dropped silently
+    connectionTimeoutMillis: 15000,     // a database that is waking up gets 15 s; before, a stuck connect could hang a request for ever
   });
   pool.on('error', e => console.error('[multiuser] db pool error:', e.message));
-  const q = (text, params) => pool.query(text, params);
+  // A database that has just woken from sleep can drop its first connection. A read is harmless to repeat, so a read is retried once;
+  // a write is never repeated here (a repeated write could be applied twice).
+  const isConnErr = e => !!e && (/Connection terminated|ECONNRESET|ETIMEDOUT|EPIPE|timeout exceeded when trying to connect/i.test(String(e.message || '')) || ['ECONNRESET', 'ETIMEDOUT', 'EPIPE'].includes(e.code));
+  const q = (text, params) => {
+    const p = pool.query(text, params);
+    if (!/^\s*select\b/i.test(text)) return p;
+    return p.catch(e => (isConnErr(e) ? new Promise(r => setTimeout(r, 400)).then(() => pool.query(text, params)) : Promise.reject(e)));
+  };
+
+  // ---- Let the database sleep (Neon free plan: it only sleeps after 5 minutes with no query) ----
+  // The sweeps below used to query every 20-30 s all day, so the database never slept. Now they run only while there is real work:
+  // a bot event, an order, or an open trade makes the relay "busy" for 10-15 minutes, and a short check runs once an hour as a safety net.
+  // DB_SLEEP=off on Render puts the old always-running behaviour back. Orders and the master trade path do not wait on the database.
+  const DB_SLEEP = process.env.DB_SLEEP !== 'off';
+  let workUntil = Date.now() + (process.env.DB_SLEEP_BOOT_MIN !== undefined && process.env.DB_SLEEP_BOOT_MIN !== '' ? Number(process.env.DB_SLEEP_BOOT_MIN) || 0 : 15) * 60000;   // at start everything runs for 15 min, so a restart finishes whatever was half done
+  const dbBusy = () => !DB_SLEEP || Date.now() < workUntil;
+  // Each bot reports its status every 10 minutes. While the relay is idle that report is kept in memory (not written to the database, which would wake it
+  // four times in ten minutes all day); it is saved as soon as there is real work, and at the hourly check. The admin page reads memory first.
+  const botStatusMem = new Map();   // bot -> { payload, at }
+  async function flushBotStatus() {
+    for (const [bot, v] of [...botStatusMem.entries()]) {
+      botStatusMem.delete(bot);
+      try { await pool.query(`INSERT INTO bot_status(bot,payload,at) VALUES($1,$2,$3) ON CONFLICT (bot) DO UPDATE SET payload=EXCLUDED.payload, at=EXCLUDED.at WHERE bot_status.at < EXCLUDED.at`, [bot, v.payload, v.at]); }
+      catch (e) { if (!botStatusMem.has(bot)) botStatusMem.set(bot, v); console.error('[multiuser] bot status flush:', e.message); }
+    }
+  }
+  const wake = (min) => {
+    const wasIdle = !dbBusy(), t = Date.now() + (min || 10) * 60000;
+    if (t > workUntil) workUntil = t;
+    if (wasIdle && botStatusMem.size) flushBotStatus().catch(() => {});
+  };
 
   const ready = q(`
     CREATE TABLE IF NOT EXISTS users (
@@ -1029,6 +1061,7 @@ function init(deps) {
   }
 
   async function fanOutOrder(body) {
+    wake(15);                                                    // an order is real work: keep the sweeps running while it settles
     const o = sanitizeOrder(body);
     if (!o) { console.warn('[multiuser] fan-out skipped: order failed validation'); return; }
     const reduceOnly = o.reduceOnly === true;
@@ -1170,6 +1203,7 @@ function init(deps) {
     const bot = clip(b.bot, 30);
     if (!bot) return { status: 400, message: 'bot is required' };
     const ev = String(b.ev || '');
+    if (ev !== 'status') wake(15);                               // a signal, an alert or a close is real work for the sweeps (a 10-minute status report is not)
     // Abuse guard: while DEVICE_KEY_MODE is 'warn' anyone who knows the URL can post here, so alerts and new ledger rows are capped. A bot that is capped
     // gets a 429, which it treats as "try again later" (it keeps the report), so a real alert is delayed, never lost.
     if (ev === 'msg') {
@@ -1196,7 +1230,10 @@ function init(deps) {
       return { status: 200 };
     }
     if (ev === 'status') {
-      await q(`INSERT INTO bot_status(bot,payload,at) VALUES($1,$2,now()) ON CONFLICT (bot) DO UPDATE SET payload=EXCLUDED.payload, at=now()`, [bot, JSON.stringify(b).slice(0, 4000)]);
+      const payload = JSON.stringify(b).slice(0, 4000);
+      if (!dbBusy()) { botStatusMem.set(bot, { payload, at: new Date() }); return { status: 200 }; }   // idle: keep it in memory, the database stays asleep
+      botStatusMem.delete(bot);
+      await q(`INSERT INTO bot_status(bot,payload,at) VALUES($1,$2,now()) ON CONFLICT (bot) DO UPDATE SET payload=EXCLUDED.payload, at=now()`, [bot, payload]);
       return { status: 200 };
     }
     if (!['open', 'relay', 'close'].includes(ev)) return { status: 400, message: 'unknown event' };
@@ -1538,6 +1575,7 @@ function init(deps) {
     try {
       await ready;
       const positions = await listOpenPositions(restClient);
+      if (positions.length && typeof wake === 'function') wake(10);   // an open trade is real work
       const seen = new Set();
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
@@ -1715,6 +1753,7 @@ function init(deps) {
         [row.symbol, row.side || null, row.mode || snCfg.mode, row.profile || null, row.event, row.state || null, row.score ?? null, row.entry ?? null, row.mark ?? null, row.oldSl ?? null, row.newSl ?? null, String(row.detail || '').slice(0, 300)]);
     } catch (e) { console.error('[multiuser] sentinel log:', e.message); }
   }
+  let snHadState = false;
   async function snSaveState(force) {
     if (!force && Date.now() - snSavedAt < 15000) return;
     snSavedAt = Date.now();
@@ -1768,6 +1807,7 @@ function init(deps) {
     try {
       await ready;
       const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
+      if (positions.length && typeof wake === 'function') wake(10);
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
         const symbol = p.symbol, side = p.side, key = symbol + '|' + side, long = side === 'Buy'; seen.add(key);
@@ -1852,7 +1892,9 @@ function init(deps) {
         await q(`INSERT INTO trade_path(symbol,side,mark,now_r,peak_r,atr,score,state) VALUES ${ph.join(',')}`, vals).catch(e => console.error('[multiuser] sentinel path:', e.message));
       }
       snRun.at = Date.now(); snRun.ok = true; snRun.err = null; snRun.note = ''; snRun.positions = positions.length;
-      await snSaveState(false);
+      const snHasState = positions.length > 0 || snState.size > 0 || snClosing.length > 0;
+      if (snHasState || snHadState) await snSaveState(!snHasState);   // was every 15 s all day, even with no trade open; now only while a trade is tracked (plus one last save when it ends)
+      snHadState = snHasState;
     } catch (e) { snRun.at = Date.now(); snRun.ok = false; snRun.err = e.message; console.error('[multiuser] sentinel:', e.message); }
     finally { snRun.busy = false; }
   }
@@ -2068,16 +2110,17 @@ function init(deps) {
     { const t1 = setTimeout(() => pruneOldRows().catch(e => console.error('[multiuser] retention:', e.message)), 5 * 60000); if (t1.unref) t1.unref();
       const t2 = setInterval(() => pruneOldRows().catch(e => console.error('[multiuser] retention:', e.message)), 6 * 3600 * 1000); if (t2.unref) t2.unref(); }
     setTimeout(() => settlePending().catch(() => {}), 20000);
-    setInterval(() => settlePending().catch(() => {}), 30000);
-    setInterval(() => alertSweep().catch(e => console.error('[multiuser] alert sweep:', e.message)), Number(process.env.ALERT_SWEEP_MS) || 20000);   // retries failed deliveries and sends the short safety-net alerts
+    setInterval(() => { if (dbBusy()) settlePending().catch(() => {}); }, 30000);
+    { const hw = setInterval(() => wake(3), 3600 * 1000); if (hw.unref) hw.unref(); }   // hourly safety net: the sweeps run for a few minutes even when nothing is going on
+    setInterval(() => { if (dbBusy()) alertSweep().catch(e => console.error('[multiuser] alert sweep:', e.message)); }, Number(process.env.ALERT_SWEEP_MS) || 20000);   // retries failed deliveries and sends the short safety-net alerts
     setInterval(() => q(`DELETE FROM bot_msgs WHERE created_at < now() - interval '30 days'`).catch(() => {}), 6 * 3600 * 1000);
     const pgLoop = () => { pgTick().catch(e => console.error('[multiuser] profit guard:', e.message)).finally(() => { const t = setTimeout(pgLoop, Math.max(3000, (pgCfg.pollSec || 5) * 1000)); if (t.unref) t.unref(); }); };
     setTimeout(pgLoop, 15000);
     const snLoop = () => { snTick().catch(e => console.error('[multiuser] sentinel:', e.message)).finally(() => { const t = setTimeout(snLoop, Math.max(3000, (snCfg.pollSec || 5) * 1000)); if (t.unref) t.unref(); }); };
     setTimeout(snLoop, 17000);   // Trade Sentinel loop (does nothing while it is switched off)   // Profit Guard loop (does nothing while it is switched off)
-    setInterval(() => checkSignalAlarms().catch(e => console.error('[multiuser] signal alarm:', e.message)), Number(process.env.ALERT_SWEEP_MS) || 20000);
+    setInterval(() => { if (dbBusy()) checkSignalAlarms().catch(e => console.error('[multiuser] signal alarm:', e.message)); }, Number(process.env.ALERT_SWEEP_MS) || 20000);
     setTimeout(() => syncAll().catch(e => console.error('[multiuser] initial sync:', e.message)), 20000);
-    setInterval(() => syncAll().catch(e => console.error('[multiuser] sync:', e.message)), SYNC_INTERVAL_MS);
+    setInterval(() => { if (dbBusy()) syncAll().catch(e => console.error('[multiuser] sync:', e.message)); }, SYNC_INTERVAL_MS);
     setTimeout(() => runBackupIfDue(false).catch(e => console.error('[multiuser] backup:', e.message)), 90000);
     setInterval(() => runBackupIfDue(false).catch(e => console.error('[multiuser] backup:', e.message)), 3600 * 1000);
     if (tgOn) {
@@ -3067,7 +3110,10 @@ function init(deps) {
       FROM signals s LEFT JOIN order_log o ON o.signal_key = 'ym-' || s.rid AND o.kind='ORDER' AND s.rid IS NOT NULL AND s.rid <> ''
       WHERE s.opened_at > now() - ($1 || ' hours')::interval
       GROUP BY s.k ORDER BY s.opened_at DESC LIMIT $2`, [String(hours), limit]);
-    const bots = (await q('SELECT bot, payload, at FROM bot_status ORDER BY bot')).rows.map(b => { let p = {}; try { p = JSON.parse(b.payload); } catch { /* ignore */ } return { bot: b.bot, at: b.at, build: p.build || null, open: p.open ?? null, cfg: p.cfg || null, relayq: p.relayq || null, webq: p.webq || null }; });
+    const botRows = (await q('SELECT bot, payload, at FROM bot_status ORDER BY bot')).rows;
+    for (const [mb, mv] of botStatusMem) { const i = botRows.findIndex(x => x.bot === mb); if (i >= 0) botRows[i] = { bot: mb, payload: mv.payload, at: mv.at }; else botRows.push({ bot: mb, payload: mv.payload, at: mv.at }); }
+    botRows.sort((x, y) => String(x.bot).localeCompare(String(y.bot)));
+    const bots = botRows.map(b => { let p = {}; try { p = JSON.parse(b.payload); } catch { /* ignore */ } return { bot: b.bot, at: b.at, build: p.build || null, open: p.open ?? null, cfg: p.cfg || null, relayq: p.relayq || null, webq: p.webq || null }; });
     res.json({ success: true, bots, signals: r.rows.map(x => {
       const reached = !!x.order_seen_at;
       let state = 'ok', text = '';
