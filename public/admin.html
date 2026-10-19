@@ -165,6 +165,22 @@
   .hold{position:relative;overflow:hidden;width:100%;border-radius:10px;border:1px solid #5a2a30;background:rgba(239,68,68,.08);color:var(--short);padding:12px 14px;font-size:12px;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:none;margin-top:8px}
   .hold .hf{position:absolute;left:0;top:0;bottom:0;width:0;background:repeating-linear-gradient(45deg,rgba(242,177,52,.55) 0 10px,rgba(242,177,52,.25) 10px 20px)}
   .hold span{position:relative}.hold[disabled]{opacity:.45;cursor:not-allowed}
+  .hold.sm{margin-top:0;padding:9px 10px;font-size:11.5px;text-align:center;line-height:1.25}
+  .hold.win{border-color:#1d5a37;background:rgba(34,197,94,.07);color:var(--long)}
+  .hold.neu{border-color:var(--line);background:var(--inset);color:var(--paper)}
+  .cdeck{display:grid;gap:10px}.cdeck h4{margin:6px 0 0;font-size:10.5px;font-weight:500;color:var(--mist);letter-spacing:.05em;text-transform:uppercase}
+  .cdeck .crow{display:grid;grid-template-columns:repeat(auto-fit,minmax(142px,1fr));gap:8px}
+  .cdeck .cpair{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,210px);gap:8px;align-items:center}
+  .cdeck .chd{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;background:transparent;border:0;color:inherit;padding:0;cursor:pointer;text-align:left;font:inherit}
+  .cwl2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .cw{background:var(--inset);border:1px solid var(--line);border-radius:14px;padding:12px;display:grid;gap:8px;align-content:start;min-width:0}
+  .cw.win{border-color:#1d5a37;background:linear-gradient(180deg,rgba(34,197,94,.07),transparent 70%),var(--inset)}.cw.los{border-color:#5a2a30;background:linear-gradient(180deg,rgba(239,68,68,.07),transparent 70%),var(--inset)}
+  .cwh{display:flex;align-items:center;justify-content:space-between;gap:8px}.cwt{font-size:13px;font-weight:600}
+  .cwn{font-size:24px;font-weight:500;line-height:1.1}.cwl{display:grid;gap:3px;min-height:20px}
+  .cwr{display:flex;justify-content:space-between;gap:8px;font-size:12px;padding:3px 0;border-top:1px solid var(--line)}.cwr:first-child{border-top:0}
+  .cw .hold{margin-top:4px}
+  @media (max-width:640px){.cwl2{grid-template-columns:1fr}}
+  .lt-x{display:flex;justify-content:flex-end}.lt-x .hold{width:auto;min-width:0;padding:7px 12px}
 
   /* drawer */
   .over{position:fixed;inset:0;z-index:50;background:rgba(5,6,9,.66);display:flex;justify-content:flex-end}
@@ -276,7 +292,7 @@ function start(){
   var h=(location.hash||'').replace('#','');if(TABS.indexOf(h)>-1)S.tab=h;
   refreshAll();
   if(S.timer)clearInterval(S.timer);
-  S.tick=0;S.timer=setInterval(function(){if(document.hidden||S.planEditing)return;S.tick++;if(S.tab==='trading'||S.tab==='live'||S.tick%2===0)refreshAll(true)},10000);
+  S.tick=0;S.timer=setInterval(function(){if(document.hidden||S.planEditing||S.holding)return;S.tick++;if(S.tab==='trading'||S.tab==='live'||S.tick%2===0)refreshAll(true)},10000);
 }
 
 /* ---------- loading ---------- */
@@ -344,8 +360,8 @@ function loadOrders(){
 function bindHold(btn){
   var key=btn.getAttribute('data-hold'),f=btn.querySelector('.hf'),D=1100,t0=0,raf=0,on=false;
   function step(ts){if(!t0)t0=ts;var p=Math.min(1,(ts-t0)/D);f.style.width=(p*100)+'%';if(p>=1){stop();if(HOLD[key])HOLD[key](btn)}else raf=requestAnimationFrame(step)}
-  function start_(){if(btn.disabled||on)return;on=true;t0=0;raf=requestAnimationFrame(step)}
-  function stop(){on=false;cancelAnimationFrame(raf);t0=0;f.style.width='0'}
+  function start_(){if(btn.disabled||on)return;on=true;S.holding=true;t0=0;raf=requestAnimationFrame(step)}
+  function stop(){on=false;S.holding=false;cancelAnimationFrame(raf);t0=0;f.style.width='0'}
   btn.addEventListener('pointerdown',function(e){e.preventDefault();start_()});
   ['pointerup','pointerleave','pointercancel'].forEach(function(ev){btn.addEventListener(ev,stop)});
   btn.addEventListener('keydown',function(e){if((e.key===' '||e.key==='Enter')&&!e.repeat){e.preventDefault();start_()}});
@@ -974,7 +990,35 @@ function tradeCard(t){
   if(t.sentinel)chips+='<span class="chip '+(t.sentinel.state==='danger'?'short':t.sentinel.state==='alert'?'warn':'')+'" title="Sentinel score '+esc(t.sentinel.score)+'">Sentinel · '+esc(t.sentinel.state||'calm')+'</span>';
   (q.flags||[]).slice(0,3).forEach(function(f){chips+='<span class="chip warn">'+esc(f)+'</span>'});
   if(chips)h+='<div class="lt-f">'+chips+'</div>';
+  h+='<div class="lt-x"><button class="hold sm" data-hold="closeScope" data-scope="trade" data-symbol="'+esc(t.symbol)+'" data-side="'+(L?'Buy':'Sell')+'" aria-label="Hold to close '+esc(coinOf(t.symbol))+'"><span class="hf"></span><span>Hold to close '+esc(coinOf(t.symbol))+'</span></button></div>';
   return h+'</div>';
+}
+function closeDeck(V){
+  var T=V.trades||[],n=T.length,sum=function(a){return a.reduce(function(s,t){return s+(t.upl||0)},0)};
+  var win=T.filter(function(t){return t.upl>0}).sort(function(a,c){return c.upl-a.upl}),los=T.filter(function(t){return t.upl<0}).sort(function(a,c){return a.upl-c.upl});
+  var lg=T.filter(function(t){return t.side==='Buy'}),sh=T.filter(function(t){return t.side!=='Buy'});
+  var bots={};T.forEach(function(t){if(t.bot)(bots[t.bot]=bots[t.bot]||[]).push(t)});
+  var hb=function(scope,label,arr,cls,data){return '<button class="hold sm '+cls+'" data-hold="closeScope" data-scope="'+scope+'"'+(data||'')+(arr.length?'':' disabled')+'><span class="hf"></span><span>'+label+'</span></button>'};
+  var panel=function(scope,title,arr,kind,empty){
+    var rows=arr.slice(0,6).map(function(t){return '<div class="cwr"><span><b>'+esc(coinOf(t.symbol))+'</b> <span class="'+(t.side==='Buy'?'long':'short')+'">'+(t.side==='Buy'?'LONG':'SHORT')+'</span></span><span class="num '+cls(t.upl)+'">'+pnlTxt(t.upl)+'</span></div>'}).join('');
+    if(arr.length>6)rows+='<div class="cwr mist"><span>+ '+(arr.length-6)+' more</span></div>';
+    return '<div class="cw '+kind+'"><div class="cwh"><span class="cwt">'+title+'</span><span class="chip">'+arr.length+' trade'+(arr.length===1?'':'s')+'</span></div>'
+      +'<div class="cwn num '+(arr.length?cls(sum(arr)):'mist')+'">'+(arr.length?pnlTxt(sum(arr)):usd(0))+'</div>'
+      +'<div class="cwl">'+(arr.length?rows:'<div class="cwr mist"><span>'+empty+'</span></div>')+'</div>'
+      +'<button class="hold'+(kind==='win'?' win':'')+'" data-hold="closeScope" data-scope="'+scope+'"'+(arr.length?'':' disabled')+'><span class="hf"></span><span>'+(arr.length?'Hold to close '+(arr.length===1?'this '+title.toLowerCase().replace(/s$/,'')+' trade':'all '+arr.length+' '+title.toLowerCase()):'Nothing to close')+'</span></button></div>';
+  };
+  var open=!!S.deckOpen;
+  var h='<div class="card cdeck" id="cdeck"><div><b style="font-size:15px">Close trades</b><br><span class="mist small">Hold a button for about a second. Closes on the master and on every copy account.</span></div>';
+  h+='<div class="cwl2">'+panel('winners','Winners',win,'win','No trade is in profit right now')+panel('losers','Losers',los,'los','No trade is in loss right now')+'</div>';
+  h+='<button class="hold" data-hold="closeScope" data-scope="all"'+(n?'':' disabled')+'><span class="hf"></span><span><b>Hold to close everything</b> &middot; '+n+' open trade'+(n===1?'':'s')+(n?' &middot; '+pnlTxt(sum(T)):'')+'</span></button>';
+  h+='<button class="chd" data-act="deckToggle" aria-expanded="'+open+'"><span class="mist small">More: longs or shorts, one bot, one pair</span><span class="chip">'+(open?'Hide':'Open')+'</span></button>';
+  if(!open)return h+'</div>';
+  h+='<h4>By direction</h4><div class="crow">'+hb('longs','Longs &middot; '+lg.length+(lg.length?' &middot; '+pnlTxt(sum(lg)):''),lg,'neu')+hb('shorts','Shorts &middot; '+sh.length+(sh.length?' &middot; '+pnlTxt(sum(sh)):''),sh,'neu')+'</div>';
+  var bk=Object.keys(bots).sort();
+  if(bk.length)h+='<h4>By bot</h4><div class="crow">'+bk.map(function(b){return hb('bot',esc(b.replace('YM ORACLE ','Oracle '))+' &middot; '+bots[b].length,bots[b],'neu',' data-bot="'+esc(b)+'"')}).join('')+'</div>';
+  h+='<h4>One pair</h4><div class="cpair"><input type="text" id="live-pair" list="live-pairs" placeholder="e.g. SOLUSDT" autocomplete="off" autocapitalize="characters" value="'+esc(S.livePair||'')+'" aria-label="Pair to close"><datalist id="live-pairs">'+T.map(function(t){return '<option value="'+esc(t.symbol)+'">'}).join('')+'</datalist><button class="hold sm" data-hold="closeScope" data-scope="pair" data-from="live-pair"><span class="hf"></span><span>Hold to close pair</span></button></div>';
+  h+='<p class="hint2">Each close is a reduce-only market order, so it can only shrink a position and never opens one. Winners and losers are decided by the master trade, and the copy accounts follow the same trades. A named pair is closed on the master and on any copy account that holds it, even if the master has none. Every trade card below also has its own close button.</p></div>';
+  return h;
 }
 function viewLive(){
   var V=S.live;
@@ -990,6 +1034,7 @@ function viewLive(){
     +'<div class="stat"><div class="k">Need attention</div><div class="v num '+(attn?'warn':'')+'">'+attn+'</div><div class="s">fragile or at risk</div></div></div>';
   h+='<div class="bandbar" style="margin:12px 0 4px" role="img" aria-label="Trades by quality band">'+['strong','steady','fragile','at risk','unknown'].map(function(k){return b[k]?'<i style="flex:'+b[k]+';background:'+col[k]+'" title="'+b[k]+' '+k+'"></i>':''}).join('')+'</div>';
   h+='<div class="hint2" style="margin-bottom:12px">'+['strong','steady','fragile','at risk'].map(function(k){return '<span class="bnd-'+(k==='at risk'?'risk':k)+'">●</span> '+(b[k]||0)+' '+k}).join(' &nbsp; ')+'</div>';
+  h+=closeDeck(V);
   var tr=V.trades.slice();
   if(S.liveSort==='best')tr.sort(function(a,c){return ((c.quality&&c.quality.score)||0)-((a.quality&&a.quality.score)||0)});
   else if(S.liveSort==='new')tr.sort(function(a,c){return c.openedAt-a.openedAt});
@@ -1027,6 +1072,20 @@ function exportCsv(id){
     var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='ym-ledger'+(id?'-user'+id:'')+'.csv';document.body.appendChild(a);a.click();a.remove();
   });
 }
+HOLD.closeScope=function(b){
+  var scope=b.getAttribute('data-scope'),body={confirm:'CLOSE',scope:scope},sym=b.getAttribute('data-symbol'),sd=b.getAttribute('data-side'),bt=b.getAttribute('data-bot'),from=b.getAttribute('data-from');
+  if(from){var e=$('#'+from);sym=e?String(e.value||'').trim().toUpperCase():'';if(sym&&!/USDT$/.test(sym)&&/^[A-Z0-9]{2,15}$/.test(sym))sym+='USDT'}
+  if(scope==='pair'&&!/^[A-Z0-9]{3,20}$/.test(sym||'')){toast('Type a pair first, for example SOLUSDT');return}
+  if(sym)body.symbol=sym;if(sd)body.side=sd;if(bt)body.bot=bt;
+  j('/api/admin/close-trades','POST',body).then(function(r){
+    if(!r.success){toast(r.message||'Could not close');return}
+    var m=r.master||{},u=r.users||{},f=(m.failed||0)+(u.failed||0);
+    if(m.closed||u.closed)toast('Closed '+(m.closed||0)+' on the master and '+(u.closed||0)+' on copy accounts'+(f?', '+f+' failed (see Activity)':''));
+    else toast(f?'Could not close: '+((m.errors||[])[0]||'see Activity'):'Nothing matched: no open trade to close');
+    if(from)S.livePair='';
+    refreshAll(true);
+  }).catch(function(){toast('Could not reach the server')});
+};
 HOLD.closeAll=function(){
   $('#pop').hidden=true;$('#statePill').setAttribute('aria-expanded','false');
   j('/api/admin/close-all','POST',{confirm:'CLOSE'}).then(function(r){toast(r.success?'Closed '+r.closed+' trade(s) across '+r.users+' user(s)'+(r.failed?', '+r.failed+' failed (see Activity)':''):(r.message||'Failed'));refreshAll(true)});
@@ -1073,6 +1132,7 @@ document.addEventListener('click',function(e){
   if(a==='sync'){t.textContent='Syncing…';j('/api/admin/sync-now','POST').then(function(){t.textContent='Sync PnL';toast('PnL synced');refreshAll(true)});return}
   if(a==='csv'){exportCsv();return}
   if(a==='testAlert'){var to=t.getAttribute('data-to')||'',lab=t.textContent;t.textContent='Sending…';j('/api/admin/test-alert','POST',to?{target:to}:{}).then(function(r){t.textContent=lab;toast(!r.configured?'No alert channel is set up on Render yet (Telegram token and chat id)':r.muted?'Muted by your alert settings ('+(r.reason||'see the panel')+'): nothing was sent':r.success?'Test sent'+(to==='group'?' to the group':to==='dm'?' to your DM':'')+(r.telegram&&r.telegram.indexOf('sent')===0?'':'')+(r.email==='sent'?' and email':''):'Sending failed: Telegram '+r.telegram+(r.email!=='off'?', email '+r.email:''))}).catch(function(){t.textContent=lab;toast('Could not reach the server')});return}
+  if(a==='deckToggle'){S.deckOpen=!S.deckOpen;render();return}
   if(a==='gmaster'){var gon=t.getAttribute('data-v')==='on';j('/api/admin/guards-master','POST',{on:gon}).then(function(r){if(r.success){if(S.pg)S.pg.master=r.master;if(S.live)S.live.master=r.master;toast(r.master?'Guards are on':'Guards are off: trades run on their own stops');refreshAll(true)}else toast(r.message||'Could not change it')});return}
   if(a==='pgMode'){var pm=t.getAttribute('data-v');pgPost({mode:pm},pm==='live'?'Profit Guard is LIVE':pm==='shadow'?'Shadow mode: recording only':'Profit Guard is off');return}
   if(a==='pgProf'){var pp=t.getAttribute('data-p'),pv=t.getAttribute('data-v'),pb={};pb[pp]={mode:pv};pgPost(pb,pp+': '+(pv==='inherit'?'follows the overall mode':pv));return}
@@ -1101,6 +1161,7 @@ document.addEventListener('input',function(e){
   var t=e.target;
   if(t.id==='mk-key'){S.mk.key=t.value;S.mk.confirm=false;return}
   if(t.id==='mk-sec'){S.mk.sec=t.value;S.mk.confirm=false;return}
+  if(t.id==='live-pair'){S.livePair=t.value;return}
   if(t.id==='live-in'){S.liveTxt=t.value;var g=$('#liveGo');if(g)g.disabled=S.liveTxt!=='LIVE';return}
   if(t.id==='uq'){S.q=t.value;render();return}
   if(t.id==='oq'){S.ouser=t.value;clearTimeout(S.oT);S.oT=setTimeout(function(){loadOrders().then(render)},350);return}

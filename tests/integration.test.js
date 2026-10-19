@@ -1535,6 +1535,59 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     await mu._test.pgTick(); assert(state.stops.length > nStops, 'master back on: the guard works again from a fresh look');
     await POST({ smart: { slice: { on: false } } }, { confirm: 'LIVE' });
     ok('master switch: off = no guard touches a stop or a position and the floor lets the bot\'s stop through; admin-only; on again resumes; audited');
+
+    // v2.8.8: close trades from the Live trades page (one trade, a pair, a bot, winners, losers, longs, shorts, all), master + copy accounts
+    {
+      const CT = (b, extra) => call('/api/admin/close-trades', 'POST', Object.assign({ confirm: 'CLOSE' }, b, extra || {}), admin);
+      assert.strictEqual((await call('/api/admin/close-trades', 'POST', { scope: 'all', confirm: 'CLOSE' })).s, 401);
+      assert.strictEqual((await call('/api/admin/close-trades', 'POST', { scope: 'all' }, admin)).s, 400, 'needs the confirm');
+      assert.strictEqual((await CT({ scope: 'everything' })).s, 400); assert.strictEqual((await CT({ scope: 'trade', symbol: 'BTCUSDT' })).s, 400, 'a trade needs a side');
+      assert.strictEqual((await CT({ scope: 'pair', symbol: 'BTC USDT!' })).s, 400); assert.strictEqual((await CT({ scope: 'bot' })).s, 400);
+      const setup = () => {
+        for (const kk of Object.keys(state.positions)) delete state.positions[kk];
+        state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: '110', unrealisedPnl: '5', positionIdx: 0 };
+        state.positions['ADMINK:ETHUSDT'] = { side: 'Sell', size: '1', avgPrice: '50', markPrice: '53', unrealisedPnl: '-3', positionIdx: 0 };
+        state.positions['ADMINK:SOLUSDT'] = { side: 'Buy', size: '2', avgPrice: '20', markPrice: '20.5', unrealisedPnl: '1', positionIdx: 0 };
+        state.positions['KEYA:BTCUSDT'] = { side: 'Buy', size: '0.4' }; state.positions['KEYA:ETHUSDT'] = { side: 'Sell', size: '3' };
+        state.positions['KEYA:SOLUSDT'] = { side: 'Buy', size: '8' };
+      };
+      const closes = (k) => state.submits.slice(n0).filter(x => x.k === k && x.body.reduceOnly === true);
+      let n0 = state.submits.length; setup();
+      let r = await CT({ scope: 'trade', symbol: 'btcusdt', side: 'long' });
+      assert(r.j.success && r.j.master.closed === 1 && r.j.matched.length === 1 && r.j.matched[0].symbol === 'BTCUSDT', JSON.stringify(r.j));
+      assert.deepStrictEqual(closes('ADMINK').map(x => [x.body.symbol, x.body.side, x.body.qty]), [['BTCUSDT', 'Sell', '0.1']]);
+      assert(closes('KEYA').length === 1 && closes('KEYA')[0].body.symbol === 'BTCUSDT');
+      assert(!state.positions['ADMINK:BTCUSDT'] && state.positions['ADMINK:ETHUSDT'] && state.positions['KEYA:ETHUSDT'], 'only that trade closed');
+      ok('close one trade: the master position and the same trade on the copy accounts, nothing else');
+      n0 = state.submits.length; setup(); r = await CT({ scope: 'trade', symbol: 'BTCUSDT', side: 'short' });
+      assert(r.j.success && r.j.master.closed === 0 && closes('ADMINK').length === 0 && closes('KEYA').length === 0, 'a trade on the other side is left alone');
+      n0 = state.submits.length; setup(); r = await CT({ scope: 'pair', symbol: 'ETHUSDT' });
+      assert(r.j.master.closed === 1 && closes('ADMINK').length === 1 && closes('KEYA')[0].body.symbol === 'ETHUSDT' && state.positions['ADMINK:BTCUSDT']);
+      ok('close a pair: both the master and the copy accounts');
+      n0 = state.submits.length; setup(); r = await CT({ scope: 'winners' });
+      assert(r.j.master.closed === 2 && closes('ADMINK').map(x => x.body.symbol).sort().join() === 'BTCUSDT,SOLUSDT' && closes('KEYA').map(x => x.body.symbol).sort().join() === 'BTCUSDT,SOLUSDT' && state.positions['ADMINK:ETHUSDT'] && state.positions['KEYA:ETHUSDT'], JSON.stringify(r.j));
+      n0 = state.submits.length; setup(); r = await CT({ scope: 'losers' });
+      assert(r.j.master.closed === 1 && closes('ADMINK')[0].body.symbol === 'ETHUSDT' && closes('KEYA').length === 1 && closes('KEYA')[0].body.symbol === 'ETHUSDT');
+      ok('close all winners / all losers: chosen by the master trade\'s result, followed on the copy accounts');
+      n0 = state.submits.length; setup(); r = await CT({ scope: 'shorts' });
+      assert(r.j.master.closed === 1 && closes('ADMINK')[0].body.symbol === 'ETHUSDT' && closes('KEYA').length === 1 && closes('KEYA')[0].body.symbol === 'ETHUSDT');
+      n0 = state.submits.length; setup(); r = await CT({ scope: 'longs' });
+      assert(r.j.master.closed === 2 && closes('KEYA').length === 2 && state.positions['ADMINK:ETHUSDT'] && state.positions['KEYA:ETHUSDT']);
+      ok('close all longs / all shorts');
+      n0 = state.submits.length; setup(); r = await CT({ scope: 'bot', bot: 'Oracle I' });
+      assert(r.j.master.closed === 1 && closes('ADMINK')[0].body.symbol === 'BTCUSDT' && closes('KEYA')[0].body.symbol === 'BTCUSDT', JSON.stringify(r.j));
+      n0 = state.submits.length; setup(); r = await CT({ scope: 'bot', bot: 'YM ORACLE III' });
+      assert(r.j.master.closed === 0 && closes('ADMINK').length === 0 && closes('KEYA').length === 0, 'a bot with no open trade closes nothing');
+      ok('close one bot\'s trades: matched through the signal that opened each trade');
+      n0 = state.submits.length; setup(); r = await CT({ scope: 'all' });
+      assert(r.j.master.closed === 3 && closes('ADMINK').length === 3 && Object.keys(state.positions).length === 0, JSON.stringify(Object.keys(state.positions)));
+      assert((await db.query(`SELECT 1 FROM audit_log WHERE action='close_trades'`)).rowCount >= 5 && (await db.query(`SELECT 1 FROM master_log WHERE bot='ADMIN' AND kind='CLOSE'`)).rowCount >= 5);
+      ok('close everything: every master position and every copy account, audited and shown in the master journal');
+      state.submitRet.ADMINK = { retCode: 110017, retMsg: 'position is zero' }; n0 = state.submits.length; setup(); r = await CT({ scope: 'pair', symbol: 'BTCUSDT' }); delete state.submitRet.ADMINK;
+      assert(r.j.success && r.j.master.failed === 1 && r.j.master.closed === 0 && /BTC/.test(r.j.master.errors[0]), JSON.stringify(r.j));
+      ok('close: a refusal from Bybit is reported with the pair and the reason, not hidden');
+      for (const kk of Object.keys(state.positions)) delete state.positions[kk];
+    }
     // LIVE TRADES: the admin visual reads every open position and gives it a quality reading
     assert.strictEqual((await call('/api/admin/live-trades', 'GET')).s, 401);
     P(125, 112); const lv = (await call('/api/admin/live-trades', 'GET', null, admin)).j;

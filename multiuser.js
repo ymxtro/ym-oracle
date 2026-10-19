@@ -2692,6 +2692,95 @@ function init(deps) {
     res.json({ success: true, users: users.length, closed, failed });
   }));
 
+  // ---------- CLOSE TRADES (admin) ----------
+  // One trade, a whole pair, one bot's trades, all winners, all losers, all longs, all shorts, or everything: on the MASTER account and on every copy account.
+  // (The older /api/admin/close-all above only reaches the copy accounts. This one is what the Live trades page uses.)
+  // It sends reduce-only market closes, so it can never open a position. It does not touch the guards' settings; a closed trade just disappears from their watch.
+  const CLOSE_SCOPES = ['all', 'trade', 'pair', 'bot', 'winners', 'losers', 'longs', 'shorts'];
+  const botKey = v => String(v || '').trim().toUpperCase().replace(/^YM\s+/, '').replace(/^ORACLE\s+/, '');
+  const normSide = v => { const t = String(v || '').trim().toLowerCase(); return t === 'buy' || t === 'long' ? 'Buy' : t === 'sell' || t === 'short' ? 'Sell' : ''; };
+  async function closeSomeForUser(u, want, why) {
+    const out = { closed: 0, failed: 0, error: null, pairs: [] };
+    try {
+      const client = userClient(u);
+      const positions = (await listOpenPositions(client)).filter(want);
+      for (const p of positions) {
+        const side = p.side === 'Buy' ? 'Sell' : 'Buy';
+        try { await client.cancelAllOrders({ category: 'linear', symbol: p.symbol }); } catch { /* best effort */ }
+        try {
+          const res = await client.submitOrder({ category: 'linear', symbol: p.symbol, side, orderType: 'Market', qty: String(p.size), reduceOnly: true, positionIdx: Number(p.positionIdx) || 0 });
+          if (res.retCode === 0) { out.closed++; out.pairs.push(p.symbol.replace(/USDT$/, '')); await logOrder({ userId: u.id, kind: 'CLOSE', symbol: p.symbol, side, qty: Number(p.size), code: 'OK', ok: true, detail: 'Closed: ' + why }); }
+          else { out.failed++; await logOrder({ userId: u.id, kind: 'CLOSE', symbol: p.symbol, side, code: classifyRet(res.retCode), ok: false, detail: res.retMsg }); }
+        } catch (e) { out.failed++; await logOrder({ userId: u.id, kind: 'CLOSE', symbol: p.symbol, side, code: failFrom(e).code, ok: false, detail: e.message }); }
+      }
+    } catch (e) { out.error = e.message; out.failed++; if (failFrom(e).auth) await markKeyError(u, e.message); }
+    return out;
+  }
+  async function closeTrades(b, req) {
+    const scope = String(b.scope || ''), symbol = String(b.symbol || '').trim().toUpperCase(), side = normSide(b.side), bot = String(b.bot || '').trim();
+    const bad = m => ({ status: 400, body: { success: false, message: m } });
+    if (!CLOSE_SCOPES.includes(scope)) return bad('scope must be one of: ' + CLOSE_SCOPES.join(', '));
+    if ((scope === 'trade' || scope === 'pair') && !/^[A-Z0-9]{3,20}$/.test(symbol)) return bad('a valid symbol is needed');
+    if (scope === 'trade' && !side) return bad('a side (long or short) is needed to close one trade');
+    if (scope === 'bot' && !botKey(bot)) return bad('a bot name is needed');
+    const out = { scope, symbol: symbol || null, side: side || null, bot: bot || null, matched: [], master: { closed: 0, failed: 0, errors: [] }, users: { accounts: 0, closed: 0, failed: 0 }, note: '' };
+    const live = getMode() === 'live';
+    let mpos = [];
+    if (live) { await ready; mpos = (await listOpenPositions(restClient)).filter(p => p.side === 'Buy' || p.side === 'Sell'); }
+    else out.note = 'Paper mode: nothing is open on Bybit, so only copy accounts were looked at.';
+    const sel = [];
+    for (const p of mpos) {
+      const pnl = parseFloat(p.unrealisedPnl) || 0;
+      let hit = false;
+      if (scope === 'all') hit = true;
+      else if (scope === 'trade') hit = p.symbol === symbol && p.side === side;
+      else if (scope === 'pair') hit = p.symbol === symbol;
+      else if (scope === 'winners') hit = pnl > 0;
+      else if (scope === 'losers') hit = pnl < 0;
+      else if (scope === 'longs') hit = p.side === 'Buy';
+      else if (scope === 'shorts') hit = p.side === 'Sell';
+      else if (scope === 'bot') { const lk = await pgLookup(p.symbol, p.side).catch(() => ({})); hit = botKey(lk && lk.bot) === botKey(bot); }
+      if (hit) sel.push(p);
+    }
+    const stamp = Date.now().toString(36);
+    let n = 0;
+    for (const p of sel) {
+      const closeSide = p.side === 'Buy' ? 'Sell' : 'Buy', coin = p.symbol.replace(/USDT$/, '');
+      out.matched.push({ symbol: p.symbol, side: p.side, upl: parseFloat(p.unrealisedPnl) || 0 });
+      try { await restClient.cancelAllOrders({ category: 'linear', symbol: p.symbol }); } catch { /* best effort */ }
+      let ok = false, detail = '';
+      try {
+        const res = await restClient.submitOrder({ category: 'linear', symbol: p.symbol, side: closeSide, orderType: 'Market', qty: String(p.size), reduceOnly: true, positionIdx: Number(p.positionIdx) || 0, orderLinkId: 'adm' + stamp + (n++) });
+        ok = res.retCode === 0; detail = ok ? 'Closed by the admin (' + scope + ')' : (res.retMsg || ('Bybit code ' + res.retCode));
+      } catch (e) { detail = e.message || String(e); }
+      if (ok) out.master.closed++; else { out.master.failed++; out.master.errors.push(coin + ': ' + detail); }
+      await recordExec({ id: 'adm' + stamp + '-' + n, bot: 'ADMIN', kind: 'CLOSE', symbol: p.symbol, side: p.side === 'Buy' ? 'BUY' : 'SELL', ok, code: ok ? 'OK' : 'BYBIT', detail }).catch(() => {});
+    }
+    // the copy accounts: the same trades. "all", "longs", "shorts" and a named pair or trade look at each account's own positions; winners / losers / one bot follow what the master selected
+    const keys = new Set(sel.map(p => p.symbol + '|' + p.side));
+    const want = scope === 'trade' ? (p => p.symbol === symbol && p.side === side) : scope === 'pair' ? (p => p.symbol === symbol)
+      : scope === 'longs' ? (p => p.side === 'Buy') : scope === 'shorts' ? (p => p.side === 'Sell') : (p => keys.has(p.symbol + '|' + p.side));
+    if (scope === 'all' || scope === 'trade' || scope === 'pair' || scope === 'longs' || scope === 'shorts' || keys.size) {
+      const users = (await q(`SELECT * FROM users WHERE key_enc IS NOT NULL AND active ORDER BY id`)).rows;
+      out.users.accounts = users.length;
+      await runLimited(users, 5, u => enqueue(u.id, async () => {
+        const r = scope === 'all' ? await closeAllForUser(u, 'admin closed all trades') : await closeSomeForUser(u, want, 'admin closed ' + (scope === 'pair' || scope === 'trade' ? symbol : scope));
+        out.users.closed += r.closed; out.users.failed += r.failed;
+        if (r.closed) notify(u, '🛑 The admin closed ' + (scope === 'all' ? 'all open trades' : r.closed === 1 ? 'a trade' : r.closed + ' trades') + ' on your account' + (scope === 'all' ? ' (' + r.closed + ').' : (r.pairs && r.pairs.length ? ': ' + r.pairs.slice(0, 6).join(', ') + '.' : '.')));
+      }));
+    }
+    liveCache = { at: 0, v: null };
+    await audit('admin', 'close_trades', scope + (symbol ? ':' + symbol : '') + (side ? ':' + side : '') + (bot ? ':' + bot : ''), req, 'master closed ' + out.master.closed + ', failed ' + out.master.failed + '; copy accounts closed ' + out.users.closed + ', failed ' + out.users.failed + ' (' + out.users.accounts + ' accounts)');
+    if (out.master.closed || out.users.closed) deliverAlert('🛑 Admin closed ' + (scope === 'all' ? 'everything' : scope === 'trade' || scope === 'pair' ? symbol.replace(/USDT$/, '') : scope === 'bot' ? bot : scope) + ': master ' + out.master.closed + ', copy accounts ' + out.users.closed + (out.master.failed + out.users.failed ? ', failed ' + (out.master.failed + out.users.failed) : '') + '.', { cat: 'updates' }).catch(() => {});
+    return { status: 200, body: { success: true, ...out } };
+  }
+  app.post('/api/admin/close-trades', adminAuth, h(async (req, res) => {
+    const b = req.body || {};
+    if (b.confirm !== 'CLOSE') return res.status(400).json({ success: false, message: 'Send confirm:"CLOSE" to close trades.' });
+    const r = await closeTrades(b, req);
+    res.status(r.status).json(r.body);
+  }));
+
   app.post('/api/admin/users/:id/reset-password', adminAuth, h(async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const temp = crypto.randomBytes(9).toString('base64url'); // shown once; the user must change it at next login
