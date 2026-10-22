@@ -335,6 +335,7 @@ function init(deps) {
   let snCfg = SN.defaults();            // Trade Sentinel settings (off until switched on from the admin console)
   let pgCfg = PG.defaults();            // Profit Guard settings (off until switched on from the admin console)
   const pgWatch = new Map();            // re-entry watches (recording only); filled and used further down
+  const botReads = new Map();           // the bots' own reversal readings, by 'SYMBOL|Side' (memory only: a reading is only useful for a few minutes)
   let guardsMaster = true;              // MASTER SWITCH: off = Profit Guard, Sentinel, the stop floor and the early slice all do nothing and trades run on their own stops
   const snState = new Map();            // Trade Sentinel: 'SYMBOL|Side' -> what it knows about that open trade
   const pgState = new Map();            // 'SYMBOL|Buy' -> { entry, initialSl, peak, floor, shadowSl, profile, ... } for every trade being watched
@@ -368,41 +369,9 @@ function init(deps) {
     ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
     max: 5,
     idleTimeoutMillis: 10000,
-    keepAlive: true,                    // keeps a quiet connection from being dropped silently
-    connectionTimeoutMillis: 15000,     // a database that is waking up gets 15 s; before, a stuck connect could hang a request for ever
   });
   pool.on('error', e => console.error('[multiuser] db pool error:', e.message));
-  // A database that has just woken from sleep can drop its first connection. A read is harmless to repeat, so a read is retried once;
-  // a write is never repeated here (a repeated write could be applied twice).
-  const isConnErr = e => !!e && (/Connection terminated|ECONNRESET|ETIMEDOUT|EPIPE|timeout exceeded when trying to connect/i.test(String(e.message || '')) || ['ECONNRESET', 'ETIMEDOUT', 'EPIPE'].includes(e.code));
-  const q = (text, params) => {
-    const p = pool.query(text, params);
-    if (!/^\s*select\b/i.test(text)) return p;
-    return p.catch(e => (isConnErr(e) ? new Promise(r => setTimeout(r, 400)).then(() => pool.query(text, params)) : Promise.reject(e)));
-  };
-
-  // ---- Let the database sleep (Neon free plan: it only sleeps after 5 minutes with no query) ----
-  // The sweeps below used to query every 20-30 s all day, so the database never slept. Now they run only while there is real work:
-  // a bot event, an order, or an open trade makes the relay "busy" for 10-15 minutes, and a short check runs once an hour as a safety net.
-  // DB_SLEEP=off on Render puts the old always-running behaviour back. Orders and the master trade path do not wait on the database.
-  const DB_SLEEP = process.env.DB_SLEEP !== 'off';
-  let workUntil = Date.now() + (process.env.DB_SLEEP_BOOT_MIN !== undefined && process.env.DB_SLEEP_BOOT_MIN !== '' ? Number(process.env.DB_SLEEP_BOOT_MIN) || 0 : 15) * 60000;   // at start everything runs for 15 min, so a restart finishes whatever was half done
-  const dbBusy = () => !DB_SLEEP || Date.now() < workUntil;
-  // Each bot reports its status every 10 minutes. While the relay is idle that report is kept in memory (not written to the database, which would wake it
-  // four times in ten minutes all day); it is saved as soon as there is real work, and at the hourly check. The admin page reads memory first.
-  const botStatusMem = new Map();   // bot -> { payload, at }
-  async function flushBotStatus() {
-    for (const [bot, v] of [...botStatusMem.entries()]) {
-      botStatusMem.delete(bot);
-      try { await pool.query(`INSERT INTO bot_status(bot,payload,at) VALUES($1,$2,$3) ON CONFLICT (bot) DO UPDATE SET payload=EXCLUDED.payload, at=EXCLUDED.at WHERE bot_status.at < EXCLUDED.at`, [bot, v.payload, v.at]); }
-      catch (e) { if (!botStatusMem.has(bot)) botStatusMem.set(bot, v); console.error('[multiuser] bot status flush:', e.message); }
-    }
-  }
-  const wake = (min) => {
-    const wasIdle = !dbBusy(), t = Date.now() + (min || 10) * 60000;
-    if (t > workUntil) workUntil = t;
-    if (wasIdle && botStatusMem.size) flushBotStatus().catch(() => {});
-  };
+  const q = (text, params) => pool.query(text, params);
 
   const ready = q(`
     CREATE TABLE IF NOT EXISTS users (
@@ -1061,7 +1030,6 @@ function init(deps) {
   }
 
   async function fanOutOrder(body) {
-    wake(15);                                                    // an order is real work: keep the sweeps running while it settles
     const o = sanitizeOrder(body);
     if (!o) { console.warn('[multiuser] fan-out skipped: order failed validation'); return; }
     const reduceOnly = o.reduceOnly === true;
@@ -1203,7 +1171,6 @@ function init(deps) {
     const bot = clip(b.bot, 30);
     if (!bot) return { status: 400, message: 'bot is required' };
     const ev = String(b.ev || '');
-    if (ev !== 'status') wake(15);                               // a signal, an alert or a close is real work for the sweeps (a 10-minute status report is not)
     // Abuse guard: while DEVICE_KEY_MODE is 'warn' anyone who knows the URL can post here, so alerts and new ledger rows are capped. A bot that is capped
     // gets a 429, which it treats as "try again later" (it keeps the report), so a real alert is delayed, never lost.
     if (ev === 'msg') {
@@ -1213,6 +1180,21 @@ function init(deps) {
     if (ev === 'test') {
       if (Date.now() - lastBotTestAt < 15000) return { status: 429, message: 'one test at a time' };
       lastBotTestAt = Date.now();
+    }
+    if (ev === 'read') {                                                   // the bot's own reversal reading for one open trade (memory only, never the ledger)
+      const rs = String(b.sym || '').toUpperCase();
+      if (!SYMBOL_RE.test(rs)) return { status: 400, message: 'bad symbol' };
+      const rsd = sideOf(b.side);
+      if (rsd !== 'BUY' && rsd !== 'SELL') return { status: 400, message: 'bad side' };
+      const u = numOr(b.urg), rpv = numOr(b.rp);
+      if (u === null || u === undefined || u < 0 || u > 1.5) return { status: 400, message: 'bad reading' };
+      const rkey = rs + '|' + (rsd === 'BUY' ? 'Buy' : 'Sell');
+      botReads.set(rkey, { urg: u, rp: rpv, st: b.st ? 1 : 0, tr: b.tr ? 1 : 0, pf: numOr(b.pf), rm: numOr(b.rm), at: Date.now(), bot });
+      if (botReads.size > 200) for (const [kk, vv] of botReads) if (Date.now() - vv.at > 1800000) botReads.delete(kk);
+      // "hold" = the relay is acting on this trade right now, so the bot may leave the whole-trade close to it (unless the reading is very strong)
+      const g0 = pgState.get(rkey);
+      const hold = !!(guardsMaster && pgCfg.smart.rev.on && pgCfg.smart.curve.on && g0 && PG.effMode(pgCfg, g0.profile) === 'live' && getMode() === 'live' && !breakerIsTripped());
+      return { status: 200, hold };
     }
     if (ev === 'test') { // the "test alert" button on a bot: proves bot -> relay -> Telegram/email works end to end
       const r = await deliverAlert('✅ Test alert from ' + bot.replace('YM ORACLE ', 'Oracle ') + '. The bot reached Render and Render can reach you. Trade alerts will arrive the same way.', { cat: 'tests' });
@@ -1230,10 +1212,7 @@ function init(deps) {
       return { status: 200 };
     }
     if (ev === 'status') {
-      const payload = JSON.stringify(b).slice(0, 4000);
-      if (!dbBusy()) { botStatusMem.set(bot, { payload, at: new Date() }); return { status: 200 }; }   // idle: keep it in memory, the database stays asleep
-      botStatusMem.delete(bot);
-      await q(`INSERT INTO bot_status(bot,payload,at) VALUES($1,$2,now()) ON CONFLICT (bot) DO UPDATE SET payload=EXCLUDED.payload, at=now()`, [bot, payload]);
+      await q(`INSERT INTO bot_status(bot,payload,at) VALUES($1,$2,now()) ON CONFLICT (bot) DO UPDATE SET payload=EXCLUDED.payload, at=now()`, [bot, JSON.stringify(b).slice(0, 4000)]);
       return { status: 200 };
     }
     if (!['open', 'relay', 'close'].includes(ev)) return { status: 400, message: 'unknown event' };
@@ -1575,7 +1554,6 @@ function init(deps) {
     try {
       await ready;
       const positions = await listOpenPositions(restClient);
-      if (positions.length && typeof wake === 'function') wake(10);   // an open trade is real work
       const seen = new Set();
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
@@ -1637,6 +1615,8 @@ function init(deps) {
         // ---- profit lock ----
         // ADAPT: the pair's own speed (1-minute ATR) and BTC's direction, from the candles the Sentinel already keeps. If they cannot be read, the plain rules apply.
         let adaptNow = {}, curveNow = {};
+        const rvNow = PG.revOf(pgCfg, botReads.get(key));          // the bot's own reversal reading for this trade (null when off, missing or too old)
+        st.rev = rvNow ? { urg: rvNow.urg, t: rvNow.t } : null;
         if ((pgCfg.smart.adapt && pgCfg.smart.adapt.on) || (pgCfg.smart.curve && pgCfg.smart.curve.on)) {
           try {
             const bars = await snBars(symbol), btcRaw = await snBtcMove();
@@ -1644,13 +1624,14 @@ function init(deps) {
             const btcDir = long ? btcRaw : -btcRaw;
             adaptNow = PG.adaptOf(pgCfg, { atr: SN.atrOf(bars), btcPct: btcDir, peakR: peakR0, maxPull: st.maxPull });
             const sn0 = snState.get(key), snSig = sn0 && sn0.mem && snEm(sn0) !== 'off' && Date.now() - (sn0.seenAt || 0) < 60000 ? { state: sn0.mem.state } : null;
-            curveNow = PG.curveOf(pgCfg, { btcPct: btcDir, peakDist: peakD0, maxPull: st.maxPull, pullNow: long ? st.peak - mark : mark - st.peak, atr: SN.atrOf(bars), sn: snSig });
+            curveNow = PG.curveOf(pgCfg, { btcPct: btcDir, peakDist: peakD0, maxPull: st.maxPull, pullNow: long ? st.peak - mark : mark - st.peak, atr: SN.atrOf(bars), sn: snSig, rev: rvNow });
             st.curveWhy = curveNow.curveWhy || '';
             st.adapt = { atrPct: adaptNow.atrPrice ? Math.round(adaptNow.atrPrice / pgCfg.smart.adapt.atrMult / mark * 10000) / 100 : null, keepAdj: adaptNow.keepAdj || 0, curveMul: curveNow.curveMul || null };
           } catch { adaptNow = {}; curveNow = {}; }
         }
         // ---- early slice: bank a share once the trade is a little over 1R; the size and the trigger follow the same per-trade room reading as the curve ----
-        const slc = !pf.scale.on && st.initialSl > 0 && !PG_BAD_RISK(long, entry, st.initialSl) ? PG.sliceOf(pgCfg, { mul: curveNow.curveMul }) : null;
+        let slc = !pf.scale.on && st.initialSl > 0 && !PG_BAD_RISK(long, entry, st.initialSl) ? PG.sliceOf(pgCfg, { mul: curveNow.curveMul }) : null;
+        if (rvNow && rvNow.sliceNow && !pf.scale.on && st.initialSl > 0 && !PG_BAD_RISK(long, entry, st.initialSl)) slc = { atR: 0.3, frac: rvNow.frac, why: 'the bot reads a reversal (' + rvNow.urg.toFixed(2) + ')' };   // a strong reversal read: bank a share now, leave the rest running
         if (slc) {
           const riskS = Math.abs(entry - st.initialSl), curRS = (long ? mark - entry : entry - mark) / riskS, flag = em === 'live' ? 'sliced' : 'slicedShadow';
           st.slicePlan = { atR: slc.atR, frac: slc.frac, why: slc.why };
@@ -1753,7 +1734,6 @@ function init(deps) {
         [row.symbol, row.side || null, row.mode || snCfg.mode, row.profile || null, row.event, row.state || null, row.score ?? null, row.entry ?? null, row.mark ?? null, row.oldSl ?? null, row.newSl ?? null, String(row.detail || '').slice(0, 300)]);
     } catch (e) { console.error('[multiuser] sentinel log:', e.message); }
   }
-  let snHadState = false;
   async function snSaveState(force) {
     if (!force && Date.now() - snSavedAt < 15000) return;
     snSavedAt = Date.now();
@@ -1807,7 +1787,6 @@ function init(deps) {
     try {
       await ready;
       const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
-      if (positions.length && typeof wake === 'function') wake(10);
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
         const symbol = p.symbol, side = p.side, key = symbol + '|' + side, long = side === 'Buy'; seen.add(key);
@@ -1863,7 +1842,7 @@ function init(deps) {
         const inst = await getInstrument(symbol).catch(() => null);
         const eff = em === 'shadow' && st.shadowSl > 0 ? (long ? Math.max(curSl, st.shadowSl) : (curSl > 0 ? Math.min(curSl, st.shadowSl) : st.shadowSl)) : curSl;
         let keepFrac = 0;
-        try { const g0 = pgState.get(key), cm = PG.curveOf(pgCfg, { btcPct, peakDist: long ? st.peak - entry : entry - st.peak, maxPull: g0 ? g0.maxPull : undefined, pullNow: long ? st.peak - mark : mark - st.peak, atr: f.atr, sn: { state: st.mem.state } }); keepFrac = PG.curveKeep(pgCfg, f.peakR, cm.curveMul) || 0; } catch { keepFrac = 0; }
+        try { const g0 = pgState.get(key), cm = PG.curveOf(pgCfg, { btcPct, peakDist: long ? st.peak - entry : entry - st.peak, maxPull: g0 ? g0.maxPull : undefined, pullNow: long ? st.peak - mark : mark - st.peak, atr: f.atr, sn: { state: st.mem.state }, rev: PG.revOf(pgCfg, botReads.get(key)) }); keepFrac = PG.curveKeep(pgCfg, f.peakR, cm.curveMul) || 0; } catch { keepFrac = 0; }
         const d = SN.decide({ side, entry, mark, peak: st.peak, curSl: eff, initialSl: st.initialSl, tick: inst && inst.tickSize || 0, atr: f.atr, state: st.mem.state, cfg: snCfg, keepFrac });
         st.why = d.action === 'raise' ? d.label : d.why;
         if (d.action !== 'raise') continue;
@@ -1892,9 +1871,7 @@ function init(deps) {
         await q(`INSERT INTO trade_path(symbol,side,mark,now_r,peak_r,atr,score,state) VALUES ${ph.join(',')}`, vals).catch(e => console.error('[multiuser] sentinel path:', e.message));
       }
       snRun.at = Date.now(); snRun.ok = true; snRun.err = null; snRun.note = ''; snRun.positions = positions.length;
-      const snHasState = positions.length > 0 || snState.size > 0 || snClosing.length > 0;
-      if (snHasState || snHadState) await snSaveState(!snHasState);   // was every 15 s all day, even with no trade open; now only while a trade is tracked (plus one last save when it ends)
-      snHadState = snHasState;
+      await snSaveState(false);
     } catch (e) { snRun.at = Date.now(); snRun.ok = false; snRun.err = e.message; console.error('[multiuser] sentinel:', e.message); }
     finally { snRun.busy = false; }
   }
@@ -2032,6 +2009,51 @@ function init(deps) {
   };
 
   // ---------- CSV export + daily backup ----------
+
+  // ---------- one file with everything about a bot (or all bots) for a date range ----------
+  // Sections in one CSV: SIGNALS (the bot's own ledger plus what Bybit and the copy users did with each trade), ORDERS (the relay's journal of
+  // what reached Bybit), GUARD and SENTINEL (every stop move or note while a trade was open), the two per-trade summaries, PATH (the price path
+  // of each open trade in R), and ALERTS (the messages the bot sent). The logs that carry no bot name are matched to the bot by pair, side and time.
+  async function buildExportAll(bot, fromD, toD) {
+    await ready;
+    const b = bot && bot !== 'all' ? bot : null;
+    const cap = 60000;
+    const sec = [];
+    const add = (name, cols, rows) => sec.push('## ' + name + ' (' + rows.length + ' rows' + (rows.length >= cap ? ', capped' : '') + ')\n' + cols.join(',') + '\n' + rows.map(r => cols.map(c => csvCell(r[c])).join(',')).join('\n'));
+    const onBot = (tbl, t) => `AND ($3::text IS NULL OR EXISTS (SELECT 1 FROM signals s WHERE s.bot=$3 AND s.symbol=${tbl}.symbol AND UPPER(${tbl}.side)=s.side AND ${tbl}.${t} >= s.opened_at - interval '1 minute' AND ${tbl}.${t} <= COALESCE(s.closed_at, now()) + interval '10 minutes'))`;
+    const P = [fromD, toD, b];
+    const sig = (await q(`SELECT s.bot, s.k, s.symbol, s.side, s.eng, s.opened_at, s.entry, s.sl, s.tp, s.lev, s.margin, s.relay_flag, s.relay_ok, s.relay_code, s.relay_secs,
+        s.closed_at, s.won, s.exit_price, s.pct, s.relayed, s.close_why,
+        (SELECT COUNT(*)::int FROM order_log o WHERE o.signal_key = 'ym-' || s.rid AND o.ok = true) AS users_filled,
+        (SELECT ROUND(AVG(o.slippage_bps)::numeric, 2) FROM order_log o WHERE o.signal_key = 'ym-' || s.rid AND o.slippage_bps IS NOT NULL) AS user_slip_bps
+      FROM signals s WHERE s.opened_at >= $1 AND s.opened_at < $2 AND ($3::text IS NULL OR s.bot=$3) ORDER BY s.opened_at LIMIT ${cap}`, P)).rows;
+    for (const r of sig) {
+      const e = Number(r.entry), sl = Number(r.sl), x = Number(r.exit_price), risk = Math.abs(e - sl);
+      r.risk_pct = e > 0 && sl > 0 ? Math.round(risk / e * 10000) / 100 : null;
+      r.exit_r = e > 0 && sl > 0 && x > 0 && risk > 0 ? Math.round(((r.side === 'BUY' ? x - e : e - x) / risk) * 100) / 100 : null;
+      r.minutes_open = r.closed_at ? Math.round((new Date(r.closed_at) - new Date(r.opened_at)) / 60000) : null;
+    }
+    add('SIGNALS', ['bot', 'k', 'symbol', 'side', 'eng', 'opened_at', 'entry', 'sl', 'tp', 'risk_pct', 'lev', 'margin', 'relay_flag', 'relay_ok', 'relay_code', 'relay_secs', 'users_filled', 'user_slip_bps',
+      'closed_at', 'minutes_open', 'won', 'exit_price', 'pct', 'exit_r', 'relayed', 'close_why'], sig);
+    add('ORDERS', ['bot', 'exec_id', 'kind', 'symbol', 'side', 'ok', 'code', 'detail', 'created_at'],
+      (await q(`SELECT bot, exec_id, kind, symbol, side, ok, code, detail, created_at FROM master_log WHERE created_at >= $1 AND created_at < $2 AND ($3::text IS NULL OR bot=$3) ORDER BY created_at LIMIT ${cap}`, P)).rows);
+    add('GUARD', ['at', 'symbol', 'side', 'mode', 'profile', 'event', 'entry', 'mark', 'old_sl', 'new_sl', 'peak_r', 'lock_pct', 'result_r', 'detail'],
+      (await q(`SELECT * FROM profit_guard_log g WHERE at >= $1 AND at < $2 ${onBot('g', 'at')} ORDER BY at LIMIT ${cap}`, P)).rows);
+    add('SENTINEL', ['at', 'symbol', 'side', 'mode', 'profile', 'event', 'state', 'score', 'entry', 'mark', 'old_sl', 'new_sl', 'detail'],
+      (await q(`SELECT * FROM sentinel_log g WHERE at >= $1 AND at < $2 ${onBot('g', 'at')} ORDER BY at LIMIT ${cap}`, P)).rows);
+    add('GUARD_TRADES', ['at', 'symbol', 'side', 'profile', 'mode', 'entry', 'initial_sl', 'peak_price', 'exit_price', 'peak_pct', 'exit_pct', 'giveback_pct', 'peak_r', 'exit_r', 'guard_floor', 'scaled', 'pnl'],
+      (await q(`SELECT * FROM pg_trades g WHERE at >= $1 AND at < $2 ${onBot('g', 'at')} ORDER BY at LIMIT ${cap}`, P)).rows);
+    add('SENTINEL_TRADES', ['at', 'symbol', 'side', 'profile', 'mode', 'label', 'entry', 'initial_sl', 'peak_r', 'max_score', 'first_alert_at', 'first_danger_at', 'moves', 'shadow_exit_r', 'exit_price', 'exit_r', 'pnl'],
+      (await q(`SELECT * FROM sentinel_trades g WHERE at >= $1 AND at < $2 ${onBot('g', 'at')} ORDER BY at LIMIT ${cap}`, P)).rows);
+    add('PATH', ['at', 'symbol', 'side', 'mark', 'now_r', 'peak_r', 'atr', 'score', 'state'],
+      (await q(`SELECT * FROM trade_path g WHERE at >= $1 AND at < $2 ${onBot('g', 'at')} ORDER BY at LIMIT ${cap}`, P)).rows);
+    add('ALERTS', ['bot', 'created_at', 'kind', 'sym', 'text'],
+      (await q(`SELECT bot, created_at, kind, sym, REGEXP_REPLACE(LEFT(text, 600), E'[\\r\\n]+', ' | ', 'g') AS text FROM bot_msgs WHERE created_at >= $1 AND created_at < $2 AND ($3::text IS NULL OR bot=$3) ORDER BY created_at LIMIT ${cap}`, P)).rows);
+    const head = ['# YM Oracle export', '# bot: ' + (b || 'all bots'), '# range (UTC): ' + fromD.toISOString() + ' to ' + toD.toISOString(), '# generated: ' + new Date().toISOString(),
+      '# exit_r = result in R using the bot\'s planned stop (1 = it made what it risked, -1 = it lost it). All times are UTC (Lagos = UTC+1).'];
+    return head.join('\n') + '\n\n' + sec.join('\n\n') + '\n';
+  }
+
   async function buildCsv(userId) {
     const where = userId ? 'WHERE u.id=$1' : '';
     const params = userId ? [userId] : [];
@@ -2110,17 +2132,16 @@ function init(deps) {
     { const t1 = setTimeout(() => pruneOldRows().catch(e => console.error('[multiuser] retention:', e.message)), 5 * 60000); if (t1.unref) t1.unref();
       const t2 = setInterval(() => pruneOldRows().catch(e => console.error('[multiuser] retention:', e.message)), 6 * 3600 * 1000); if (t2.unref) t2.unref(); }
     setTimeout(() => settlePending().catch(() => {}), 20000);
-    setInterval(() => { if (dbBusy()) settlePending().catch(() => {}); }, 30000);
-    { const hw = setInterval(() => wake(3), 3600 * 1000); if (hw.unref) hw.unref(); }   // hourly safety net: the sweeps run for a few minutes even when nothing is going on
-    setInterval(() => { if (dbBusy()) alertSweep().catch(e => console.error('[multiuser] alert sweep:', e.message)); }, Number(process.env.ALERT_SWEEP_MS) || 20000);   // retries failed deliveries and sends the short safety-net alerts
+    setInterval(() => settlePending().catch(() => {}), 30000);
+    setInterval(() => alertSweep().catch(e => console.error('[multiuser] alert sweep:', e.message)), Number(process.env.ALERT_SWEEP_MS) || 20000);   // retries failed deliveries and sends the short safety-net alerts
     setInterval(() => q(`DELETE FROM bot_msgs WHERE created_at < now() - interval '30 days'`).catch(() => {}), 6 * 3600 * 1000);
     const pgLoop = () => { pgTick().catch(e => console.error('[multiuser] profit guard:', e.message)).finally(() => { const t = setTimeout(pgLoop, Math.max(3000, (pgCfg.pollSec || 5) * 1000)); if (t.unref) t.unref(); }); };
     setTimeout(pgLoop, 15000);
     const snLoop = () => { snTick().catch(e => console.error('[multiuser] sentinel:', e.message)).finally(() => { const t = setTimeout(snLoop, Math.max(3000, (snCfg.pollSec || 5) * 1000)); if (t.unref) t.unref(); }); };
     setTimeout(snLoop, 17000);   // Trade Sentinel loop (does nothing while it is switched off)   // Profit Guard loop (does nothing while it is switched off)
-    setInterval(() => { if (dbBusy()) checkSignalAlarms().catch(e => console.error('[multiuser] signal alarm:', e.message)); }, Number(process.env.ALERT_SWEEP_MS) || 20000);
+    setInterval(() => checkSignalAlarms().catch(e => console.error('[multiuser] signal alarm:', e.message)), Number(process.env.ALERT_SWEEP_MS) || 20000);
     setTimeout(() => syncAll().catch(e => console.error('[multiuser] initial sync:', e.message)), 20000);
-    setInterval(() => { if (dbBusy()) syncAll().catch(e => console.error('[multiuser] sync:', e.message)); }, SYNC_INTERVAL_MS);
+    setInterval(() => syncAll().catch(e => console.error('[multiuser] sync:', e.message)), SYNC_INTERVAL_MS);
     setTimeout(() => runBackupIfDue(false).catch(e => console.error('[multiuser] backup:', e.message)), 90000);
     setInterval(() => runBackupIfDue(false).catch(e => console.error('[multiuser] backup:', e.message)), 3600 * 1000);
     if (tgOn) {
@@ -2988,12 +3009,12 @@ function init(deps) {
       await pgApplyTuning(pr, sug, 'admin');
       return res.json({ success: true, ...(await pgView()) });
     }
-    const sm = b.smart && typeof b.smart === 'object' ? { noise: { ...pgCfg.smart.noise, ...(b.smart.noise || {}) }, stall: { ...pgCfg.smart.stall, ...(b.smart.stall || {}) }, adapt: { ...pgCfg.smart.adapt, ...(b.smart.adapt || {}), mkt: { ...pgCfg.smart.adapt.mkt, ...((b.smart.adapt || {}).mkt || {}) } }, curve: { ...pgCfg.smart.curve, ...(b.smart.curve || {}) }, slice: { ...pgCfg.smart.slice, ...(b.smart.slice || {}) }, tune: { ...pgCfg.smart.tune, ...(b.smart.tune || {}), lastAtN: pgCfg.smart.tune.lastAtN } } : pgCfg.smart;
+    const sm = b.smart && typeof b.smart === 'object' ? { noise: { ...pgCfg.smart.noise, ...(b.smart.noise || {}) }, stall: { ...pgCfg.smart.stall, ...(b.smart.stall || {}) }, adapt: { ...pgCfg.smart.adapt, ...(b.smart.adapt || {}), mkt: { ...pgCfg.smart.adapt.mkt, ...((b.smart.adapt || {}).mkt || {}) } }, curve: { ...pgCfg.smart.curve, ...(b.smart.curve || {}) }, slice: { ...pgCfg.smart.slice, ...(b.smart.slice || {}) }, rev: { ...pgCfg.smart.rev, ...(b.smart.rev || {}) }, tune: { ...pgCfg.smart.tune, ...(b.smart.tune || {}), lastAtN: pgCfg.smart.tune.lastAtN } } : pgCfg.smart;
     const next = PG.normalize({ ...pgCfg, ...b, smart: sm, reentry: b.reentry ? { ...pgCfg.reentry, ...b.reentry } : pgCfg.reentry, fast: b.fast ? { ...pgCfg.fast, ...b.fast } : pgCfg.fast, swing: b.swing ? { ...pgCfg.swing, ...b.swing } : pgCfg.swing });
     if (next.smart.tune.mode === 'auto' && pgCfg.smart.tune.mode !== 'auto' && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'Auto-tuning changes the live stop rules by itself. Confirm it on the panel.' });
     for (const pr of ['fast', 'swing']) {      // anything that starts acting on real money needs the explicit confirm
       const goesLive = PG.effMode(next, pr) === 'live' && PG.effMode(pgCfg, pr) !== 'live';
-      const scaleLive = PG.effMode(next, pr) === 'live' && ((next[pr].scale.on && !(PG.effMode(pgCfg, pr) === 'live' && pgCfg[pr].scale.on)) || (next.smart.slice.on && !(PG.effMode(pgCfg, pr) === 'live' && pgCfg.smart.slice.on)));
+      const scaleLive = PG.effMode(next, pr) === 'live' && ((next[pr].scale.on && !(PG.effMode(pgCfg, pr) === 'live' && pgCfg[pr].scale.on)) || (next.smart.slice.on && !(PG.effMode(pgCfg, pr) === 'live' && pgCfg.smart.slice.on)) || (next.smart.rev.on && !(PG.effMode(pgCfg, pr) === 'live' && pgCfg.smart.rev.on)));
       if ((goesLive || scaleLive) && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'This moves real stops or closes real positions on Bybit. Confirm it on the panel.' });
     }
     await q(`INSERT INTO meta(k,v) VALUES('profit_guard',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(next)]);
@@ -3038,7 +3059,7 @@ function init(deps) {
       out.trades.push({ symbol, side, bot: sig ? sig.bot : '', engine: sig ? sig.eng : null, entry, mark, peak, stopLoss: parseFloat(p.stopLoss) || 0, takeProfit: parseFloat(p.takeProfit) || (sig ? Number(sig.tp) : 0) || 0,
         initialSl, size, leverage: lev, upl: parseFloat(p.unrealisedPnl) || 0, margin: size * entry / lev, openedAt: created, atr,
         quality: as, trail,
-        profitGuard: gst ? { mode: gst.em || null, why: gst.lastWhy || '', shadowSl: gst.shadowSl || 0, room: gst.curveWhy || '', slice: gst.slicePlan || null, sliced: !!(gst.sliced || gst.slicedShadow), slicedLive: !!gst.sliced } : null,
+        profitGuard: gst ? { mode: gst.em || null, why: gst.lastWhy || '', shadowSl: gst.shadowSl || 0, room: gst.curveWhy || '', slice: gst.slicePlan || null, reversal: gst.rev || null, sliced: !!(gst.sliced || gst.slicedShadow), slicedLive: !!gst.sliced } : null,
         sentinel: sst ? { mode: sst.em || null, state: sst.mem && sst.mem.state, score: sst.score === undefined ? null : sst.score } : null });
     }
     out.trades.sort((a, b) => ((a.quality && a.quality.score) ?? 999) - ((b.quality && b.quality.score) ?? 999));
@@ -3110,10 +3131,7 @@ function init(deps) {
       FROM signals s LEFT JOIN order_log o ON o.signal_key = 'ym-' || s.rid AND o.kind='ORDER' AND s.rid IS NOT NULL AND s.rid <> ''
       WHERE s.opened_at > now() - ($1 || ' hours')::interval
       GROUP BY s.k ORDER BY s.opened_at DESC LIMIT $2`, [String(hours), limit]);
-    const botRows = (await q('SELECT bot, payload, at FROM bot_status ORDER BY bot')).rows;
-    for (const [mb, mv] of botStatusMem) { const i = botRows.findIndex(x => x.bot === mb); if (i >= 0) botRows[i] = { bot: mb, payload: mv.payload, at: mv.at }; else botRows.push({ bot: mb, payload: mv.payload, at: mv.at }); }
-    botRows.sort((x, y) => String(x.bot).localeCompare(String(y.bot)));
-    const bots = botRows.map(b => { let p = {}; try { p = JSON.parse(b.payload); } catch { /* ignore */ } return { bot: b.bot, at: b.at, build: p.build || null, open: p.open ?? null, cfg: p.cfg || null, relayq: p.relayq || null, webq: p.webq || null }; });
+    const bots = (await q('SELECT bot, payload, at FROM bot_status ORDER BY bot')).rows.map(b => { let p = {}; try { p = JSON.parse(b.payload); } catch { /* ignore */ } return { bot: b.bot, at: b.at, build: p.build || null, open: p.open ?? null, cfg: p.cfg || null, relayq: p.relayq || null, webq: p.webq || null }; });
     res.json({ success: true, bots, signals: r.rows.map(x => {
       const reached = !!x.order_seen_at;
       let state = 'ok', text = '';
@@ -3229,6 +3247,18 @@ function init(deps) {
     res.json({ success: true, ...(await syncAll()) });
   }));
 
+  app.get('/api/admin/export-all.csv', adminAuth, h(async (req, res) => {
+    const day = /^\d{4}-\d{2}-\d{2}$/, bot = String(req.query.bot || 'all').replace(/[^\w .\-]/g, '').slice(0, 30) || 'all';
+    const toD = day.test(String(req.query.to || '')) ? new Date(new Date(req.query.to + 'T00:00:00Z').getTime() + 86400000) : new Date();
+    const fromD = day.test(String(req.query.from || '')) ? new Date(req.query.from + 'T00:00:00Z') : new Date(toD.getTime() - 7 * 86400000);
+    if (Number.isNaN(fromD.getTime()) || Number.isNaN(toD.getTime()) || fromD >= toD) return res.status(400).json({ success: false, message: 'Pick a valid date range (from before to).' });
+    if (toD - fromD > 92 * 86400000) return res.status(400).json({ success: false, message: 'Pick at most 92 days (older rows are removed by the retention job).' });
+    const text = await buildExportAll(bot, fromD, toD);
+    await audit('admin', 'export_all', bot, req, fromD.toISOString().slice(0, 10) + ' to ' + toD.toISOString().slice(0, 10));
+    const slug = bot.toLowerCase().replace(/ym oracle /, 'oracle-').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'all';
+    res.set({ 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="ym-' + slug + '-' + fromD.toISOString().slice(0, 10) + '_' + new Date(toD.getTime() - 1).toISOString().slice(0, 10) + '.csv"', 'Cache-Control': 'no-store' });
+    res.send(text);
+  }));
   app.get('/api/admin/export.csv', adminAuth, h(async (req, res) => {
     const uid = parseInt(req.query.userId, 10) || null;
     const { csv } = await buildCsv(uid);
@@ -3264,7 +3294,7 @@ function init(deps) {
   app.get('/admin', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
   app.get('/s/:token', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'share.html')));
 
-  return { enabled: true, canPersist: true, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, pruneOldRows, pgTune: pgTuneEval, pgAutoTune, pgTick, pgState, pgWatch, pgClosing, pgRun, snTick, snState, snRun, snBackfill, snView, getSnCfg: () => snCfg, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
+  return { enabled: true, canPersist: true, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, pruneOldRows, pgTune: pgTuneEval, pgAutoTune, pgTick, pgState, botReads, pgWatch, pgClosing, pgRun, snTick, snState, snRun, snBackfill, snView, getSnCfg: () => snCfg, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, buildExportAll, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
 }
 
 module.exports = { init };

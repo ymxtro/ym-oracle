@@ -1,6 +1,6 @@
 {
   "name": "ym-oracle",
-  "version": "2.8.10",
+  "version": "2.9.2",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

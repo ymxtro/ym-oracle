@@ -47,6 +47,11 @@ const DEFAULT_SMART = {
   //   follow the same per-trade "room" reading as the curve: a clean trend waits a little longer and takes less, a choppy trade (or BTC / the Sentinel against it) takes it sooner and takes more.
   //   Off by default because it closes real positions. Skipped while the ladder's own scale-out steps are on for that profile (one or the other, never both).
   slice: { on: false, atR: 1.2, frac: 0.3, dyn: true },
+  // final-21 REVERSAL READING FROM THE BOT: the bot already scores structure breaks, trend, momentum and double tops/bottoms into an "urgency" (profit banked x reversal risk). It now sends that
+  //   reading here, and the relay answers it in steps instead of one full close: from `soft` the stop room shrinks smoothly; from `firm` (the bot's own trigger) the relay also takes a slice
+  //   (`slice` = share of the position) and the bot keeps the rest running. Only a very strong reading (the bot's HARD level) still closes the whole trade. A reading older than maxAge seconds is ignored.
+  //   Off by default. While it is off, in Shadow mode, or if this relay does not answer, the bot closes the whole trade exactly as before.
+  rev: { on: false, soft: 0.45, firm: 0.62, slice: 0.5, maxAge: 300 },
 };
 const copySmart = d => JSON.parse(JSON.stringify(d));
 
@@ -112,6 +117,8 @@ function normSmart(raw, d) {
     adapt: normAdapt(r.adapt, d.adapt),
     slice: { on: (r.slice && r.slice.on !== undefined) ? r.slice.on === true : d.slice.on, atR: num(r.slice && r.slice.atR, 0.6, 5, d.slice.atR), frac: num(r.slice && r.slice.frac, 0.1, 0.5, d.slice.frac),
              dyn: (r.slice && r.slice.dyn !== undefined) ? r.slice.dyn === true : d.slice.dyn },
+    rev: { on: (r.rev && r.rev.on !== undefined) ? r.rev.on === true : d.rev.on, soft: num(r.rev && r.rev.soft, 0.2, 0.8, d.rev.soft), firm: num(r.rev && r.rev.firm, 0.3, 0.9, d.rev.firm),
+           slice: num(r.rev && r.rev.slice, 0.1, 0.8, d.rev.slice), maxAge: Math.round(num(r.rev && r.rev.maxAge, 60, 1800, d.rev.maxAge)) },
     curve: { on: (r.curve && r.curve.on !== undefined) ? r.curve.on === true : d.curve.on, h: num(r.curve && r.curve.h, 0.5, 6, d.curve.h) },
     tune: { mode: ['off', 'suggest', 'auto'].includes(t.mode) ? t.mode : d.tune.mode, minTrades: Math.round(num(t.minTrades, 5, 500, d.tune.minTrades)), every: Math.round(num(t.every, 3, 200, d.tune.every)),
             step: num(t.step, 0.01, 0.1, d.tune.step), lastAtN: { fast: Math.round(num(la.fast, 0, 1e6, 0)), swing: Math.round(num(la.swing, 0, 1e6, 0)) } },
@@ -255,10 +262,20 @@ function curveOf(cfg, x) {
   if (Number.isFinite(btc)) { const against = Math.min(1, Math.max(0, -btc / 0.6)); if (against > 0) { mul *= 1 - 0.3 * against; if (against >= 0.4) why.push('BTC against'); } }
   const SNM = { calm: 1.05, watch: 0.92, alert: 0.78, danger: 0.62 };       // the Sentinel's own reading of whether this trade looks like it is turning
   if (x.sn && SNM[x.sn.state]) { mul *= SNM[x.sn.state]; if (x.sn.state === 'alert' || x.sn.state === 'danger') why.push('Sentinel ' + x.sn.state); }
+  if (x.rev && x.rev.t > 0) { mul *= 1 - 0.35 * x.rev.t; why.push('bot reversal read'); }   // the bot's own structure/momentum reversal reading (see revOf)
   const pn = Number(x.pullNow), atr = Number(x.atr);
   if (pn > 0 && atr > 0 && pd > 0 && pn >= 2 * atr && pn / pd >= 0.25) { mul *= 0.85; why.push('giving back'); }   // already 2+ ATR off the best and a quarter of the profit gone
   mul = Math.round(Math.min(1.5, Math.max(0.5, mul)) * 1000) / 1000;
   return { curveMul: mul, curveWhy: why.join(', ') };
+}
+// The bot's reversal reading, turned into steps. in: rd = { urg, at (ms) }. Returns { t, sliceNow, frac, urg } or null when it is off, missing or too old.
+//   t runs 0..1 between the soft and firm levels (it only shrinks the stop room); sliceNow is true from the firm level up.
+function revOf(cfg, rd, now) {
+  const rv = cfg.smart.rev;
+  if (!rv || !rv.on || !rd || !Number.isFinite(Number(rd.urg))) return null;
+  if ((now || Date.now()) - Number(rd.at || 0) > rv.maxAge * 1000) return null;
+  const u = Number(rd.urg), span = Math.max(0.05, rv.firm - rv.soft), t = u >= rv.soft ? Math.min(1, (u - rv.soft) / span) : 0;
+  return { t: Math.round(t * 1000) / 1000, sliceNow: u >= rv.firm, frac: rv.slice, urg: u };
 }
 // The keep share the curve gives at this peak (used by the Sentinel so both guards speak the same language). null when the curve is off.
 function curveKeep(cfg, peakR, mul) {
@@ -357,4 +374,4 @@ function reentryStep(w, mark, nowMs, rc) {
   return { events: ev, finished: false };
 }
 
-module.exports = { sliceOf, curveKeep, curveOf, adaptOf, updatePull, noiseOf, stallExtra, suggestTuning, DEFAULT_SMART, PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };
+module.exports = { revOf, sliceOf, curveKeep, curveOf, adaptOf, updatePull, noiseOf, stallExtra, suggestTuning, DEFAULT_SMART, PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };

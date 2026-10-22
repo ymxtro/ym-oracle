@@ -743,7 +743,7 @@ function pgSettingsBody(){
     for(var i=0;i<3;i++){var r=g('pg-'+p+'-r'+i),k=g('pg-'+p+'-k'+i);if(r>0&&k>0)pr.ladder.push([r,k/100])}
     for(var n=0;n<2;n++){var sr=g('pg-'+p+'-sr'+n),sk=g('pg-'+p+'-sk'+n);if(sr>0&&sk>0)pr.scale.steps.push([sr,sk/100])}
     o[p]=pr});
-  var tmE=$('#pg-tune');o.smart={noise:{on:c('pg-sn-on'),mult:g('pg-sn-mult')},stall:{on:c('pg-ss-on'),fastMin:g('pg-ss-fast'),swingMin:g('pg-ss-swing')},curve:{on:c('pg-cv-on'),h:g('pg-cv-h')},slice:{on:c('pg-sl-on'),atR:g('pg-sl-at'),frac:g('pg-sl-frac')/100,dyn:c('pg-sl-dyn')},adapt:{on:c('pg-ad-on'),atrMult:g('pg-ad-mult'),mkt:{on:c('pg-am-on'),pts:g('pg-am-pts')/100}},tune:{mode:tmE?tmE.value:'suggest'}};
+  var tmE=$('#pg-tune');o.smart={noise:{on:c('pg-sn-on'),mult:g('pg-sn-mult')},stall:{on:c('pg-ss-on'),fastMin:g('pg-ss-fast'),swingMin:g('pg-ss-swing')},curve:{on:c('pg-cv-on'),h:g('pg-cv-h')},slice:{on:c('pg-sl-on'),atR:g('pg-sl-at'),frac:g('pg-sl-frac')/100,dyn:c('pg-sl-dyn')},rev:{on:c('pg-rv-on'),soft:g('pg-rv-soft'),firm:g('pg-rv-firm'),slice:g('pg-rv-slice')/100},adapt:{on:c('pg-ad-on'),atrMult:g('pg-ad-mult'),mkt:{on:c('pg-am-on'),pts:g('pg-am-pts')/100}},tune:{mode:tmE?tmE.value:'suggest'}};
   o.reentry={on:c('pg-re-on'),minPullR:g('pg-re-pull'),resumePct:g('pg-re-res'),targetR:g('pg-re-tgt')};
   return o;
 }
@@ -824,8 +824,9 @@ function guardCard(){
   h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-ss-on"'+(SM.stall.on?' checked':'')+'> <b>Stall tightening.</b> A trade in profit that has made no new best for a while keeps a few more points of its profit (+'+Math.round((SM.stall.stepPts||0)*100)+' per quiet period, up to +'+Math.round((SM.stall.maxPts||0)*100)+').</label><div class="fgrid"><div><label class="l" for="pg-ss-fast">Quiet period, fast (minutes)</label><input type="number" step="5" id="pg-ss-fast" value="'+esc(SM.stall.fastMin)+'"></div><div><label class="l" for="pg-ss-swing">Quiet period, swing (minutes)</label><input type="number" step="30" id="pg-ss-swing" value="'+esc(SM.stall.swingMin)+'"></div></div>';
   var CV=SM.curve||{on:true,h:2};
   h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-cv-on"'+(CV.on?' checked':'')+'> <b>Smooth profit curve.</b> Keeps a share of the best profit that grows smoothly with it (no dead zone between the ladder steps). The share is worked out per trade: more room while its pullbacks are small, less while they are large or BTC runs against it.</label><div class="fgrid"><div><label class="l" for="pg-cv-h">Give-back factor (higher = more room)</label><input type="number" step="0.1" id="pg-cv-h" value="'+esc(CV.h)+'"></div></div>';
-  var SL=SM.slice||{on:false,atR:1.2,frac:0.3,dyn:true};
+  var SL=SM.slice||{on:false,atR:1.2,frac:0.3,dyn:true}; var RV=(SM&&SM.rev)||{on:false,soft:0.45,firm:0.62,slice:0.5,maxAge:300};
   h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-sl-on"'+(SL.on?' checked':'')+'> <b>Early profit slice.</b> Close a share of the position once the trade is a little over 1R, so a trade that then reverses has already paid something. Shadow records it; Live closes it for real (needs the confirm). Not used while the ladder\'s own scale-out is on.</label><div class="fgrid"><div><label class="l" for="pg-sl-at">Take it at (R)</label><input type="number" step="0.1" id="pg-sl-at" value="'+esc(SL.atR)+'"></div><div><label class="l" for="pg-sl-frac">Share to close (%)</label><input type="number" step="5" id="pg-sl-frac" value="'+esc(Math.round(SL.frac*100))+'"></div></div><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="pg-sl-dyn"'+(SL.dyn?' checked':'')+'> Let each trade set it: a clean trend waits a little longer and takes less, a choppy trade (or one the Sentinel or BTC is against) takes it sooner and takes more.</label>';
+  h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-rv-on"'+(RV.on?' checked':'')+'> <b>Use the bot\'s reversal reading.</b> The bot scores structure breaks, trend, momentum and double tops/bottoms. From the first level the stop room shrinks smoothly; from the second the relay takes a slice and the bot leaves the rest running; only a very strong reading still closes the whole trade. Needs the Smooth curve on. Shadow records it; Live acts (needs the confirm). If this is off or the relay does not answer, the bot closes the whole trade as before.</label><div class="fgrid"><div><label class="l" for="pg-rv-soft">Start tightening at</label><input type="number" step="0.05" id="pg-rv-soft" value="'+esc(RV.soft)+'"></div><div><label class="l" for="pg-rv-firm">Take a slice at</label><input type="number" step="0.05" id="pg-rv-firm" value="'+esc(RV.firm)+'"></div><div><label class="l" for="pg-rv-slice">Slice size (%)</label><input type="number" step="5" id="pg-rv-slice" value="'+esc(Math.round(RV.slice*100))+'"></div></div>';
   var AD=SM.adapt||{on:true,atrMult:0.8,mkt:{on:true,pts:0.08}};
   h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-ad-on"'+(AD.on?' checked':'')+'> <b>Pair speed.</b> Do not raise a stop closer to the price than a share of that pair\'s own 1-minute ATR, so a fast coin gets room before it has shown a pullback.</label><div class="fgrid"><div><label class="l" for="pg-ad-mult">Share of ATR</label><input type="number" step="0.1" id="pg-ad-mult" value="'+esc(AD.atrMult)+'"></div></div>';
   h+='<label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="pg-am-on"'+((AD.mkt||{}).on?' checked':'')+'> <b>Market awareness.</b> Keep a few more points of the profit while BTC moves against the trade, and a few less while the trade is trending cleanly.</label><div class="fgrid"><div><label class="l" for="pg-am-pts">Most it may shift (points)</label><input type="number" step="1" id="pg-am-pts" value="'+esc(Math.round(((AD.mkt||{}).pts||0)*100))+'"></div></div>';
@@ -913,6 +914,8 @@ function viewSettings(){
   }
   h+='</div>';
   h+='<div class="card"><h2 style="margin:0 0 8px">Data tools</h2><div class="btns"><button class="btn" data-act="sync">Sync PnL</button><button class="btn" data-act="csv">Download CSV</button><button class="btn" data-act="backup">Backup to Telegram</button><button class="btn" data-act="testAlert">Send test alert</button></div></div>';
+  var td=new Date(),fd=new Date(td.getTime()-6*864e5),iso=function(d){return d.toISOString().slice(0,10)};
+  h+='<div class="card"><h2 style="margin:0 0 4px">Download everything</h2><div class="small" style="margin-bottom:8px">One file with every trade a bot took in the range: its own ledger, what Bybit and the copy users did with it, the Profit Guard and Sentinel actions, each trade\'s price path and the alerts it sent. Dates are UTC.</div><div class="fgrid"><div><label class="l" for="ea-bot">Bot</label><select id="ea-bot"><option value="all">All bots</option><option>YM ORACLE I</option><option>YM ORACLE II</option><option>YM ORACLE III</option><option>YM ORACLE IV</option></select></div><div><label class="l" for="ea-from">From</label><input type="date" id="ea-from" value="'+iso(fd)+'"></div><div><label class="l" for="ea-to">To</label><input type="date" id="ea-to" value="'+iso(td)+'"></div></div><div class="btns" style="margin-top:8px"><button class="btn pri" data-act="exportAll">Download everything</button></div></div>';
   h+='</div><div class="stack">';
   if(S.sec){var ok=S.sec.filter(function(c){return c.ok}).length;
     h+='<div class="card"><div class="line"><span>Security checklist</span><span class="chip '+(ok===S.sec.length?'long':'warn')+'">'+ok+' of '+S.sec.length+' done</span></div>'
@@ -1067,6 +1070,14 @@ function render(){
 }
 
 /* ---------- actions ---------- */
+function exportAll(){
+  var bot=$('#ea-bot').value,from=$('#ea-from').value,to=$('#ea-to').value;
+  return api('/api/admin/export-all.csv?bot='+encodeURIComponent(bot)+'&from='+encodeURIComponent(from)+'&to='+encodeURIComponent(to)).then(function(r){
+    if(!r.ok)return r.json().then(function(j){toast((j&&j.message)||'Could not export')});
+    var cd=r.headers.get('Content-Disposition')||'',m=/filename="([^"]+)"/.exec(cd),name=m?m[1]:'ym-export.csv';
+    return r.blob().then(function(blob){var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();toast('Downloaded '+name)});
+  });
+}
 function exportCsv(id){
   return api('/api/admin/export.csv'+(id?'?userId='+id:'')).then(function(r){return r.blob()}).then(function(blob){
     var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='ym-ledger'+(id?'-user'+id:'')+'.csv';document.body.appendChild(a);a.click();a.remove();
@@ -1131,6 +1142,7 @@ document.addEventListener('click',function(e){
   if(a==='resetPlan'){S.planDraft=draftFrom(S.planCounts.plan);S.planPreview=null;S.planDirty=false;S.planEditing=false;render();return}
   if(a==='sync'){t.textContent='Syncing…';j('/api/admin/sync-now','POST').then(function(){t.textContent='Sync PnL';toast('PnL synced');refreshAll(true)});return}
   if(a==='csv'){exportCsv();return}
+  if(a==='exportAll'){exportAll();return}
   if(a==='testAlert'){var to=t.getAttribute('data-to')||'',lab=t.textContent;t.textContent='Sending…';j('/api/admin/test-alert','POST',to?{target:to}:{}).then(function(r){t.textContent=lab;toast(!r.configured?'No alert channel is set up on Render yet (Telegram token and chat id)':r.muted?'Muted by your alert settings ('+(r.reason||'see the panel')+'): nothing was sent':r.success?'Test sent'+(to==='group'?' to the group':to==='dm'?' to your DM':'')+(r.telegram&&r.telegram.indexOf('sent')===0?'':'')+(r.email==='sent'?' and email':''):'Sending failed: Telegram '+r.telegram+(r.email!=='off'?', email '+r.email:''))}).catch(function(){t.textContent=lab;toast('Could not reach the server')});return}
   if(a==='deckToggle'){S.deckOpen=!S.deckOpen;render();return}
   if(a==='gmaster'){var gon=t.getAttribute('data-v')==='on';j('/api/admin/guards-master','POST',{on:gon}).then(function(r){if(r.success){if(S.pg)S.pg.master=r.master;if(S.live)S.live.master=r.master;toast(r.master?'Guards are on':'Guards are off: trades run on their own stops');refreshAll(true)}else toast(r.message||'Could not change it')});return}

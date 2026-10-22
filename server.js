@@ -609,7 +609,7 @@ app.post('/api/order', requireDevice, async (req, res) => {
 app.post('/api/bot-event', requireDevice, async (req, res) => {
   try {
     const r = await multiuser.recordBotEvent(req.body);
-    return res.status(r.status).json({ success: r.status === 200, message: r.message });
+    return res.status(r.status).json({ success: r.status === 200, message: r.message, hold: r.hold === true });
   } catch (error) {
     console.error('[bot-event]', error.message);
     return res.status(500).json({ success: false });
