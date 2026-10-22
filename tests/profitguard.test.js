@@ -244,4 +244,21 @@ ok('tuning: waits for enough live trades, tightens when profit is handed back, l
   assert(kHealthy > 0.3 && kDanger > kHealthy && kDanger <= 0.85); assert.strictEqual(G.curveKeep(G.normalize({ smart: { curve: { on: false } } }), 2, 1), null);
   ok('curveKeep: the same keep share the curve uses, higher when the trade is turning, null when the curve is off');
 }
+// final-21: the bot's reversal reading
+{
+  const off = G.normalize({ mode: 'live' });
+  assert.strictEqual(G.defaults().smart.rev.on, false); assert.strictEqual(G.revOf(off, { urg: 0.9, at: Date.now() }), null);
+  const on = G.normalize({ mode: 'live', smart: { rev: { on: true } } }), t0 = Date.now();
+  assert.strictEqual(G.revOf(on, { urg: 0.3, at: t0 }).t, 0); assert.strictEqual(G.revOf(on, { urg: 0.3, at: t0 }).sliceNow, false);
+  const mid = G.revOf(on, { urg: 0.535, at: t0 }); assert(mid.t > 0.4 && mid.t < 0.6 && !mid.sliceNow);
+  const hi = G.revOf(on, { urg: 0.7, at: t0 }); assert.strictEqual(hi.t, 1); assert.strictEqual(hi.sliceNow, true); assert.strictEqual(hi.frac, 0.5);
+  assert.strictEqual(G.revOf(on, { urg: 0.9, at: t0 - 400000 }), null); assert.strictEqual(G.revOf(on, null), null); assert.strictEqual(G.revOf(on, { urg: 'x', at: t0 }), null);
+  const bad = G.normalize({ smart: { rev: { on: true, soft: 5, firm: 0.01, slice: 9, maxAge: 1 } } }).smart.rev; assert(bad.soft <= 0.8 && bad.firm >= 0.3 && bad.slice <= 0.8 && bad.maxAge >= 60);
+  ok('reversal reading: off by default, steps from soft to firm, slice from firm, ignores old or broken readings, settings stay in bounds');
+  const cc = G.normalize({ mode: 'live', smart: { curve: { on: true }, rev: { on: true } } });
+  const base = G.curveOf(cc, { peakDist: 20, maxPull: 3 }), rd = G.curveOf(cc, { peakDist: 20, maxPull: 3, rev: { t: 1 } }), half = G.curveOf(cc, { peakDist: 20, maxPull: 3, rev: { t: 0.5 } });
+  assert(rd.curveMul < half.curveMul && half.curveMul < base.curveMul && /bot reversal read/.test(rd.curveWhy) && rd.curveMul >= 0.5);
+  assert(G.curveKeep(cc, 1.5, rd.curveMul) > G.curveKeep(cc, 1.5, base.curveMul));
+  ok('reversal reading: shrinks the stop room smoothly, so the stop keeps more of the peak, and never leaves the bounds');
+}
 console.log('PASS ' + n);

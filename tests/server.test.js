@@ -173,6 +173,8 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
   assert.strictEqual((await A.post('/api/bot-event', { v: 1, bot: 'YM ORACLE I', ev: 'open', k: 'BTCUSDT-1', sym: 'BTCUSDT', side: 'BUY', eng: 'fast', t: 1, rid: 'r1', relay: 'SENT' })).s, 200);
   assert.strictEqual((await A.post('/api/bot-event', { v: 1, bot: 'YM ORACLE I', ev: 'status', t: 1 })).s, 200);
   ok('/api/bot-event exists and accepts the bots\' reports');
+  { const rr = await A.post('/api/bot-event', { v: 1, bot: 'YM ORACLE I', ev: 'read', sym: 'BTCUSDT', side: 'BUY', urg: 0.2, rp: 40, ot: 1792564363 }); assert.strictEqual(rr.s, 200); assert.strictEqual(rr.j.hold, false); assert.strictEqual(rr.j.closed, undefined);
+    assert(/closed: r\.closed/.test(fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8')), 'server.js passes the relay\'s close feedback through to the bot'); ok('/api/bot-event read: answers hold:false and no close feedback for an unknown trade; the close feedback is passed through'); }
 
   // 9. heartbeat: old firmware (name only), new beacon, junk
   assert.strictEqual((await A.post('/api/heartbeat', { name: 'YM ORACLE I' })).s, 200);

@@ -1427,6 +1427,31 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     }
   }
 
+  // ---------- one file with everything about a bot (v2.9.2) ----------
+  {
+    const EA = (qs) => realFetch(base + '/api/admin/export-all.csv' + qs, { headers: admin });
+    await db.query('TRUNCATE profit_guard_log, sentinel_log, pg_trades, sentinel_trades, trade_path, signals, bot_msgs, master_log');
+    const ins = (k, bot, sym, side, entry, sl, exit, why) => db.query(`INSERT INTO signals(k,bot,symbol,side,eng,opened_at,entry,sl,tp,lev,margin,relay_flag,relay_ok,relay_code,closed_at,won,exit_price,pct,relayed,close_why,rid)
+      VALUES($1,$2,$3,$4,'fast',now() - interval '3 hours',$5,$6,$5*1.05,3,20,'SENT',true,'OK',now() - interval '1 hour',$8,$7,-1.5,true,$9,$1)`, [k, bot, sym, side, entry, sl, exit, exit > entry === (side === 'BUY'), why]);
+    await ins('ea1', 'YM ORACLE II', 'BTCUSDT', 'BUY', 100, 95, 95, 'Stop Loss Hit');
+    await ins('ea2', 'YM ORACLE III', 'ETHUSDT', 'SELL', 200, 210, 190, 'Take Profit Hit');
+    await db.query(`INSERT INTO profit_guard_log(symbol,side,mode,profile,event,entry,mark,detail,at) VALUES('BTCUSDT','Buy','live','fast','raised',100,103,'guard note btc', now() - interval '2 hours'),('ETHUSDT','Sell','live','fast','raised',200,195,'guard note eth', now() - interval '2 hours'),('BTCUSDT','Buy','live','fast','raised',100,103,'too late', now() - interval '20 minutes')`);
+    await db.query(`INSERT INTO sentinel_log(symbol,side,mode,profile,event,state,score,detail,at) VALUES('ETHUSDT','Sell','shadow','fast','state','alert',55,'sentinel note eth', now() - interval '2 hours')`);
+    await db.query(`INSERT INTO bot_msgs(k,bot,kind,sym,text,created_at) VALUES('m1','YM ORACLE II','result','BTCUSDT','line one\nline two', now() - interval '1 hour'),('m2','YM ORACLE III','result','ETHUSDT','eth result', now() - interval '1 hour')`);
+    await db.query(`INSERT INTO master_log(exec_id,bot,kind,symbol,side,ok,code,detail) VALUES('x1','YM ORACLE II','OPEN','BTCUSDT','BUY',true,'OK','filled'),('x2','YM ORACLE III','OPEN','ETHUSDT','SELL',true,'OK','filled')`);
+    const rb = await EA('?bot=' + encodeURIComponent('YM ORACLE II')); const tb = await rb.text();
+    assert.strictEqual(rb.status, 200); assert(/attachment; filename="ym-oracle-ii-/.test(rb.headers.get('content-disposition')), rb.headers.get('content-disposition'));
+    for (const sct of ['## SIGNALS (1 rows)', '## ORDERS (1 rows)', '## GUARD (1 rows)', '## SENTINEL (0 rows)', '## GUARD_TRADES', '## SENTINEL_TRADES', '## PATH', '## ALERTS (1 rows)']) assert(tb.includes(sct), sct + ' in ' + tb.slice(0, 400));
+    assert(tb.includes('ea1') && !tb.includes('ea2') && tb.includes('guard note btc') && !tb.includes('guard note eth') && !tb.includes('too late') && tb.includes('line one | line two') && tb.includes('x1') && !tb.includes('x2'));
+    const sigRow = tb.split('\n').find(l => l.startsWith('YM ORACLE II,ea1,')).split(','); assert(sigRow.includes('5') && sigRow.includes('-1') && sigRow.includes('120'), sigRow.join('|'));   // risk 5%, exit_r -1, 120 minutes open
+    const ta = await (await EA('')).text(); assert(ta.includes('## SIGNALS (2 rows)') && ta.includes('guard note eth') && ta.includes('sentinel note eth') && ta.includes('# bot: all bots'));
+    assert.strictEqual((await EA('?from=2026-02-01&to=2026-01-01')).status, 400); assert.strictEqual((await EA('?from=2025-01-01&to=2026-06-01')).status, 400);
+    assert.strictEqual((await realFetch(base + '/api/admin/export-all.csv')).status, 401);
+    assert((await db.query(`SELECT 1 FROM audit_log WHERE action='export_all'`)).rows.length >= 2);
+    await db.query('TRUNCATE profit_guard_log, sentinel_log, pg_trades, sentinel_trades, trade_path, signals, bot_msgs, master_log');
+    ok('download everything: one file per bot with the ledger, orders, guard and sentinel actions, alerts; other bots excluded, bad ranges refused, admin only, audited');
+  }
+
   // ---------- Profit Guard, smart layer (final-17c): breathing room, stall tightening, self-tuning ----------
   {
     const POST = (b, extra) => call('/api/admin/profit-guard', 'POST', Object.assign({}, b, extra || {}), admin);
@@ -1435,7 +1460,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
       await db.query('TRUNCATE profit_guard_log, pg_trades'); await db.query(`DELETE FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch')`);
       mu._test.pgState.clear(); mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 100 };
       for (const kk of Object.keys(state.positions)) delete state.positions[kk]; mode = 'live'; halted = false;
-      await POST({ mode: 'off', smart: { slice: { on: false }, noise: { on: true, mult: 1, capR: 1.5 }, stall: { on: true, fastMin: 30, swingMin: 360, stepPts: 0.1, maxPts: 0.2 }, tune: { mode: 'suggest' } },
+      await POST({ mode: 'off', smart: { slice: { on: false }, rev: { on: false }, noise: { on: true, mult: 1, capR: 1.5 }, stall: { on: true, fastMin: 30, swingMin: 360, stepPts: 0.1, maxPts: 0.2 }, tune: { mode: 'suggest' } },
         swing: { mode: 'inherit', ladder: [[2, 0.35], [4, 0.55], [8, 0.65]], scale: { on: false } }, fast: { mode: 'inherit', ladder: [[1.5, 0.45], [3, 0.6], [6, 0.7]], scale: { on: false } } });
     };
     const P = (mark, sl) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl) }; };
@@ -1519,6 +1544,46 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     assert.strictEqual((await logs('scaled')).length, 1); assert(/early slice/.test((await logs('scaled'))[0].detail));
     P(114, 90); await mu._test.pgTick(); assert.strictEqual(state.submits.slice(nSub2).filter(x => x.k === 'ADMINK' && x.body.reduceOnly === true).length, 1, 'only one slice per trade');
     ok('early slice live: closes one slice of the master position with a reduce-only order, once, and needs the confirm to switch on');
+    // v2.9.0: the bot's reversal reading
+    {
+      const rd = (o) => mu.recordBotEvent({ v: 1, bot: 'YM ORACLE I', ev: 'read', sym: 'BTCUSDT', side: 'BUY', urg: 0.7, rp: 82, st: 1, tr: 1, pf: 1.3, rm: 1.3, ...o });
+      for (const bad of [{ sym: 'btc;drop' }, { side: 'X' }, { urg: 9 }, { urg: -1 }, { urg: 'abc' }]) assert.strictEqual((await rd(bad)).status, 400, JSON.stringify(bad));
+      await reset(); mu._test.botReads.clear();
+      await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','swing',100,90) ON CONFLICT (k) DO NOTHING`);
+      // shadow: the slice it would take is logged, nothing is closed, and the bot is told NOT to hand over (hold false)
+      assert((await POST({ mode: 'shadow', smart: { curve: { on: true }, rev: { on: true } } })).j.cfg.smart.rev.on === true);
+      P(113, 90); assert.strictEqual((await rd({})).status, 200);
+      const nS0 = state.submits.length; await mu._test.pgTick(); await mu._test.pgTick();
+      assert.strictEqual(state.submits.length, nS0, 'shadow closes nothing');
+      const ws = await logs('would_scale'); assert.strictEqual(ws.length, 1, 'once per trade'); assert(/early slice/.test(ws[0].detail) && /reversal/.test(ws[0].detail), ws[0].detail);
+      assert.strictEqual((await rd({})).hold, false, 'shadow: the bot keeps its own whole-trade close');
+      ok('bot reversal reading (shadow): validated, the slice it would take is recorded once, nothing is closed, and the bot is told to keep its own close');
+      // live: needs the confirm; a strong reading takes one reduce-only slice and the bot is told the relay is handling it
+      await reset(); mu._test.botReads.clear();
+      assert.strictEqual((await POST({ mode: 'live' }, { confirm: 'LIVE' })).j.cfg.mode, 'live');
+      assert.strictEqual((await POST({ smart: { curve: { on: true }, rev: { on: true } } })).s, 400, 'acting on the reading closes real positions: needs the confirm');
+      assert((await POST({ smart: { curve: { on: true }, rev: { on: true } } }, { confirm: 'LIVE' })).j.cfg.smart.rev.on === true);
+      mu._test.pgState.clear(); P(113, 90); await rd({});
+      const nS1 = state.submits.length; await mu._test.pgTick();
+      const rs = state.submits.slice(nS1).filter(x => x.k === 'ADMINK' && x.body.reduceOnly === true);
+      assert.strictEqual(rs.length, 1, JSON.stringify(state.submits.slice(nS1).map(x => x.body))); assert(Number(rs[0].body.qty) > 0 && Number(rs[0].body.qty) <= 0.05 + 1e-9 && rs[0].body.side === 'Sell', JSON.stringify(rs[0].body));
+      assert(/reversal/.test((await logs('scaled'))[0].detail));
+      assert.strictEqual((await rd({})).hold, true, 'live: the relay is handling this trade');
+      await mu._test.pgTick(); assert.strictEqual(state.submits.slice(nS1).filter(x => x.k === 'ADMINK' && x.body.reduceOnly === true).length, 1, 'only one slice per trade');
+      ok('bot reversal reading (live): needs the confirm, takes one reduce-only slice, once, and tells the bot the relay is handling it');
+      // a middling reading only shrinks the stop room (no slice); no reading and a stale one change nothing
+      await reset(); mu._test.botReads.clear(); await POST({ mode: 'live' }, { confirm: 'LIVE' }); await POST({ smart: { curve: { on: true }, rev: { on: true } } }, { confirm: 'LIVE' });
+      mu._test.pgState.clear(); P(112, 90); await mu._test.pgTick(); const plain = mu._test.pgState.get('BTCUSDT|Buy').adapt.curveMul;
+      await rd({ urg: 0.55 }); mu._test.pgState.clear(); const nS2 = state.submits.length; await mu._test.pgTick(); const withRead = mu._test.pgState.get('BTCUSDT|Buy');
+      assert(withRead.adapt.curveMul < plain && /bot reversal read/.test(withRead.curveWhy), plain + ' vs ' + withRead.adapt.curveMul);
+      assert.strictEqual(state.submits.slice(nS2).filter(x => x.body && x.body.reduceOnly === true).length, 0, 'below the firm level: no slice');
+      const old = mu._test.botReads.get('BTCUSDT|Buy'); old.at -= 400000; mu._test.pgState.clear(); await mu._test.pgTick();
+      assert.strictEqual(mu._test.pgState.get('BTCUSDT|Buy').adapt.curveMul, plain, 'a stale reading is ignored');
+      assert.strictEqual((await call('/api/admin/guards-master', 'POST', { on: false }, admin)).j.master, false); assert.strictEqual((await rd({})).hold, false, 'master off: never hold');
+      await call('/api/admin/guards-master', 'POST', { on: true }, admin);
+      ok('bot reversal reading: a middling reading only shrinks the stop room, a stale one is ignored, and with the master switch off the bot is never told to hold');
+      mu._test.botReads.clear();
+    }
     // master switch
     P(150, 90); mu._test.pgState.clear(); await mu._test.pgTick();
     const floorHeld = mu.guardClamp({ symbol: 'BTCUSDT', stopLoss: '95' }).stopLoss; assert.notStrictEqual(floorHeld, '95', 'master on: the floor holds a looser stop');
@@ -1642,6 +1707,44 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     ok('retention: a 12,000-row backlog is cleared in batches of 5000');
     await db.query(`DELETE FROM signals WHERE k LIKE 'ret-%'`); await db.query(`DELETE FROM master_log WHERE exec_id LIKE 'ret-%'`); await db.query(`DELETE FROM order_log WHERE order_link_id LIKE 'ret-%'`);
     await db.query(`DELETE FROM audit_log WHERE actor='ret-test'`); await db.query(`DELETE FROM profit_guard_log WHERE detail='ret-test'`); await db.query(`DELETE FROM pnl_ledger WHERE order_id LIKE 'ret-%'`);
+  }
+
+  // ---------- v2.9.4: relay close feedback and burst brake ----------
+  {
+    const rd = (o) => mu.recordBotEvent({ v: 1, bot: 'YM ORACLE III', ev: 'read', sym: 'DOTUSDT', side: 'SELL', urg: 0.1, rp: 50, st: 0, tr: 0, pf: 0, rm: -0.2, ...o });
+    const ot = Math.floor(Date.now() / 1000) - 3600;
+    mu._test.masterClosed.clear();
+    assert.strictEqual((await rd({ ot })).closed, undefined, 'nothing closed yet');
+    mu._test.masterClosed.set('DOTUSDT|Sell', { since: ot * 1000 + 6000, entry: 1.1532, exit: 1.1739689, exitR: -1, at: Date.now() - 60000 });
+    const r1 = await rd({ ot }); assert.strictEqual(r1.status, 200); assert.deepStrictEqual(r1.closed, { x: 1.1739689, r: -1 });
+    assert.strictEqual((await rd({})).closed, undefined, 'older firmware (no ot): no feedback');
+    assert.strictEqual((await rd({ ot: ot - 7200 })).closed, undefined, 'a trade opened hours EARLIER than the one that closed is not the same trade');
+    assert.strictEqual((await rd({ ot: ot + 7200 })).closed, undefined, 'a trade opened AFTER the close is not the same trade');
+    assert.strictEqual((await rd({ ot, side: 'BUY' })).closed, undefined, 'the other direction is a different trade');
+    mu._test.masterClosed.get('DOTUSDT|Sell').at = Date.now() - 7 * 3600000; assert.strictEqual((await rd({ ot })).closed, undefined, 'stale records are ignored');
+    mu._test.masterClosed.set('DOTUSDT|Sell', { since: ot * 1000 + 6000, entry: 1.1532, exit: 1.1739689, exitR: -1, at: Date.now() - 60000 });
+    mu._test.masterClosed.clear();
+    ok('close feedback: the relay returns the real exit only for the SAME trade (open time, direction, freshness all checked); older firmware gets nothing');
+
+    const T = mu._test, now = Date.now();
+    const rec = (sym, side, ago) => ({ symbol: sym, side, at: now - ago * 60000 });
+    assert.deepStrictEqual(T.burstFactor([], 'AAA', 'Sell', now, null), { n: 0, factor: 1, mode: 'shadow' });
+    assert.strictEqual(T.burstFactor([rec('B', 'Sell', 3)], 'AAA', 'Sell', now, null).factor, 0.6);
+    assert.strictEqual(T.burstFactor([rec('B', 'Sell', 3), rec('C', 'Sell', 5)], 'AAA', 'Sell', now, null).factor, 0.4);
+    assert.strictEqual(T.burstFactor([rec('B', 'Sell', 3), rec('C', 'Sell', 5), rec('D', 'Sell', 6), rec('E', 'Sell', 7)], 'AAA', 'Sell', now, null).factor, 0.4, 'never below the last factor');
+    assert.strictEqual(T.burstFactor([rec('AAA', 'Sell', 3)], 'AAA', 'Sell', now, null).n, 0, 'the same coin is not a burst');
+    assert.strictEqual(T.burstFactor([rec('B', 'Buy', 3)], 'AAA', 'Sell', now, null).n, 0, 'the other direction is not a burst');
+    assert.strictEqual(T.burstFactor([rec('B', 'Sell', 40)], 'AAA', 'Sell', now, null).n, 0, 'outside the window');
+    assert.strictEqual(T.burstFactor([rec('B', 'Sell', 3), rec('B', 'Sell', 4)], 'AAA', 'Sell', now, null).n, 1, 'the same other coin twice counts once');
+    const nz = T.burstNorm({ mode: 'bogus', windowMin: 9999, factors: [2, -1, 'x'] }); assert.strictEqual(nz.mode, 'shadow'); assert.strictEqual(nz.windowMin, 120); assert.deepStrictEqual(nz.factors, [1, 0.6, 0.4]);
+    assert.strictEqual((await call('/api/admin/burst-brake', 'GET')).s, 401);
+    assert.strictEqual((await call('/api/admin/burst-brake', 'GET', null, admin)).j.cfg.mode, 'shadow', 'default is shadow: logs only');
+    assert.strictEqual((await call('/api/admin/burst-brake', 'POST', { mode: 'live' }, admin)).s, 400, 'live needs the confirm');
+    const lv = await call('/api/admin/burst-brake', 'POST', { mode: 'live', confirm: 'LIVE', windowMin: 20, factors: [1, 0.5] }, admin);
+    assert.strictEqual(lv.j.cfg.mode, 'live'); assert.strictEqual(lv.j.cfg.windowMin, 20); assert.deepStrictEqual(lv.j.cfg.factors, [1, 0.5]);
+    assert.strictEqual((await call('/api/admin/burst-brake', 'POST', { mode: 'shadow' }, admin)).j.cfg.mode, 'shadow');
+    await call('/api/admin/burst-brake', 'POST', { mode: 'shadow', windowMin: 15, factors: [1, 0.6, 0.4] }, admin);
+    ok('burst brake: later same-direction copies on other coins inside the window get smaller factors; same coin / other side / old trades never count; settings validated; default shadow; live needs the confirm; admin only');
   }
 
   const fs = require('fs'); for (const f of ['admin', 'join', 'share']) assert(fs.existsSync(R + '/public/' + f + '.html'));

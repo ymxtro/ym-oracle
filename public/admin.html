@@ -916,6 +916,7 @@ function viewSettings(){
   h+='<div class="card"><h2 style="margin:0 0 8px">Data tools</h2><div class="btns"><button class="btn" data-act="sync">Sync PnL</button><button class="btn" data-act="csv">Download CSV</button><button class="btn" data-act="backup">Backup to Telegram</button><button class="btn" data-act="testAlert">Send test alert</button></div></div>';
   var td=new Date(),fd=new Date(td.getTime()-6*864e5),iso=function(d){return d.toISOString().slice(0,10)};
   h+='<div class="card"><h2 style="margin:0 0 4px">Download everything</h2><div class="small" style="margin-bottom:8px">One file with every trade a bot took in the range: its own ledger, what Bybit and the copy users did with it, the Profit Guard and Sentinel actions, each trade\'s price path and the alerts it sent. Dates are UTC.</div><div class="fgrid"><div><label class="l" for="ea-bot">Bot</label><select id="ea-bot"><option value="all">All bots</option><option>YM ORACLE I</option><option>YM ORACLE II</option><option>YM ORACLE III</option><option>YM ORACLE IV</option></select></div><div><label class="l" for="ea-from">From</label><input type="date" id="ea-from" value="'+iso(fd)+'"></div><div><label class="l" for="ea-to">To</label><input type="date" id="ea-to" value="'+iso(td)+'"></div></div><div class="btns" style="margin-top:8px"><button class="btn pri" data-act="exportAll">Download everything</button></div></div>';
+  h+='<div class="card"><h2 style="margin:0 0 4px">Burst brake (copy users)</h2><div class="small" style="margin-bottom:8px">When several bots open the same direction on different coins within minutes, later copies for your signed-up users can be made smaller (100% / 60% / 40% by default). The master account is never changed. <b>Shadow</b> only records what it would have done.</div><div class="fgrid"><div><label class="l" for="bb-mode">Mode</label><select id="bb-mode"><option value="off">Off</option><option value="shadow" selected>Shadow (log only)</option><option value="live">Live</option></select></div><div><label class="l" for="bb-win">Window (minutes)</label><input type="number" id="bb-win" min="1" max="120" value="15"></div></div><label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="bb-conf"> I understand Live changes the size of real copy trades</label><div class="btns" style="margin-top:8px"><button class="btn" data-act="burstLoad">Refresh</button><button class="btn pri" data-act="burstSave">Save</button></div><div id="bb-out" class="small" style="margin-top:8px">Press Refresh to see the current setting and what it did.</div></div>';
   h+='</div><div class="stack">';
   if(S.sec){var ok=S.sec.filter(function(c){return c.ok}).length;
     h+='<div class="card"><div class="line"><span>Security checklist</span><span class="chip '+(ok===S.sec.length?'long':'warn')+'">'+ok+' of '+S.sec.length+' done</span></div>'
@@ -1070,6 +1071,19 @@ function render(){
 }
 
 /* ---------- actions ---------- */
+function burstLoad(){
+  return j('/api/admin/burst-brake').then(function(r){
+    if(!r||!r.cfg){toast('Could not load');return}
+    $('#bb-mode').value=r.cfg.mode;$('#bb-win').value=r.cfg.windowMin;
+    var rows=(r.recent||[]).slice().reverse().slice(0,12).map(function(x){return esc(x.at.slice(5,16).replace('T',' '))+' · '+esc(x.symbol.replace('USDT',''))+' '+(x.side==='Buy'?'long':'short')+' · '+x.n+' earlier · '+Math.round(x.factor*100)+'% size ('+esc(x.mode)+')'});
+    $('#bb-out').innerHTML='Mode: <b>'+esc(r.cfg.mode)+'</b>, window '+r.cfg.windowMin+' min, sizes '+r.cfg.factors.map(function(f){return Math.round(f*100)+'%'}).join(' / ')+'<br>'+(rows.length?rows.join('<br>'):'Nothing has been reduced (or would have been) since the last restart.');
+  });
+}
+function burstSave(){
+  var mode=$('#bb-mode').value,body={mode:mode,windowMin:Number($('#bb-win').value)||15};
+  if(mode==='live'){if(!$('#bb-conf').checked){toast('Tick the box to confirm Live');return}body.confirm='LIVE'}
+  return j('/api/admin/burst-brake','POST',body).then(function(r){toast(r&&r.success?'Saved':((r&&r.message)||'Could not save'));return burstLoad()});
+}
 function exportAll(){
   var bot=$('#ea-bot').value,from=$('#ea-from').value,to=$('#ea-to').value;
   return api('/api/admin/export-all.csv?bot='+encodeURIComponent(bot)+'&from='+encodeURIComponent(from)+'&to='+encodeURIComponent(to)).then(function(r){
@@ -1143,6 +1157,8 @@ document.addEventListener('click',function(e){
   if(a==='sync'){t.textContent='Syncing…';j('/api/admin/sync-now','POST').then(function(){t.textContent='Sync PnL';toast('PnL synced');refreshAll(true)});return}
   if(a==='csv'){exportCsv();return}
   if(a==='exportAll'){exportAll();return}
+  if(a==='burstLoad'){burstLoad();return}
+  if(a==='burstSave'){burstSave();return}
   if(a==='testAlert'){var to=t.getAttribute('data-to')||'',lab=t.textContent;t.textContent='Sending…';j('/api/admin/test-alert','POST',to?{target:to}:{}).then(function(r){t.textContent=lab;toast(!r.configured?'No alert channel is set up on Render yet (Telegram token and chat id)':r.muted?'Muted by your alert settings ('+(r.reason||'see the panel')+'): nothing was sent':r.success?'Test sent'+(to==='group'?' to the group':to==='dm'?' to your DM':'')+(r.telegram&&r.telegram.indexOf('sent')===0?'':'')+(r.email==='sent'?' and email':''):'Sending failed: Telegram '+r.telegram+(r.email!=='off'?', email '+r.email:''))}).catch(function(){t.textContent=lab;toast('Could not reach the server')});return}
   if(a==='deckToggle'){S.deckOpen=!S.deckOpen;render();return}
   if(a==='gmaster'){var gon=t.getAttribute('data-v')==='on';j('/api/admin/guards-master','POST',{on:gon}).then(function(r){if(r.success){if(S.pg)S.pg.master=r.master;if(S.live)S.live.master=r.master;toast(r.master?'Guards are on':'Guards are off: trades run on their own stops');refreshAll(true)}else toast(r.message||'Could not change it')});return}

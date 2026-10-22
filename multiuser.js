@@ -98,6 +98,26 @@ function envOptsFor(base, env) {
   return o;
 }
 
+// BURST BRAKE (v2.9.4). Several bots often fire the same direction within minutes of each other (Oct 21 2026: three shorts at 01:15, then more later). For the COPY
+// USERS that is one big bet in disguise. Each new same-side open on a DIFFERENT coin inside `windowMin` minutes counts as one earlier burst trade, and the n-th later copy
+// is sized by factors[n] (default 1, 0.6, 0.4). The master account is never touched. Pure function so it can be tested directly.
+const BURST_DEFAULT = { mode: 'shadow', windowMin: 15, factors: [1, 0.6, 0.4] };   // mode: 'off' | 'shadow' (log what it would do) | 'live'
+function burstNorm(c) {
+  const b = { ...BURST_DEFAULT, ...(c && typeof c === 'object' ? c : {}) };
+  if (!['off', 'shadow', 'live'].includes(b.mode)) b.mode = 'shadow';
+  b.windowMin = Math.min(120, Math.max(1, Number(b.windowMin) || BURST_DEFAULT.windowMin));
+  let f = Array.isArray(b.factors) ? b.factors.map(Number).filter(x => Number.isFinite(x) && x > 0 && x <= 1).slice(0, 6) : [];
+  if (!f.length) f = BURST_DEFAULT.factors.slice();
+  b.factors = f;
+  return b;
+}
+function burstFactor(recent, symbol, side, now, cfg) {
+  const c = burstNorm(cfg);
+  const seen = new Set();
+  for (const r of recent || []) if (r.side === side && r.symbol !== symbol && now - r.at <= c.windowMin * 60000) seen.add(r.symbol);
+  const n = seen.size;
+  return { n, factor: c.factors[Math.min(n, c.factors.length - 1)], mode: c.mode };
+}
 function scaleQty({ adminQty, adminEquity, userEquity, mult, qtyStep, minQty, maxRatio }) {
   adminQty = Number(adminQty); adminEquity = Number(adminEquity); userEquity = Number(userEquity);
   if (!(adminQty > 0) || !(adminEquity > 0) || !(userEquity > 0)) return { qty: null, code: 'BAL' };
@@ -317,7 +337,7 @@ function csvCell(v) {
 function init(deps) {
   const noop = async () => {};
   const off = { enabled: false, canPersist: false, loadMasterCreds: async () => null, saveMasterCreds: async () => ({ ok: false, reason: 'no database' }), clearMasterCreds: async () => ({ ok: false, reason: 'no database' }), fanOutOrder: noop, fanOutTradingStop: noop, guardClamp: b => b, guardFitClose: async b => b, fanOutLeverage: noop, recordExec: noop, recordBotEvent: async () => ({ status: 200 }), verifyAdminToken: async () => false, sizeMasterOrder: async () => null,
-    _test: { envOptsFor, defaultEnvFor, encrypt, decrypt, scaleQty, sizeForUser, minPositive, parseControls, planMatch, PLAN_DEFAULT, hashPassword, verifyPassword, classifyRet, permissionProblem, sanitizeOrder, sanitizeStop, sanitizeLeverage, csvCell } };
+    _test: { burstFactor, burstNorm, envOptsFor, defaultEnvFor, encrypt, decrypt, scaleQty, sizeForUser, minPositive, parseControls, planMatch, PLAN_DEFAULT, hashPassword, verifyPassword, classifyRet, permissionProblem, sanitizeOrder, sanitizeStop, sanitizeLeverage, csvCell } };
 
   const DATABASE_URL = process.env.DATABASE_URL || '';
   const SECRET_HEX = process.env.KEY_ENCRYPTION_SECRET || '';
@@ -335,7 +355,13 @@ function init(deps) {
   let snCfg = SN.defaults();            // Trade Sentinel settings (off until switched on from the admin console)
   let pgCfg = PG.defaults();            // Profit Guard settings (off until switched on from the admin console)
   const pgWatch = new Map();            // re-entry watches (recording only); filled and used further down
-  const botReads = new Map();           // the bots' own reversal readings, by 'SYMBOL|Side' (memory only: a reading is only useful for a few minutes)
+  const botReads = new Map();
+  // v2.9.4: trades the relay has seen close on the exchange (stop, target, Profit Guard, anything). A bot that is still tracking the trade asks via its
+  // 'read' event and gets the real exit back, so it books the REAL result instead of a later phantom stop. Memory only; key SYMBOL|Buy/Sell.
+  const masterClosed = new Map();
+  let burstCfg = burstNorm(null);        // BURST BRAKE settings (meta 'burst_brake'); default = shadow: log only
+  const burstRecent = [];                // recent non-reduce orders {symbol, side, at, key}
+  const burstLog = [];                   // what the brake did / would have done: newest last, max 60           // the bots' own reversal readings, by 'SYMBOL|Side' (memory only: a reading is only useful for a few minutes)
   let guardsMaster = true;              // MASTER SWITCH: off = Profit Guard, Sentinel, the stop floor and the early slice all do nothing and trades run on their own stops
   const snState = new Map();            // Trade Sentinel: 'SYMBOL|Side' -> what it knows about that open trade
   const pgState = new Map();            // 'SYMBOL|Buy' -> { entry, initialSl, peak, floor, shadowSl, profile, ... } for every trade being watched
@@ -587,9 +613,10 @@ function init(deps) {
       catch (e) { console.error('[multiuser] alert routes not loaded, using defaults:', e.message); }
     }
     try {                                                // Profit Guard: saved settings and the peaks/floors of trades that were open (so a restart forgets nothing)
-      const pg = await q(`SELECT k, v FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch','sentinel','sentinel_state','guards_master')`);
+      const pg = await q(`SELECT k, v FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch','sentinel','sentinel_state','guards_master','burst_brake')`);
       for (const row of pg.rows) {
         if (row.k === 'guards_master') guardsMaster = JSON.parse(row.v).on !== false;
+        else if (row.k === 'burst_brake') burstCfg = burstNorm(JSON.parse(row.v));
         else if (row.k === 'profit_guard') pgCfg = PG.normalize(JSON.parse(row.v));
         else if (row.k === 'sentinel') snCfg = SN.normalize(JSON.parse(row.v));
         else if (row.k === 'sentinel_state') { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) snState.set(k, v); }
@@ -992,6 +1019,12 @@ function init(deps) {
           qtyStep: ctx.inst.qtyStep, minQty: ctx.inst.minQty, maxRatio: MAX_RATIO });
         if (!s.qty) return finish(s.code, false, s.detail);
         qty = s.qty;
+        if (ctx.burst && ctx.burst.mode === 'live' && ctx.burst.factor < 1) {   // BURST BRAKE: a later same-direction copy in a burst is smaller (never below the exchange minimum)
+          const stepB = Number(ctx.inst.qtyStep) || 0, minB = Number(ctx.inst.minQty) || 0;
+          let qb = qty * ctx.burst.factor; if (stepB > 0) qb = Math.floor(qb / stepB + 1e-9) * stepB;
+          qb = Number(qb.toFixed(12));
+          if (qb >= minB && qb > 0) { base.burstNote = 'Burst brake: ' + ctx.burst.n + ' other same-direction trade(s) opened recently, this copy is ' + Math.round(ctx.burst.factor * 100) + '% size'; qty = qb; }
+        }
         // what this trade would lose if the signal's stop is hit (an estimate from the market price at signal time)
         const stopPx = Number(o.stopLoss);
         if (stopPx > 0 && ctx.refPrice > 0) base.riskUsd = Math.round(qty * Math.abs(ctx.refPrice - stopPx) * 100) / 100;
@@ -1011,7 +1044,7 @@ function init(deps) {
       }
       if (res.retCode === 110072) res = { ...res, retCode: 0, result: res.result || {} }; // duplicate = our earlier try did land
       if (res.retCode === 0) {
-        await q(`UPDATE order_log SET code='OK', ok=true, detail='Placed', bybit_order_id=$2 WHERE id=$1`, [claimed, (res.result && res.result.orderId) || null]);
+        await q(`UPDATE order_log SET code='OK', ok=true, detail=$3, bybit_order_id=$2 WHERE id=$1`, [claimed, (res.result && res.result.orderId) || null, 'Placed' + (base.burstNote ? ' (' + base.burstNote + ')' : '')]);
         if (!ctx.reduceOnly) {
           notify(u, '✅ Opened ' + o.symbol.replace('USDT', '') + ' ' + (o.side === 'Buy' ? 'long' : 'short') + ' (' + qty + ')');
           const t = setTimeout(() => recordFill(client, claimed, link, o.side, ctx.refPrice), 3000);
@@ -1034,12 +1067,22 @@ function init(deps) {
     if (!o) { console.warn('[multiuser] fan-out skipped: order failed validation'); return; }
     const reduceOnly = o.reduceOnly === true;
     await markOrderSeen(body && body.orderLinkId).catch(() => {});   // the bot's signal reached the relay: stops the "never arrived" alarm
+    let burst = null;
+    if (!reduceOnly && burstCfg.mode !== 'off') {   // BURST BRAKE: count same-side opens on other coins in the last few minutes (a retransmit of the same signal is not counted twice)
+      const nowB = Date.now(), keyB = (body && body.orderLinkId) || (o.symbol + '|' + o.side + '|' + Math.floor(nowB / 60000));
+      while (burstRecent.length && nowB - burstRecent[0].at > 3 * 3600000) burstRecent.shift();
+      if (!burstRecent.some(r => r.key === keyB)) {
+        burst = burstFactor(burstRecent, o.symbol, o.side, nowB, burstCfg);
+        burstRecent.push({ symbol: o.symbol, side: o.side, at: nowB, key: keyB });
+        if (burst.factor < 1) { burstLog.push({ at: new Date(nowB).toISOString(), symbol: o.symbol, side: o.side, n: burst.n, factor: burst.factor, mode: burst.mode }); if (burstLog.length > 60) burstLog.shift(); }
+      }
+    }
     const users = await tradableUsers({ forOpen: !reduceOnly }); // pause stops NEW trades only; closes always go through
     if (!users.length) return;
     const mode = getMode();
     const minute = Math.floor(Date.now() / 60000);
     const signalKey = (body && body.orderLinkId) || [o.symbol, o.side, o.qty, reduceOnly, minute].join('|');
-    const ctx = { mode, reduceOnly, signalKey, signalKeyRaw: (body && typeof body.orderLinkId === 'string' && body.orderLinkId.slice(0, 40)) || null, adminEquity: null, inst: null, refPrice: null };
+    const ctx = { mode, reduceOnly, signalKey, signalKeyRaw: (body && typeof body.orderLinkId === 'string' && body.orderLinkId.slice(0, 40)) || null, adminEquity: null, inst: null, refPrice: null, burst };
     if (mode === 'live' && !reduceOnly) {
       let sizingErr = null;
       try { ctx.adminEquity = await getAdminEquity(); ctx.inst = await getInstrument(o.symbol); }
@@ -1194,7 +1237,14 @@ function init(deps) {
       // "hold" = the relay is acting on this trade right now, so the bot may leave the whole-trade close to it (unless the reading is very strong)
       const g0 = pgState.get(rkey);
       const hold = !!(guardsMaster && pgCfg.smart.rev.on && pgCfg.smart.curve.on && g0 && PG.effMode(pgCfg, g0.profile) === 'live' && getMode() === 'live' && !breakerIsTripped());
-      return { status: 200, hold };
+      // v2.9.4 close feedback: if the exchange position this bot is still tracking has already closed, hand back the real exit. The bot sends the
+      // epoch second it opened the trade (ot); the relay's own trade must have started shortly after that and ended after it, so an older or newer trade
+      // on the same coin is never mistaken for it. No ot (older firmware) = no feedback.
+      let closed = null;
+      const otMs = numOr(b.ot) > 1e9 ? numOr(b.ot) * 1000 : 0;
+      const mc = masterClosed.get(rkey);
+      if (otMs && mc && mc.exit > 0 && mc.since >= otMs - 120000 && mc.since <= otMs + 900000 && mc.at > otMs && Date.now() - mc.at < 6 * 3600000) closed = { x: mc.exit, r: mc.exitR };
+      return closed ? { status: 200, hold, closed } : { status: 200, hold };
     }
     if (ev === 'test') { // the "test alert" button on a bot: proves bot -> relay -> Telegram/email works end to end
       const r = await deliverAlert('✅ Test alert from ' + bot.replace('YM ORACLE ', 'Oracle ') + '. The bot reached Render and Render can reach you. Trade alerts will arrive the same way.', { cat: 'tests' });
@@ -1539,6 +1589,10 @@ function init(deps) {
         [symbol, side, st.profile, it.em, entry, st.initialSl || null, st.peak, exit || null, peakPct, exitPct, gb, peakR, exitR, st.floor || st.shadowSl || null, (st.scaled || []).length, pnl]);
     } catch (e) { console.error('[multiuser] profit guard scorecard:', e.message); }
     await pgLog({ symbol, side, profile: st.profile, mode: it.em, event: 'closed', entry, mark: exit || null, newSl: st.floor || st.shadowSl || null, peakR, detail: 'trade closed' + (exitPct !== null ? ': best +' + peakPct.toFixed(2) + '%, exit ' + (exitPct >= 0 ? '+' : '') + exitPct.toFixed(2) + '%, gave back ' + gb.toFixed(2) + '%' : ' (exit price not found)') + (st.shadowSl > 0 && !st.shadowHit ? ' (price never touched the guard\'s shadow stop)' : '') });
+    if (exit > 0) {
+      masterClosed.set(it.key, { since: st.since || 0, entry, exit, exitR: exitR === null ? null : exitR, at: Date.now() });
+      if (masterClosed.size > 100) for (const [kk, vv] of masterClosed) if (Date.now() - vv.at > 6 * 3600000) masterClosed.delete(kk);
+    }
     const rc = pgCfg.reentry, pf = pgCfg[st.profile];
     if (rc.on && it.em !== 'off' && risk > 0 && peakR >= pf.beR) {
       pgWatch.set(it.key, { symbol, side, profile: st.profile, entry, exit: exit || it.mark, peak: st.peak, risk, extreme: exit || it.mark, cand: null, expiresAt: Date.now() + (st.profile === 'swing' ? rc.hoursSwing : rc.hoursFast) * 3600000 });
@@ -3073,6 +3127,15 @@ function init(deps) {
   app.get('/api/admin/live-trades', adminAuth, h(async (req, res) => { res.json({ success: true, ...(await liveView()) }); }));
   // MASTER SWITCH: one switch for the Profit Guard, the Sentinel, the stop floor and the early slice. Off = trades run on their own stops (the bots' own trailing and fixed stops).
   // Turning it off needs no confirm; stops the guards already moved stay where they are on Bybit. Turning it back on starts a fresh watch of the open trades.
+  app.get('/api/admin/burst-brake', adminAuth, h(async (req, res) => { res.json({ success: true, cfg: burstCfg, recent: burstLog.slice(-30) }); }));
+  app.post('/api/admin/burst-brake', adminAuth, h(async (req, res) => {
+    const b = req.body || {};
+    if (b.mode === 'live' && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: "Going live needs confirm: 'LIVE'. Shadow mode only logs what it would do." });
+    burstCfg = burstNorm({ ...burstCfg, ...(['off', 'shadow', 'live'].includes(b.mode) ? { mode: b.mode } : {}), ...(b.windowMin !== undefined ? { windowMin: b.windowMin } : {}), ...(b.factors !== undefined ? { factors: b.factors } : {}) });
+    await q(`INSERT INTO meta(k,v) VALUES('burst_brake',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(burstCfg)]);
+    await audit('admin', 'burst_brake', null, req, 'mode ' + burstCfg.mode + ', window ' + burstCfg.windowMin + ' min, factors ' + burstCfg.factors.join('/'));
+    res.json({ success: true, cfg: burstCfg });
+  }));
   app.get('/api/admin/guards-master', adminAuth, h(async (req, res) => { res.json({ success: true, master: guardsMaster }); }));
   app.post('/api/admin/guards-master', adminAuth, h(async (req, res) => {
     const on = req.body && req.body.on;
@@ -3294,7 +3357,7 @@ function init(deps) {
   app.get('/admin', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
   app.get('/s/:token', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'share.html')));
 
-  return { enabled: true, canPersist: true, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, pruneOldRows, pgTune: pgTuneEval, pgAutoTune, pgTick, pgState, botReads, pgWatch, pgClosing, pgRun, snTick, snState, snRun, snBackfill, snView, getSnCfg: () => snCfg, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, buildExportAll, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
+  return { enabled: true, canPersist: true, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, pruneOldRows, pgTune: pgTuneEval, pgAutoTune, pgTick, pgState, botReads, masterClosed, pgWatch, pgClosing, pgRun, snTick, snState, snRun, snBackfill, snView, getSnCfg: () => snCfg, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, buildExportAll, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
 }
 
 module.exports = { init };
