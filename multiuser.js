@@ -348,18 +348,34 @@ function init(deps) {
     return off;
   }
 
-  const { app, restClient, getMode, breakerIsTripped, sendAlert, baseOpts } = deps;
+  const { app, restClient, getMode, breakerIsTripped, sendAlert, baseOpts, execTrade } = deps;
   const PG = require('./profitguard.js');
+  const RB = require('./reentrybrain.js');
   const PL = require('./policylab.js');
   const SN = require('./sentinel.js');
   const LQ = require('./livequality.js');
   let snCfg = SN.defaults();            // Trade Sentinel settings (off until switched on from the admin console)
   let pgCfg = PG.defaults();            // Profit Guard settings (off until switched on from the admin console)
-  const pgWatch = new Map();            // re-entry watches (recording only); filled and used further down
+  const pgWatch = new Map();            // re-entry watches (recording; with live re-entry on, the same watch can place one order); filled and used further down
+  const pgPlanned = new Map();          // v2.9.8: symbol|side -> { sl, eng, bot, at } for a re-entry the relay has just placed, so the guard measures R against ITS stop, not the old trade's
   const botReads = new Map();
   // v2.9.4: trades the relay has seen close on the exchange (stop, target, Profit Guard, anything). A bot that is still tracking the trade asks via its
   // 'read' event and gets the real exit back, so it books the REAL result instead of a later phantom stop. Memory only; key SYMBOL|Buy/Sell.
   const masterClosed = new Map();
+  const closedDbMiss = new Map();   // v2.9.11: 'SYMBOL|Side|ot' -> when the database last said "not closed", so a bot asking every minute costs at most one query a minute
+  async function closedFromDb(rkey, otMs) {
+    const ck = rkey + '|' + otMs, seen = closedDbMiss.get(ck);
+    if (seen && Date.now() - seen < 60000) return null;
+    try {
+      const [sym, sd] = rkey.split('|');
+      const r = await q(`SELECT exit_price, exit_r FROM pg_trades WHERE symbol=$1 AND side=$2 AND exit_price > 0 AND at > to_timestamp($3) AND at > now() - interval '48 hours' ORDER BY at ASC LIMIT 1`, [sym, sd, otMs / 1000]);
+      const x = r.rows[0];
+      if (x) return { x: Number(x.exit_price), r: x.exit_r === null ? null : Number(x.exit_r) };
+    } catch (e) { console.error('[multiuser] closed lookup:', e.message); }
+    closedDbMiss.set(ck, Date.now());
+    if (closedDbMiss.size > 200) for (const [kk, vv] of closedDbMiss) if (Date.now() - vv > 300000) closedDbMiss.delete(kk);
+    return null;
+  }
   let burstCfg = burstNorm(null);        // BURST BRAKE settings (meta 'burst_brake'); default = shadow: log only
   const burstRecent = [];                // recent non-reduce orders {symbol, side, at, key}
   const burstLog = [];                   // what the brake did / would have done: newest last, max 60           // the bots' own reversal readings, by 'SYMBOL|Side' (memory only: a reading is only useful for a few minutes)
@@ -554,12 +570,18 @@ function init(deps) {
     );
     CREATE INDEX IF NOT EXISTS profit_guard_log_at_idx ON profit_guard_log(at DESC);
     ALTER TABLE profit_guard_log ADD COLUMN IF NOT EXISTS result_r NUMERIC;
+    ALTER TABLE profit_guard_log ADD COLUMN IF NOT EXISTS score NUMERIC;
+    ALTER TABLE profit_guard_log ADD COLUMN IF NOT EXISTS feat TEXT;
     CREATE TABLE IF NOT EXISTS pg_trades (
       id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(), symbol TEXT, side TEXT, profile TEXT, mode TEXT,
       entry NUMERIC, initial_sl NUMERIC, peak_price NUMERIC, exit_price NUMERIC, peak_pct NUMERIC, exit_pct NUMERIC, giveback_pct NUMERIC,
       peak_r NUMERIC, exit_r NUMERIC, guard_floor NUMERIC, scaled INT, pnl NUMERIC
     );
     ALTER TABLE pg_trades ADD COLUMN IF NOT EXISTS closed_by TEXT;
+    CREATE INDEX IF NOT EXISTS pg_trades_sym_at_idx ON pg_trades(symbol, at DESC);
+    ALTER TABLE pg_trades ADD COLUMN IF NOT EXISTS reentry BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE pg_trades ADD COLUMN IF NOT EXISTS reentry_score NUMERIC;
+    ALTER TABLE pg_trades ADD COLUMN IF NOT EXISTS reentry_src TEXT;
     CREATE TABLE IF NOT EXISTS trade_path (
       id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(), symbol TEXT, side TEXT, mark NUMERIC, now_r NUMERIC, peak_r NUMERIC, atr NUMERIC, score NUMERIC, state TEXT
     );
@@ -617,15 +639,26 @@ function init(deps) {
       catch (e) { console.error('[multiuser] alert routes not loaded, using defaults:', e.message); }
     }
     try {                                                // Profit Guard: saved settings and the peaks/floors of trades that were open (so a restart forgets nothing)
-      const pg = await q(`SELECT k, v FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch','sentinel','sentinel_state','guards_master','burst_brake')`);
+      const pg = await q(`SELECT k, v FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch','sentinel','sentinel_state','guards_master','burst_brake','sn_start_0_7')`);
       for (const row of pg.rows) {
         if (row.k === 'guards_master') guardsMaster = JSON.parse(row.v).on !== false;
         else if (row.k === 'burst_brake') burstCfg = burstNorm(JSON.parse(row.v));
         else if (row.k === 'profit_guard') pgCfg = PG.normalize(JSON.parse(row.v));
         else if (row.k === 'sentinel') snCfg = SN.normalize(JSON.parse(row.v));
+        else if (row.k === 'sn_start_0_7') { /* marker only */ }
         else if (row.k === 'sentinel_state') { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) snState.set(k, v); }
         else if (row.k === 'profit_guard_watch') { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) pgWatch.set(k, v); }
         else { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) pgState.set(k, v); }
+      }
+      if (!pg.rows.some(r => r.k === 'sn_start_0_7')) {   // v2.9.10: the Sentinel's profit start 0.3R -> 0.7R, once, only if it was never changed from the old default
+        const m = SN.migrateStart(snCfg, pg.rows.some(r => r.k === 'sentinel'));
+        if (m.changed) {
+          snCfg = m.cfg;
+          await q(`INSERT INTO meta(k,v) VALUES('sentinel',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(snCfg)]);
+          console.log('[sentinel] profit start moved from 0.3R to 0.7R (v2.9.10 default; change it in the Sentinel card if you prefer another value)');
+          if (sendAlert) Promise.resolve(sendAlert('🛡️ Sentinel: "in profit" now starts at +0.7R (was +0.3R). Between 0.3R and 0.7R an alert uses the loss-side stop instead of jumping to breakeven. Change it in the Sentinel card if you prefer.')).catch(() => {});
+        }
+        await q(`INSERT INTO meta(k,v) VALUES('sn_start_0_7','1') ON CONFLICT (k) DO NOTHING`);
       }
     } catch (e) { console.error('[multiuser] profit guard settings not loaded, it stays off:', e.message); }
     const dr = await q(`SELECT v FROM meta WHERE k='dry_run_all'`);
@@ -1247,7 +1280,9 @@ function init(deps) {
       let closed = null;
       const otMs = numOr(b.ot) > 1e9 ? numOr(b.ot) * 1000 : 0;
       const mc = masterClosed.get(rkey);
-      if (otMs && mc && mc.exit > 0 && mc.since >= otMs - 120000 && mc.since <= otMs + 900000 && mc.at > otMs && Date.now() - mc.at < 6 * 3600000) closed = { x: mc.exit, r: mc.exitR };
+      if (otMs && mc && mc.exit > 0 && mc.since >= otMs - 120000 && mc.since <= otMs + 900000 && mc.at > otMs && Date.now() - mc.at < 48 * 3600000) closed = { x: mc.exit, r: mc.exitR };
+      // v2.9.11: the memory above is lost on every restart or redeploy. Fall back to the saved scorecard: the first trade on this coin and side that closed after the bot opened its own, with a real exit.
+      if (!closed && otMs) closed = await closedFromDb(rkey, otMs);
       // v2.9.6: the stop that is really on Bybit for this trade, only while the Profit Guard is LIVE for it and the relay is trading normally. The bot copies it
       // (tighter only) and, while it receives it, leaves stop moves to the relay instead of sending its own through the manager.
       const slNow = (g0 && guardsMaster && PG.effMode(pgCfg, g0.profile) === 'live' && getMode() === 'live' && !breakerIsTripped() && Number(g0.curSl) > 0 && Date.now() - (g0.seenAt || Date.now()) < 120000) ? Number(g0.curSl) : 0;
@@ -1536,8 +1571,8 @@ function init(deps) {
   const pgEm = st => PG.effMode(pgCfg, st.profile);
   async function pgLog(row) {
     try {
-      await q(`INSERT INTO profit_guard_log(symbol,side,mode,profile,event,entry,mark,old_sl,new_sl,peak_r,lock_pct,detail,result_r) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-        [row.symbol, row.side || null, row.mode || pgCfg.mode, row.profile || null, row.event, row.entry ?? null, row.mark ?? null, row.oldSl ?? null, row.newSl ?? null, row.peakR ?? null, row.lockPct ?? null, String(row.detail || '').slice(0, 300), row.resultR ?? null]);
+      await q(`INSERT INTO profit_guard_log(symbol,side,mode,profile,event,entry,mark,old_sl,new_sl,peak_r,lock_pct,detail,result_r,score,feat) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        [row.symbol, row.side || null, row.mode || pgCfg.mode, row.profile || null, row.event, row.entry ?? null, row.mark ?? null, row.oldSl ?? null, row.newSl ?? null, row.peakR ?? null, row.lockPct ?? null, String(row.detail || '').slice(0, 300), row.resultR ?? null, Number.isFinite(row.score) ? row.score : null, row.feat ? JSON.stringify(row.feat).slice(0, 600) : null]);
     } catch (e) { console.error('[multiuser] profit guard log:', e.message); }
   }
   // v2.9.7: the Halt switch and the paper/live mode are mirrored here, so a redeploy or restart on a host with no persistent disk cannot silently undo them.
@@ -1567,6 +1602,8 @@ function init(deps) {
   }
   // Which profile a trade follows, and the stop the bot originally planned for it (from what the bot reported when it opened the trade).
   async function pgLookup(symbol, side) {
+    const pl = pgPlanned.get(symbol + '|' + side);
+    if (pl && Date.now() - pl.at < 600000) { pgPlanned.delete(symbol + '|' + side); return { bot: pl.bot, sl: pl.sl, eng: pl.eng, reentry: true, score: pl.score, src: pl.src }; }
     try {
       const r = await q(`SELECT bot, sl, eng FROM signals WHERE symbol=$1 AND side=$2 AND opened_at > now() - interval '30 days' ORDER BY opened_at DESC LIMIT 1`, [symbol, side === 'Buy' ? 'BUY' : 'SELL']);
       const x = r.rows[0]; if (!x) return { bot: '', sl: 0, eng: null };
@@ -1602,7 +1639,9 @@ function init(deps) {
     try {
       const r = await restClient.getClosedPnL({ category: 'linear', symbol, limit: 10 });
       const rows = ((r.result && r.result.list) || []).filter(x => x.symbol === symbol && Number(x.updatedTime || x.createdTime || 0) >= st.since - 60000);
-      const last = rows.find(x => Number(x.updatedTime || x.createdTime || 0) >= it.at - 180000);
+      // v2.9.11: the newest closing row of THIS trade. It used to also require the row to be within 3 minutes before we noticed the close, so a relay that woke from a sleep
+      // or restart (it noticed hours later) found no exit price at all: 5 of 19 trades on 21-22 Oct. Rows are already limited to those after the trade began; the upper bound keeps a LATER trade out.
+      const last = rows.filter(x => Number(x.updatedTime || x.createdTime || 0) <= it.at + 120000).sort((a, b) => Number(b.updatedTime || b.createdTime || 0) - Number(a.updatedTime || a.createdTime || 0))[0];
       if (last && parseFloat(last.avgExitPrice) > 0) { exit = parseFloat(last.avgExitPrice); pnl = rows.reduce((t, x) => t + (Number(x.closedPnl) || 0), 0); }
     } catch { /* retried below */ }
     if (!(exit > 0) && it.tries < 6) { it.tries++; return false; }
@@ -1614,21 +1653,115 @@ function init(deps) {
     try {
       const closedBy = exit > 0 ? PL.attributeExit({ side, entry, initialSl: st.initialSl, exit, guardFloor: st.floor, sentinelFloor: st.snFloor, botStop: st.botSl }) : 'UNKNOWN';
       st.closedBy = closedBy;
-      await q(`INSERT INTO pg_trades(symbol,side,profile,mode,entry,initial_sl,peak_price,exit_price,peak_pct,exit_pct,giveback_pct,peak_r,exit_r,guard_floor,scaled,pnl,closed_by)
-               SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
+      await q(`INSERT INTO pg_trades(symbol,side,profile,mode,entry,initial_sl,peak_price,exit_price,peak_pct,exit_pct,giveback_pct,peak_r,exit_r,guard_floor,scaled,pnl,closed_by,reentry,reentry_score,reentry_src)
+               SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::boolean,$19::numeric,$20::text
                WHERE NOT EXISTS (SELECT 1 FROM pg_trades WHERE symbol=$1 AND side=$2 AND entry=$5 AND exit_price IS NOT DISTINCT FROM $8::numeric)`,
-        [symbol, side, st.profile, it.em, entry, st.initialSl || null, st.peak, exit || null, peakPct, exitPct, gb, peakR, exitR, st.floor || st.shadowSl || null, (st.scaled || []).length, pnl, closedBy]);
+        [symbol, side, st.profile, it.em, entry, st.initialSl || null, st.peak, exit || null, peakPct, exitPct, gb, peakR, exitR, st.floor || st.shadowSl || null, (st.scaled || []).length, pnl, closedBy, st.reentry === true, Number.isFinite(st.reentryScore) ? st.reentryScore : null, st.reentrySrc || null]);
     } catch (e) { console.error('[multiuser] profit guard scorecard:', e.message); }
     await pgLog({ symbol, side, profile: st.profile, mode: it.em, event: 'closed', entry, mark: exit || null, newSl: st.floor || st.shadowSl || null, peakR, detail: 'trade closed' + (st.closedBy && st.closedBy !== 'UNKNOWN' ? ' [exit at: ' + st.closedBy + ']' : '') + (exitPct !== null ? ': best +' + peakPct.toFixed(2) + '%, exit ' + (exitPct >= 0 ? '+' : '') + exitPct.toFixed(2) + '%, gave back ' + gb.toFixed(2) + '%' : ' (exit price not found)') + (st.shadowSl > 0 && !st.shadowHit ? ' (price never touched the guard\'s shadow stop)' : '') });
     if (exit > 0) {
       masterClosed.set(it.key, { since: st.since || 0, entry, exit, exitR: exitR === null ? null : exitR, at: Date.now() });
-      if (masterClosed.size > 100) for (const [kk, vv] of masterClosed) if (Date.now() - vv.at > 6 * 3600000) masterClosed.delete(kk);
+      if (masterClosed.size > 100) for (const [kk, vv] of masterClosed) if (Date.now() - vv.at > 48 * 3600000) masterClosed.delete(kk);
     }
     const rc = pgCfg.reentry, pf = pgCfg[st.profile];
-    if (rc.on && it.em !== 'off' && risk > 0 && peakR >= pf.beR) {
-      pgWatch.set(it.key, { symbol, side, profile: st.profile, entry, exit: exit || it.mark, peak: st.peak, risk, extreme: exit || it.mark, cand: null, expiresAt: Date.now() + (st.profile === 'swing' ? rc.hoursSwing : rc.hoursFast) * 3600000 });
+    // v2.9.9 SHAKE-OUT: a protective stop closed the trade near breakeven (the original stop was never touched) although it had shown some profit: the thesis may be intact. Watched like a winner, tagged 'shake'.
+    const isShake = !!(rc.shake && ['GUARD_STOP', 'SENTINEL_STOP', 'BOT_STOP', 'OTHER'].includes(st.closedBy) && peakR !== null && peakR >= 0.2 && peakR < pf.beR && exitR !== null && exitR > -0.35 && exitR < 0.75);
+    if (st.reentry) {   // v2.9.8: a re-entry never starts another watch (no chains), and its result may pause live re-entry
+      await pgLog({ symbol, side, profile: st.profile, mode: 'live', event: 'reentry_closed', entry, mark: exit || null, peakR, resultR: exitR, detail: 'the re-entry trade closed' + (exitR !== null ? ' at ' + (exitR >= 0 ? '+' : '') + exitR.toFixed(2) + 'R of its own stop' : '') + (st.closedBy && st.closedBy !== 'UNKNOWN' ? ' [exit at: ' + st.closedBy + ']' : '') });
+      await reentryCheckPause().catch(e => console.error('[multiuser] re-entry pause check:', e.message));
+    } else if (rc.on && it.em !== 'off' && risk > 0 && (peakR >= pf.beR || isShake)) {
+      pgWatch.set(it.key, { symbol, side, profile: st.profile, src: peakR >= pf.beR ? 'winner' : 'shake', bot: st.bot || '', lev: st.lev || 0, margin: st.margin || 0, entry, exit: exit || it.mark, peak: st.peak, risk, extreme: exit || it.mark, cand: null, expiresAt: Date.now() + (st.profile === 'swing' ? rc.hoursSwing : rc.hoursFast) * 3600000 });
       for (const k of [...pgWatch.keys()].slice(0, Math.max(0, pgWatch.size - 20))) pgWatch.delete(k);
     }
+    return true;
+  }
+  // ---- LIVE RE-ENTRY (v2.9.8) -----------------------------------------------------------------------------------------------------------------------------
+  // The recorder spots "pulled back, then resumed". When live re-entry is ON (off by default, needs the LIVE confirm), that spot may become ONE real order on the MASTER account
+  // only (never copied to users), sized at sizeMult x the original trade's margin, stop = the pullback low, target = +targetR. PG.reentryGate decides; every refusal is logged
+  // with its reason. A re-entry is managed like any trade (guard, sentinel, Bybit stop/target), never starts another watch, and three bad results in a row pause it.
+  const tickCache = new Map();
+  async function tickOf(symbol) {
+    if (tickCache.has(symbol)) return tickCache.get(symbol);
+    const r = await restClient.getInstrumentsInfo({ category: 'linear', symbol });
+    const t = r && r.result && r.result.list && r.result.list[0] && r.result.list[0].priceFilter && r.result.list[0].priceFilter.tickSize;
+    if (!(Number(t) > 0)) throw new Error('no tick size for ' + symbol);
+    tickCache.set(symbol, t); return t;
+  }
+  // ---- the brain's data (v2.9.9): candles of the pair (15m, 1h), BTC (1h), the 24h turnover, and the pair's earlier re-entry results ----
+  const klCache = new Map();
+  async function klines(symbol, interval, limit, ttlMs) {
+    const k = symbol + '|' + interval, hit = klCache.get(k);
+    if (hit && Date.now() - hit.at < ttlMs) return hit.bars;
+    const r = await restClient.getKline({ category: 'linear', symbol, interval, limit });
+    if (!r || r.retCode !== 0) throw new Error('kline ' + ((r && (r.retMsg || r.retCode)) || 'no reply'));
+    const bars = snBarsFrom(r.result && r.result.list).sort((a, b) => a.t - b.t);
+    klCache.set(k, { at: Date.now(), bars });
+    return bars;
+  }
+  async function turnoverOf(symbol) {
+    const r = await restClient.getTickers({ category: 'linear', symbol });
+    const t = r && r.result && r.result.list && r.result.list[0] ? parseFloat(r.result.list[0].turnover24h) : NaN;
+    return Number.isFinite(t) ? t : null;
+  }
+  async function pairRecord(symbol) {
+    try {
+      const r = (await q(`SELECT COUNT(*)::int AS n, AVG(x) AS avg FROM (SELECT result_r AS x FROM profit_guard_log WHERE event='reentry_result' AND symbol=$1 AND at > now() - interval '60 days' AND result_r IS NOT NULL
+        UNION ALL SELECT exit_r FROM pg_trades WHERE reentry AND symbol=$1 AND at > now() - interval '60 days' AND exit_r IS NOT NULL) t`, [symbol])).rows[0];
+      return Number(r.n) > 0 ? { n: Number(r.n), avgR: Number(r.avg) } : null;
+    } catch { return null; }
+  }
+  // Scores one chance. Never throws: when the data cannot be read the answer is { ok:false, reason } and a live order is refused.
+  async function reentryBrain(w, c, mk) {
+    try {
+      const [c15, c60, btc, turn, pair] = await Promise.all([klines(w.symbol, '15', 60, 60000), klines(w.symbol, '60', 60, 300000), klines('BTCUSDT', '60', 30, 120000).catch(() => null), turnoverOf(w.symbol).catch(() => null), pairRecord(w.symbol)]);
+      return RB.score({ side: w.side, price: mk, stop: c.stop, peak: w.peak, entry: w.entry, src: w.src || 'winner', c15, c60, btc, turnover: turn, pair });
+    } catch (e) { return { ok: false, reason: 'market data: ' + String(e && e.message || e).slice(0, 100) }; }
+  }
+  async function reentryTry(w, e, mk, positions, brain) {
+    if (w.placed) return;
+    w.placed = true;                       // one attempt per candidate, whatever happens (kept with the watch)
+    const rc = pgCfg.reentry, c = w.cand || { price: e.price, stop: e.stop, pullR: e.pullR };
+    c.pullR = e.pullR;
+    const base = { symbol: w.symbol, side: w.side, profile: w.profile, mode: 'live', entry: w.entry };
+    const skip = async (code, detail) => { await pgLog({ ...base, event: 'reentry_skipped', mark: mk, newSl: c.stop, peakR: c.pullR, detail: code + ': ' + detail }); return false; };
+    const liveOk = !!(guardsMaster && PG.effMode(pgCfg, w.profile) === 'live' && getMode() === 'live' && !breakerIsTripped() && typeof execTrade === 'function');
+    const today = Number((await q(`SELECT COUNT(*)::int AS n FROM profit_guard_log WHERE event='reentry_placed' AND at > now() - interval '24 hours'`)).rows[0].n) || 0;
+    const openN = [...pgState.values()].filter(x => x.reentry).length + [...pgClosing].filter(x => x.st && x.st.reentry).length + [...pgPlanned.values()].filter(x => Date.now() - x.at < 600000).length;
+    const lossRow = (await q(`SELECT EXTRACT(EPOCH FROM (now() - at)) / 3600 AS h FROM pg_trades WHERE reentry AND symbol=$1 AND exit_r < 0 ORDER BY at DESC LIMIT 1`, [w.symbol])).rows[0];
+    const ctx = { score: brain && brain.ok ? brain.score : undefined, scoreWhy: brain && !brain.ok ? brain.reason : '', turnover: brain && brain.ok && brain.feat.turn !== undefined ? brain.feat.turn : null, mark: mk, todayCount: today, openCount: openN, symbolHeld: (positions || []).some(p => p.symbol === w.symbol && parseFloat(p.size) > 0), lastLossAgoH: lossRow ? Number(lossRow.h) : null, liveOk };
+    const g = PG.reentryGate(w, c, ctx, rc);
+    if (!g.ok) { if (g.code === 'SHAKEOFF') return false; return skip(g.code, g.detail); }
+    let tick; try { tick = await tickOf(w.symbol); } catch (err) { return skip('NOTICK', err.message); }
+    const plan = PG.reentryPlan(w, c, rc, tick, mk, brain && brain.ok ? brain.score : undefined);
+    const long = w.side === 'Buy';
+    if (!(plan.sl > 0) || !(plan.tp > 0) || (long ? !(plan.tp > mk && plan.sl < mk) : !(plan.tp < mk && plan.sl > mk))) return skip('BADPLAN', 'stop ' + plan.sl + ' / target ' + plan.tp + ' do not fit around ' + mk);
+    const id = 'RE' + require('crypto').createHash('sha1').update([w.symbol, w.side, c.at || 0, w.entry].join('|')).digest('hex').slice(0, 12);
+    const key = w.symbol + '|' + w.side;
+    pgPlanned.set(key, { sl: plan.sl, eng: w.profile, bot: w.bot || '', at: Date.now(), score: brain && brain.ok ? brain.score : null, src: w.src || 'winner' });
+    let res;
+    try { res = await execTrade({ kind: 'open', id, bot: ('RE ' + (w.bot || '')).trim(), side: plan.side, symbol: w.symbol, usdMargin: plan.usdMargin, leverage: plan.leverage, sl: String(plan.sl), tp: String(plan.tp), trailPct: 0 }); }
+    catch (err) { res = { body: { ok: false, code: 'NET', detail: String(err && err.message || err).slice(0, 120) } }; }
+    const b = (res && res.body) || {};
+    if (b.ok) {
+      await pgLog({ ...base, event: 'reentry_placed', mark: mk, newSl: plan.sl, peakR: c.pullR, score: brain && brain.ok ? brain.score : undefined, feat: brain && brain.ok ? { ...brain.feat, src: w.src || 'winner' } : undefined, detail: (w.src === 'shake' ? 'SHAKE-OUT ' : '') + 'RE-ENTRY PLACED on the master account: ' + plan.side + ' $' + plan.usdMargin + ' margin at ' + plan.leverage + 'x, stop ' + plan.sl + ' (' + plan.stopPct.toFixed(2) + '% away), target ' + plan.tp + ' (+' + plan.rr + 'R)' + (brain && brain.ok ? ', score ' + brain.score + ' ' + brain.verdict : '') + ' [' + b.code + ']' });
+      if (sendAlert) Promise.resolve(sendAlert('🔁 Re-entry placed (master only): ' + w.symbol.replace('USDT', '') + ' ' + (long ? 'long' : 'short') + ' after a ' + c.pullR.toFixed(1) + 'R pullback' + (w.src === 'shake' ? ' (a shake-out)' : '') + (brain && brain.ok ? ', score ' + brain.score + '/100 ' + brain.verdict : '') + '. Stop ' + plan.sl + ', target ' + plan.tp + ', $' + plan.usdMargin + ' margin at ' + plan.leverage + 'x.')).catch(() => {});
+      return true;
+    }
+    pgPlanned.delete(key);
+    await pgLog({ ...base, event: 'reentry_failed', mark: mk, newSl: plan.sl, peakR: c.pullR, detail: (b.code || 'ERR') + ': ' + (b.detail || b.message || 'the order was not placed') });
+    return false;
+  }
+  async function reentryCheckPause() {
+    const rc = pgCfg.reentry; if (!rc.live) return false;
+    const r = await q(`SELECT exit_r FROM pg_trades WHERE reentry ORDER BY id DESC LIMIT 3`);
+    const rs = r.rows.map(x => Number(x.exit_r) || 0);
+    if (!PG.reentryShouldPause(rs, rc)) return false;
+    const next = PG.normalize({ ...pgCfg, reentry: { ...rc, live: false } });
+    await q(`INSERT INTO meta(k,v) VALUES('profit_guard',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(next)]);
+    pgCfg = next;
+    const sum = rs.reduce((t, x) => t + x, 0);
+    await pgLog({ symbol: '-', mode: 'live', event: 'reentry_paused', resultR: sum, detail: 'Live re-entry paused itself: the last 3 re-entries lost ' + sum.toFixed(2) + 'R together (limit -' + rc.pauseR + 'R). It is back to recording only; switch it on again in the Profit Guard card when you are ready.' });
+    if (sendAlert) Promise.resolve(sendAlert('⏸ Live re-entry paused itself: the last 3 re-entries lost ' + sum.toFixed(2) + 'R together. It only records now. Review the Profit Guard log before switching it back on.')).catch(() => {});
     return true;
   }
   async function pgTick() {
@@ -1651,12 +1784,13 @@ function init(deps) {
           const lk = await pgLookup(symbol, side);
           let init = lk.sl > 0 && (long ? lk.sl < entry : lk.sl > entry) ? lk.sl : 0;                     // the bot's own planned stop
           if (!init && curSl > 0 && (long ? curSl < entry : curSl > entry)) init = curSl;                    // else the first stop we saw on the position
-          st = { entry, initialSl: init, peak: entry, peakAt: Date.now(), maxPull: 0, floor: 0, shadowSl: 0, shadowHit: false, scaled: [], profile: PG.profileOf(pgCfg, lk.eng, lk.bot), bot: lk.bot, since: Date.now(), lastAlert: 0 };
+          st = { entry, initialSl: init, peak: entry, peakAt: Date.now(), maxPull: 0, floor: 0, shadowSl: 0, shadowHit: false, scaled: [], profile: PG.profileOf(pgCfg, lk.eng, lk.bot), bot: lk.bot, since: Date.now(), lastAlert: 0, reentry: lk.reentry === true, reentryScore: lk.score, reentrySrc: lk.src };
           pgState.set(key, st); pgWatch.delete(key);
         }
         st.scaled = st.scaled || [];
         const peak0 = st.peak;
         st.peak = PG.updatePeak(st.peak, side, mark, entry); st.mark = mark; st.curSl = curSl; st.size = Number(p.size) || 0; st.seenAt = Date.now();
+        { const lv = Number(p.leverage) || 0, pv = Number(p.positionValue) || (st.size * entry); if (lv >= 1 && pv > 0) { st.lev = lv; st.margin = pv / lv; } }   // v2.9.8: what a re-entry will be sized from
         { const sn1 = snState.get(key); if (sn1 && sn1.floor > 0) st.snFloor = sn1.floor; const bs = botStopSeen.get(symbol); if (bs > 0) st.botSl = bs; }   // v2.9.5: who set which stop, for the exit attribution
         if (st.peak !== peak0 || !(st.peakAt > 0)) { st.peakAt = Date.now(); st.dirty = true; }          // smart: a new best resets the stall clock
         const pull0 = st.maxPull || 0; st.maxPull = PG.updatePull(pull0, side, st.peak, mark);          // smart: the trade's own largest pullback so far
@@ -1790,8 +1924,14 @@ function init(deps) {
         if (out.events.length || out.finished) gone = true;
         for (const e of out.events) {
           const base = { symbol: w.symbol, side: w.side, profile: w.profile, mode: 'shadow', entry: w.entry };
-          if (e.type === 'would_reenter') await pgLog({ ...base, event: 'would_reenter', mark: e.price, newSl: e.stop, peakR: e.pullR, detail: 'pulled back ' + e.pullR.toFixed(1) + 'R then resumed: a re-entry would have been taken here (recording only)' });
-          else if (e.type === 'reentry_result') await pgLog({ ...base, event: 'reentry_result', mark: mk, resultR: e.r, peakR: e.bestR, detail: e.why });
+          if (e.type === 'would_reenter') {
+            const brain = await reentryBrain(w, { price: e.price, stop: e.stop }, mk);   // scored (and logged) for EVERY chance, live or not: that is how the score is checked against results
+            if (w.cand) { w.cand.score = brain.ok ? brain.score : null; w.cand.pullR = e.pullR; }
+            await pgLog({ ...base, event: 'would_reenter', mark: e.price, newSl: e.stop, peakR: e.pullR, score: brain.ok ? brain.score : undefined, feat: brain.ok ? { ...brain.feat, src: w.src || 'winner' } : { src: w.src || 'winner', unreadable: brain.reason },
+              detail: (w.src === 'shake' ? 'SHAKE-OUT chance: ' : '') + 'pulled back ' + e.pullR.toFixed(1) + 'R then resumed' + (pgCfg.reentry.live ? '' : ' (recording only)') + ' | ' + RB.summary(brain) });
+            if (pgCfg.reentry.live) await reentryTry(w, e, mk, positions, brain).catch(err => console.error('[multiuser] live re-entry:', err.message));
+          }
+          else if (e.type === 'reentry_result') await pgLog({ ...base, event: 'reentry_result', mark: mk, resultR: e.r, peakR: e.bestR, score: w.cand && Number.isFinite(w.cand.score) ? w.cand.score : undefined, detail: e.why });
           else if (e.type === 'no_reentry') await pgLog({ ...base, event: 'no_reentry', mark: mk, peakR: e.pullR, detail: 'no pullback-and-resume appeared within the window' });
         }
         if (out.finished) pgWatch.delete(key);
@@ -1845,7 +1985,8 @@ function init(deps) {
   async function snExitOf(symbol, sinceMs) {
     try {
       const r = await restClient.getClosedPnL({ category: 'linear', symbol, limit: 10 });
-      const rows = ((r.result && r.result.list) || []).filter(x => x.symbol === symbol && Number(x.updatedTime || x.createdTime || 0) >= sinceMs - 60000);
+      // v2.9.11: newest row first by its own time (never trust the list order), the same pick the Profit Guard scorecard makes: on 21 Oct the two scorecards disagreed on the exit of the same trade (AVAX 0.06R vs 0.73R)
+      const rows = ((r.result && r.result.list) || []).filter(x => x.symbol === symbol && Number(x.updatedTime || x.createdTime || 0) >= sinceMs - 60000).sort((a, b) => Number(b.updatedTime || b.createdTime || 0) - Number(a.updatedTime || a.createdTime || 0));
       if (rows.length && parseFloat(rows[0].avgExitPrice) > 0) return { exit: parseFloat(rows[0].avgExitPrice), pnl: rows.reduce((t, x) => t + (Number(x.closedPnl) || 0), 0) };
     } catch { /* retried */ }
     return null;
@@ -2093,10 +2234,12 @@ function init(deps) {
     const trades = [...pgState.entries()].map(([key, st]) => ({ symbol: key.split('|')[0], side: key.split('|')[1], profile: st.profile, bot: st.bot, mode: st.em || pgEm(st), entry: st.entry, mark: st.mark || null, peak: st.peak, peakR: st.peakR || 0, initialSl: st.initialSl || null, stop: st.curSl || null, floor: st.floor || null, shadowStop: st.shadowSl || null, scaled: (st.scaled || []).length, why: st.lastWhy || '', pullR: st.initialSl > 0 ? (st.maxPull || 0) / Math.abs(st.entry - st.initialSl) : null, stallPts: Math.round(PG.stallExtra(pgCfg, st.profile, Date.now(), st.peakAt) * 100) }));
     const card = (await q(`SELECT at, symbol, side, profile, mode, peak_pct, exit_pct, giveback_pct, peak_r, exit_r, scaled, pnl, closed_by FROM pg_trades ORDER BY id DESC LIMIT 20`)).rows;
     const agg = (await q(`SELECT profile, mode, COUNT(*)::int AS n, AVG(peak_pct) AS peak, AVG(exit_pct) AS exit, AVG(giveback_pct) AS giveback FROM pg_trades WHERE exit_pct IS NOT NULL GROUP BY profile, mode ORDER BY profile, mode`)).rows;
+    const bands = (await q(`SELECT CASE WHEN score < 45 THEN '<45' WHEN score < 60 THEN '45-60' WHEN score < 75 THEN '60-75' ELSE '75+' END AS band, COUNT(*)::int AS n, AVG(result_r) AS avg_r, COUNT(*) FILTER (WHERE result_r > 0)::int AS wins FROM profit_guard_log WHERE event='reentry_result' AND score IS NOT NULL GROUP BY 1 ORDER BY 1`)).rows;
+    const lv = (await q(`SELECT COUNT(*)::int AS n, COUNT(*) FILTER (WHERE exit_r > 0)::int AS wins, COALESCE(SUM(exit_r), 0) AS sum_r, AVG(exit_r) AS avg_r FROM pg_trades WHERE reentry`)).rows[0];
     const re = (await q(`SELECT COUNT(*) FILTER (WHERE event='would_reenter')::int AS spotted, COUNT(*) FILTER (WHERE event='reentry_result')::int AS done, COUNT(*) FILTER (WHERE event='reentry_result' AND result_r>0)::int AS wins, AVG(result_r) FILTER (WHERE event='reentry_result') AS avg_r, COUNT(*) FILTER (WHERE event='no_reentry')::int AS none FROM profit_guard_log`)).rows[0];
     const watching = [...pgWatch.values()].map(w => ({ symbol: w.symbol, side: w.side, profile: w.profile, cand: !!w.cand, expiresAt: w.expiresAt }));
     const tuning = {}; for (const pr of ['fast', 'swing']) { try { const t = await pgTuneEval(pr); delete t.next; tuning[pr] = t; } catch { tuning[pr] = null; } }
-    return { master: guardsMaster, cfg: pgCfg, tuning, run: { at: pgRun.at, ok: pgRun.ok, note: pgRun.note, err: pgRun.err, positions: pgRun.positions, raises: pgRun.raises, scales: pgRun.scales, relayMode: getMode(), halted: !!breakerIsTripped() }, trades, log, scorecard: { recent: card, summary: agg, reentry: re, watching } };
+    return { master: guardsMaster, cfg: pgCfg, tuning, run: { at: pgRun.at, ok: pgRun.ok, note: pgRun.note, err: pgRun.err, positions: pgRun.positions, raises: pgRun.raises, scales: pgRun.scales, relayMode: getMode(), halted: !!breakerIsTripped() }, trades, log, scorecard: { recent: card, summary: agg, reentry: { ...re, live: lv, bands }, watching } };
   };
 
   // ---------- CSV export + daily backup ----------
@@ -3102,6 +3245,7 @@ function init(deps) {
     }
     const sm = b.smart && typeof b.smart === 'object' ? { noise: { ...pgCfg.smart.noise, ...(b.smart.noise || {}) }, stall: { ...pgCfg.smart.stall, ...(b.smart.stall || {}) }, adapt: { ...pgCfg.smart.adapt, ...(b.smart.adapt || {}), mkt: { ...pgCfg.smart.adapt.mkt, ...((b.smart.adapt || {}).mkt || {}) } }, curve: { ...pgCfg.smart.curve, ...(b.smart.curve || {}) }, slice: { ...pgCfg.smart.slice, ...(b.smart.slice || {}) }, rev: { ...pgCfg.smart.rev, ...(b.smart.rev || {}) }, tune: { ...pgCfg.smart.tune, ...(b.smart.tune || {}), lastAtN: pgCfg.smart.tune.lastAtN } } : pgCfg.smart;
     const next = PG.normalize({ ...pgCfg, ...b, smart: sm, reentry: b.reentry ? { ...pgCfg.reentry, ...b.reentry } : pgCfg.reentry, fast: b.fast ? { ...pgCfg.fast, ...b.fast } : pgCfg.fast, swing: b.swing ? { ...pgCfg.swing, ...b.swing } : pgCfg.swing });
+    if (((next.reentry.live && !pgCfg.reentry.live) || (next.reentry.liveShake && !pgCfg.reentry.liveShake)) && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'Live re-entry opens real trades on the master account. Confirm it on the panel.' });
     if (next.smart.tune.mode === 'auto' && pgCfg.smart.tune.mode !== 'auto' && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: 'Auto-tuning changes the live stop rules by itself. Confirm it on the panel.' });
     for (const pr of ['fast', 'swing']) {      // anything that starts acting on real money needs the explicit confirm
       const goesLive = PG.effMode(next, pr) === 'live' && PG.effMode(pgCfg, pr) !== 'live';
@@ -3401,7 +3545,7 @@ function init(deps) {
   app.get('/admin', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
   app.get('/s/:token', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'share.html')));
 
-  return { enabled: true, canPersist: true, loadControl, saveControl, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, pruneOldRows, pgTune: pgTuneEval, pgAutoTune, pgTick, snRecordClose, botStopSeen, pgState, botReads, masterClosed, pgWatch, pgClosing, pgRun, snTick, snState, snRun, snBackfill, snView, getSnCfg: () => snCfg, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, buildExportAll, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
+  return { enabled: true, canPersist: true, loadControl, saveControl, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, reentryTry, reentryBrain, reentryCheckPause, pgPlanned, pruneOldRows, pgTune: pgTuneEval, pgAutoTune, pgTick, snRecordClose, botStopSeen, pgState, botReads, masterClosed, closedDbMiss, pgWatch, pgClosing, pgRun, snTick, snState, snRun, snBackfill, snView, getSnCfg: () => snCfg, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, buildExportAll, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
 }
 
 module.exports = { init };

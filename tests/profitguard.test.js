@@ -120,6 +120,64 @@ const ws = { side: 'Sell', exit: 50, peak: 0, risk: 10, extreme: 50, cand: null,
 G.reentryStep(ws, 60, T0, rc); r = G.reentryStep(ws, 30, T0, rc); assert.strictEqual(r.events[0].type, 'would_reenter'); assert.strictEqual(r.events[0].stop, 60);
 ok('re-entry recorder: needs a real pullback, fires on the resume, ends on +target / stop / window, works for shorts');
 
+// ---- LIVE re-entry gate and plan (v2.9.8) ----
+{ const rcL = G.normalize({ reentry: { live: true } }).reentry;
+  const W2 = (o) => ({ side: 'Sell', margin: 100, lev: 10, ...o });
+  const C2 = (o) => ({ price: 0.03697, stop: 0.0372, pullR: 2.2, ...o });          // the CARV short: stop 0.62% above the entry
+  const X2 = (o) => ({ mark: 0.03697, todayCount: 0, openCount: 0, symbolHeld: false, lastLossAgoH: null, liveOk: true, score: 80, turnover: 20e6, ...o });
+  assert.strictEqual(G.defaults().reentry.live, false, 'live re-entry is OFF by default');
+  assert.strictEqual(G.reentryGate(W2(), C2(), X2(), G.defaults().reentry).code, 'OFF');
+  assert.strictEqual(G.reentryGate(W2(), C2(), X2(), rcL).ok, true);
+  const code = (w, c, x) => G.reentryGate(w, c, x, rcL).code;
+  assert.strictEqual(code(W2(), C2(), X2({ liveOk: false })), 'PAUSED');
+  assert.strictEqual(code(W2({ margin: 0 }), C2(), X2()), 'NOSIZE');
+  assert.strictEqual(code(W2({ lev: 0 }), C2(), X2()), 'NOSIZE');
+  assert.strictEqual(code(W2(), C2({ stop: 0.0369 }), X2()), 'BADSTOP', 'a short needs its stop above the entry');
+  assert.strictEqual(code(W2(), C2({ stop: 0.03700 }), X2()), 'TIGHT', 'stop 0.08% away: fees would eat the win');
+  assert.strictEqual(code(W2({ lev: 5 }), C2({ stop: 0.0400 }), X2()), 'WIDE', '8% stop');
+  assert.strictEqual(code(W2({ lev: 20 }), C2({ stop: 0.0385 }), X2()), 'LIQ', '4.1% stop x 20x is past the liquidation limit');
+  assert.strictEqual(code(W2(), C2({ pullR: 3.5 }), X2()), 'DEEP');
+  assert.strictEqual(code(W2(), C2(), X2({ symbolHeld: true })), 'HELD');
+  assert.strictEqual(code(W2(), C2(), X2({ todayCount: 3 })), 'DAYCAP');
+  assert.strictEqual(code(W2(), C2(), X2({ todayCount: 2 })), 'OK');
+  assert.strictEqual(code(W2(), C2(), X2({ openCount: 1 })), 'OPENCAP');
+  assert.strictEqual(code(W2(), C2(), X2({ lastLossAgoH: 2 })), 'COOLDOWN');
+  assert.strictEqual(code(W2(), C2(), X2({ lastLossAgoH: 7 })), 'OK');
+  assert.strictEqual(code(W2(), C2(), X2({ mark: 0 })), 'NOPRICE');
+  assert.strictEqual(code(W2(), C2(), X2({ mark: 0.0372 })), 'STOPPED');
+  assert.strictEqual(code(W2(), C2(), X2({ mark: 0.03715 })), 'MOVED', 'price ran 78% of the stop distance against the entry since the signal');
+  assert.strictEqual(code(W2(), C2(), X2({ mark: 0.03690 })), 'MOVED', 'ran 30%+ in favour: the move is already partly gone');
+  assert.strictEqual(code(W2(), C2(), X2({ mark: 0.03692 })), 'OK', 'a small slip is fine');
+  const wl = { side: 'Buy', margin: 100, lev: 10 }, cl = { price: 0.3632, stop: 0.3590, pullR: 0.9 };
+  assert.strictEqual(G.reentryGate(wl, cl, X2({ mark: 0.3632 }), rcL).ok, true, 'a long works the same way');
+  assert.strictEqual(G.reentryGate(wl, { ...cl, stop: 0.3700 }, X2({ mark: 0.3632 }), rcL).code, 'BADSTOP');
+  assert.strictEqual(G.reentryGate(wl, cl, X2({ mark: 0.3585 }), rcL).code, 'STOPPED');
+  // v2.9.9 the brain and shake-outs
+  assert.strictEqual(code(W2(), C2(), X2({ score: undefined, scoreWhy: 'no candles' })), 'NOREAD', 'no market reading = no order');
+  assert.strictEqual(code(W2(), C2(), X2({ score: 59 })), 'LOWSCORE'); assert.strictEqual(code(W2(), C2(), X2({ score: 60 })), 'OK');
+  assert.strictEqual(G.reentryGate(W2(), C2(), X2({ score: undefined }), { ...rcL, brain: false }).ok, true, 'with the brain switched off the old rules decide alone');
+  assert.strictEqual(code(W2(), C2(), X2({ turnover: 0.4e6 })), 'THIN'); assert.strictEqual(code(W2(), C2(), X2({ turnover: null })), 'OK', 'unknown turnover is left to the score');
+  const shk = { src: 'shake' };
+  assert.strictEqual(code(W2(shk), C2(), X2()), 'SHAKEOFF', 'shake-outs are recorded, not placed, unless liveShake is on');
+  const rcS = { ...rcL, liveShake: true };
+  assert.strictEqual(G.reentryGate(W2(shk), C2(), X2({ score: 65 }), rcS).code, 'LOWSCORE', 'a shake-out needs 10 more points'); assert.strictEqual(G.reentryGate(W2(shk), C2(), X2({ score: 70 }), rcS).ok, true);
+  assert.strictEqual(G.defaults().reentry.brain, true); assert.strictEqual(G.defaults().reentry.shake, true); assert.strictEqual(G.defaults().reentry.liveShake, false); assert.strictEqual(G.normalize({ reentry: { minScore: 500 } }).reentry.minScore, 60);
+  // the plan
+  const pl = G.reentryPlan(W2(), C2(), rcL, '0.00001', 0.03697);
+  assert.deepStrictEqual([pl.side, pl.sl, pl.tp, pl.usdMargin, pl.leverage], ['SELL', 0.0372, 0.03651, 50, 10], JSON.stringify(pl));   // dist 0.00023 x 2 = 0.00046 below 0.03697
+  const pl2 = G.reentryPlan(wl, cl, rcL, '0.0001', 0.3632);
+  assert.deepStrictEqual([pl2.side, pl2.sl, pl2.tp], ['BUY', 0.359, 0.3716], JSON.stringify(pl2));                          // rounded toward the entry
+  assert(G.reentryPlan(W2({ margin: 33.337 }), C2(), rcL, '0.00001', 0.03697).usdMargin === 16.67, 'margin to cents');
+  assert.strictEqual(G.reentryPlan(W2(), C2(), rcL, '0.00001', 0.03697, 60).usdMargin, 30, '60 points = 0.6x of the 50 base'); assert.strictEqual(G.reentryPlan(W2(), C2(), rcL, '0.00001', 0.03697, 100).usdMargin, 55, '100 points = 1.1x'); assert.strictEqual(G.reentryPlan(W2(), C2(), { ...rcL, brain: false }, '0.00001', 0.03697, 100).usdMargin, 50, 'brain off: flat size');
+  assert.strictEqual(G.roundTick(0.036976, '0.00001', 'near'), 0.03698); assert.strictEqual(G.roundTick(1.29651, '0.0001', 'up'), 1.2966); assert.strictEqual(G.roundTick(1.29659, '0.0001', 'down'), 1.2965); assert.strictEqual(G.roundTick(0.5, '1e-5', 'near'), 0.5);
+  // pause rule
+  assert.strictEqual(G.reentryShouldPause([-1, -1], rcL), false, 'needs three results');
+  assert.strictEqual(G.reentryShouldPause([-1, -0.5, 0.2], rcL), false, '-1.3R together is under the 1.5R limit');
+  assert.strictEqual(G.reentryShouldPause([-1, -1, 0.2], rcL), true);
+  assert.strictEqual(G.reentryShouldPause([2, -1, -1, -1], rcL), false, 'only the latest three count');
+  assert.strictEqual(G.normalize({ reentry: { sizeMult: 9, maxPerDay: 0, live: 'yes' } }).reentry.sizeMult, 0.5, 'junk falls back'); assert.strictEqual(G.normalize({ reentry: { live: 'yes' } }).reentry.live, false);
+  ok('live re-entry: off by default; every gate (size, stop distance, fees, liquidation, depth, held, caps, cool-down, price moved) refuses for its own reason; the plan is tick-rounded; three bad results pause it'); }
+
 // ---- smart layer (final-17c) ----
 assert.strictEqual(G.normalize({}).smart.tune.mode, 'suggest'); assert.strictEqual(G.normalize({ smart: { tune: { mode: 'bogus', step: 9 } } }).smart.tune.mode, 'suggest'); assert.strictEqual(G.normalize({ smart: { tune: { step: 9 } } }).smart.tune.step, 0.05);
 assert.strictEqual(G.normalize({ smart: { noise: { on: false } } }).smart.noise.on, false);

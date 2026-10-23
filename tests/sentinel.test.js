@@ -53,14 +53,14 @@ assert.strictEqual(S.step({ state: 'bogus' }, 0, th).state, 'calm');
 ok('a damaged memory restarts at calm');
 
 // ---- decide: tighten only ----
-const D = (o) => S.decide({ side: 'Buy', entry: 100, mark: 100.4, peak: 100.45, curSl: 99, initialSl: 99, tick: 0.01, atr: 0.1, state: 'alert', cfg, ...o });
+const D = (o) => S.decide({ side: 'Buy', entry: 100, mark: 100.7, peak: 100.8, curSl: 99, initialSl: 99, tick: 0.01, atr: 0.1, state: 'alert', cfg, ...o });
 assert.strictEqual(D({ state: 'watch' }).action, 'none'); assert.strictEqual(D({ state: 'calm' }).action, 'none');
 ok('calm and watch never touch a stop');
-let d = D({});                                                  // in profit (peak 0.45R), alert -> breakeven
+let d = D({});                                                  // in profit (peak 0.8R, past the 0.7R start), alert -> breakeven
 assert.strictEqual(d.action, 'raise'); assert.strictEqual(d.newSl, 100.1);
 ok('in profit + alert: stop to breakeven plus fee cushion (' + d.newSl + ')');
-d = D({ state: 'danger', mark: 100.6, peak: 100.65 });          // keep 50% of the 0.65 peak = 100.325; the price gap (0.25%) allows up to ~100.35
-assert.strictEqual(d.action, 'raise'); assert(d.newSl >= 100.3 && d.newSl <= 100.6 - 0.25, 'got ' + d.newSl);
+d = D({ state: 'danger', mark: 100.9, peak: 100.95 });          // keep 50% of the 0.95 peak = 100.475; the price gap (0.25%) allows up to ~100.65
+assert.strictEqual(d.action, 'raise'); assert(d.newSl >= 100.4 && d.newSl <= 100.9 - 0.25, 'got ' + d.newSl);
 ok('in profit + danger: keeps a share of the peak, never closer to the price than the gap (' + d.newSl + ')');
 { // final-20: with the Profit Guard curve's share the actions follow the trade; without it the old fixed behaviour is unchanged
   const base = { side: 'Buy', entry: 100, mark: 112, peak: 112.9, curSl: 90, initialSl: 90, tick: 0.01, atr: 0.1, cfg };
@@ -71,6 +71,18 @@ ok('in profit + danger: keeps a share of the peak, never closer to the price tha
   const sh = S.decide({ ...base, side: 'Sell', entry: 100, mark: 88, peak: 87.1, curSl: 110, initialSl: 110, state: 'danger', keepFrac: 0.6 }); assert(sh.newSl < 100 - 0.7 * 12.9 + 0.02 && sh.newSl > 85);
   ok('sentinel: in profit, alert keeps the curve share and danger 15 points more (never below its own fixed share); without a curve share nothing changes; shorts too');
 }
+// v2.9.10: the profit start is 0.7R. The SOON trade (peak about +0.3R, then an alert) used to jump to breakeven; now it keeps the loss-side stop and gets room.
+assert.strictEqual(S.defaults().profit.startR, 0.7); assert.strictEqual(S.normalize({}).profit.startR, 0.7);
+d = D({ peak: 100.45, mark: 100.3, state: 'alert' }); assert.strictEqual(d.action, 'raise'); assert.strictEqual(d.newSl, 99.4); assert(/-0\.6R/.test(d.label), d.label);
+d = D({ peak: 100.69, mark: 100.3, state: 'alert' }); assert.strictEqual(d.newSl, 99.4, 'just under 0.7R is still the loss side');
+d = D({ peak: 100.7, mark: 100.5, state: 'alert' }); assert.strictEqual(d.newSl, 100.1, 'at 0.7R it counts as in profit: breakeven');
+assert.strictEqual(S.normalize({ profit: { startR: 0.3 } }).profit.startR, 0.3, 'a chosen 0.3 is still allowed');
+{ const old = S.normalize({ profit: { startR: 0.3, dangerKeep: 0.4 }, th: { alert: 55 } });
+  let m = S.migrateStart(old, true); assert(m.changed && m.cfg.profit.startR === 0.7 && m.cfg.profit.dangerKeep === 0.4 && m.cfg.th.alert === 55, 'only the start moves; everything else is kept');
+  m = S.migrateStart(S.normalize({ profit: { startR: 0.5 } }), true); assert(!m.changed && m.cfg.profit.startR === 0.5, 'a value somebody chose is never touched');
+  m = S.migrateStart(old, false); assert(!m.changed, 'nothing saved: the new default already applies');
+  assert(!S.migrateStart(null, true).changed); }
+ok('v2.9.10: profit start is 0.7R (an alert at +0.3-0.7R keeps the loss-side stop, from 0.7R it is breakeven); a saved 0.3R moves once, a chosen value never');
 d = D({ peak: 100, mark: 99.7, curSl: 99, state: 'alert' });    // loss side: -0.6R = 99.4
 assert.strictEqual(d.newSl, 99.4);
 ok('loss side + alert: stop moves from -1R to -0.6R');
@@ -82,7 +94,7 @@ d = D({ mark: 100.2 });                                         // breakeven wou
 assert(d.action === 'none' || d.newSl <= 100.2 - 0.25 + 0.011, 'gap rule');
 assert.strictEqual(D({ peak: 100, mark: 99.7, curSl: 99.5, state: 'alert' }).action, 'none');
 ok('never loosens and never repeats a move that is already tighter');
-d = S.decide({ side: 'Sell', entry: 100, mark: 99.5, peak: 99.4, curSl: 101, initialSl: 101, tick: 0.01, atr: 0.1, state: 'alert', cfg });
+d = S.decide({ side: 'Sell', entry: 100, mark: 99.3, peak: 99.2, curSl: 101, initialSl: 101, tick: 0.01, atr: 0.1, state: 'alert', cfg });
 assert.strictEqual(d.action, 'raise'); assert.strictEqual(d.newSl, 99.9);
 ok('short side mirrors the long side');
 assert.strictEqual(D({ initialSl: 0 }).action, 'none');

@@ -32,8 +32,8 @@ class Stub {
     return { retCode: 0, result: { list, nextPageCursor: '' } };
   }
   async cancelAllOrders() { state.cancels = (state.cancels || 0) + 1; return { retCode: 0 }; }
-  async getInstrumentsInfo() { return { retCode: 0, result: { list: [{ status: 'Trading', lotSizeFilter: { qtyStep: '0.01', minOrderQty: '0.01' } }] } }; }
-  async getTickers({ symbol } = {}) { return { retCode: 0, result: { list: [{ lastPrice: String((state.tickers || {})[symbol] || 65000) }] } }; }
+  async getInstrumentsInfo() { return { retCode: 0, result: { list: [{ status: 'Trading', lotSizeFilter: { qtyStep: '0.01', minOrderQty: '0.01' }, priceFilter: { tickSize: '0.01' } }] } }; }
+  async getTickers({ symbol } = {}) { return { retCode: 0, result: { list: [{ lastPrice: String((state.tickers || {})[symbol] || 65000), turnover24h: String(((state.turnover || {})[symbol]) ?? 50e6) }] } }; }
   async getHistoricOrders({ orderLinkId }) { if (state.orderReadFails) throw new Error('timeout'); const o = (state.orders || {})[orderLinkId]; if (o) return { retCode: 0, result: { list: o.active ? [] : [o] } }; if (orderLinkId && /^u\d+-pend/.test(orderLinkId)) return { retCode: 0, result: { list: [] } }; return { retCode: 0, result: { list: [{ avgPrice: state.fillPrice }] } }; }
   async getActiveOrders({ orderLinkId }) { if (state.orderReadFails) throw new Error('timeout'); const o = (state.orders || {})[orderLinkId]; return { retCode: 0, result: { list: o && o.active ? [o] : [] } }; }
   async submitOrder(b) {
@@ -73,6 +73,7 @@ const express = require(R + '/node_modules/express');
 const app = express(); app.use(express.json());
 let mode = 'live', halted = false; const alerts = [], tradeAlerts = [], tradeOpts = []; let deliverResult = { ok: true, configured: true, telegram: 'sent', email: 'off' };
 const arMod = require(R + '/alertroute.js'); const arState = { cfg: arMod.defaults() }; const alertRouterState = () => arState;
+const execCalls = []; let execImpl = async () => ({ http: 200, body: { ok: true, code: 'OK', detail: '' } });
 const mu = require(R + '/multiuser.js').init({
   app, restClient: new Stub({ key: 'ADMINK' }), getMode: () => mode, breakerIsTripped: () => halted,
   getSecurityInfo: () => ({ deviceKeySet: false, deviceKeyMode: 'warn', deviceKeyMisses: 0 }),
@@ -81,6 +82,7 @@ const mu = require(R + '/multiuser.js').init({
   getFleet: () => FLEET,
   getMasterSync: () => SYNC,
   getExecReports: () => [],
+  execTrade: async b => { execCalls.push(b); return execImpl(b); },
 });
 assert(mu.enabled, 'multiuser should be enabled');
 
@@ -1408,9 +1410,122 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
       state.tickers.BTCUSDT = 170; await mu._test.pgTick();
       const rr = await logs('reentry_result'); assert(rr.length === 1 && Number(rr[0].result_r) === 2, JSON.stringify(rr));
       assert(!mu._test.pgWatch.has('BTCUSDT|Buy'), 'finished watches are removed');
-      assert.strictEqual(state.submits.length, sub0, 'the recorder never places an order');
+      assert.strictEqual(state.submits.length, sub0, 'the recorder never places an order'); assert.strictEqual(execCalls.length, 0, 'live re-entry is off by default: nothing is placed');
       const rsum = (await call('/api/admin/profit-guard', 'GET', null, admin)).j.scorecard.reentry; assert(rsum.spotted === 1 && rsum.done === 1 && rsum.wins === 1);
       ok('profit guard re-entry recorder: notes a pullback-and-resume entry and its outcome, shows it in the summary, and never trades');
+
+      // ---- v2.9.8 LIVE re-entry: a real order on the master account, behind the confirm, with caps, no chains and an automatic pause
+      { const lg = async ev => (await db.query(`SELECT * FROM profit_guard_log WHERE event=$1 ORDER BY id`, [ev])).rows;
+        const noConf = await call('/api/admin/profit-guard', 'POST', { reentry: { live: true } }, admin); assert.strictEqual(noConf.s, 400, 'going live needs the confirm: ' + JSON.stringify(noConf.j));
+        assert.strictEqual((await call('/api/admin/profit-guard', 'GET', null, admin)).j.cfg.reentry.live, false);
+        const on = await call('/api/admin/profit-guard', 'POST', { mode: 'live', swing: { mode: 'live' }, fast: { mode: 'live' }, reentry: { live: true, maxStopPct: 15, brain: false }, confirm: 'LIVE' }, admin);
+        assert(on.j.success && on.j.cfg.reentry.live === true, JSON.stringify(on.j).slice(0, 300));
+        mu._test.pgState.clear(); mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 125, ETHUSDT: 2000 };
+        await db.query('TRUNCATE pg_trades'); await db.query('TRUNCATE profit_guard_log'); execCalls.length = 0; alerts.length = 0;
+        const PL = (mark, sl) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '5', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl), leverage: '5', positionValue: '500' }; };
+        PL(150, 90); await mu._test.pgTick();
+        assert(mu._test.pgState.get('BTCUSDT|Buy').lev === 5 && mu._test.pgState.get('BTCUSDT|Buy').margin === 100, 'the original trade\'s size is remembered');
+        state.closedPnl.ADMINK = [{ symbol: 'BTCUSDT', avgExitPrice: '127.6', closedPnl: '2.7', updatedTime: String(Date.now()) }];
+        delete state.positions['ADMINK:BTCUSDT']; await mu._test.pgTick();
+        const wv = mu._test.pgWatch.get('BTCUSDT|Buy'); assert(wv && wv.lev === 5 && wv.margin === 100, 'the watch carries the size');
+        execImpl = async b => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.37', avgPrice: '135', markPrice: '135', stopLoss: b.sl, leverage: String(b.leverage), positionValue: String(b.usdMargin * b.leverage) }; return { http: 200, body: { ok: true, code: 'OK', detail: '' } }; };
+        state.tickers.BTCUSDT = 120; await mu._test.pgTick(); assert.strictEqual(execCalls.length, 0, 'no order on the pullback itself');
+        state.tickers.BTCUSDT = 135; await mu._test.pgTick();
+        assert.strictEqual(execCalls.length, 1, 'one order at the resume'); const eb = execCalls[0];
+        assert.deepStrictEqual([eb.kind, eb.side, eb.symbol, eb.usdMargin, eb.leverage, eb.sl, eb.tp, eb.trailPct], ['open', 'BUY', 'BTCUSDT', 50, 5, '120', '165', 0], JSON.stringify(eb));
+        assert(/^RE[0-9a-f]{12}$/.test(eb.id), 'a valid id: ' + eb.id);
+        const pl = await lg('reentry_placed'); assert.strictEqual(pl.length, 1); assert(/RE-ENTRY PLACED on the master account/.test(pl[0].detail));
+        assert(alerts.some(a => /Re-entry placed \(master only\)/.test(a)), 'the admin is told');
+        await mu._test.pgTick(); assert.strictEqual(execCalls.length, 1, 'never a second order for the same chance');
+        const sr = mu._test.pgState.get('BTCUSDT|Buy'); assert(sr && sr.reentry === true && sr.initialSl === 120, 'managed against ITS stop, not the old trade\'s: ' + JSON.stringify(sr && { r: sr.reentry, sl: sr.initialSl }));
+        assert(!mu._test.pgWatch.has('BTCUSDT|Buy'), 'the watch ends when the re-entry opens');
+        // it loses; two earlier live re-entries also lost, so live re-entry pauses itself; and no chain starts
+        await db.query(`INSERT INTO pg_trades(symbol,side,profile,mode,entry,initial_sl,exit_price,exit_r,reentry) VALUES('XRPUSDT','Sell','fast','live',1,1.1,1.06,-0.6,true),('CRVUSDT','Buy','fast','live',1,0.9,0.94,-0.6,true)`);
+        state.closedPnl.ADMINK = [{ symbol: 'BTCUSDT', avgExitPrice: '120', closedPnl: '-5', updatedTime: String(Date.now()) }];
+        delete state.positions['ADMINK:BTCUSDT']; await mu._test.pgTick();
+        const rrow = (await db.query(`SELECT reentry, exit_r FROM pg_trades WHERE symbol='BTCUSDT' AND reentry`)).rows; assert(rrow.length === 1 && rrow[0].reentry === true && Math.abs(Number(rrow[0].exit_r) + 1) < 1e-9, JSON.stringify(rrow));
+        assert(!mu._test.pgWatch.has('BTCUSDT|Buy'), 'a re-entry never starts another watch (no chains)');
+        assert.strictEqual((await lg('reentry_closed')).length, 1);
+        assert.strictEqual((await call('/api/admin/profit-guard', 'GET', null, admin)).j.cfg.reentry.live, false, 'three losing re-entries in a row switch live re-entry off');
+        assert.strictEqual((await lg('reentry_paused')).length, 1); assert(alerts.some(a => /paused itself/.test(a)));
+        const sc = (await call('/api/admin/profit-guard', 'GET', null, admin)).j.scorecard.reentry.live; assert(sc.n === 3 && sc.wins === 0, JSON.stringify(sc));
+        // a refused chance is logged with its reason and places nothing
+        await call('/api/admin/profit-guard', 'POST', { reentry: { live: true }, confirm: 'LIVE' }, admin); execCalls.length = 0;
+        mu._test.pgWatch.set('SOLUSDT|Buy', { symbol: 'SOLUSDT', side: 'Buy', profile: 'fast', bot: 'X', lev: 5, margin: 100, entry: 100, exit: 120, peak: 130, risk: 5, extreme: 100, cand: { price: 110, stop: 109.9, at: 1 }, expiresAt: Date.now() + 3600000 });
+        await mu._test.reentryTry(mu._test.pgWatch.get('SOLUSDT|Buy'), { type: 'would_reenter', price: 110, stop: 109.9, pullR: 2 }, 110, []);
+        const sk = await lg('reentry_skipped'); assert(sk.length === 1 && /^TIGHT/.test(sk[0].detail) && execCalls.length === 0, JSON.stringify(sk.map(x => x.detail)));
+        // a failed order is logged and leaves nothing planned
+        execImpl = async () => ({ http: 200, body: { ok: false, code: 'BAL', detail: 'wanted $50 margin, only $3 free' } });
+        await mu._test.reentryTry({ symbol: 'ADAUSDT', side: 'Buy', profile: 'fast', bot: 'X', lev: 5, margin: 100, entry: 100, exit: 120, peak: 130, risk: 5, extreme: 100, cand: { price: 110, stop: 104, at: 2 }, expiresAt: Date.now() + 3600000 }, { type: 'would_reenter', price: 110, stop: 104, pullR: 2 }, 110, []);
+        const fl = await lg('reentry_failed'); assert(fl.length === 1 && /^BAL/.test(fl[0].detail) && !mu._test.pgPlanned.has('ADAUSDT|Buy'), JSON.stringify(fl.map(x => x.detail)));
+        await call('/api/admin/profit-guard', 'POST', { reentry: { live: false } }, admin);
+        mu._test.pgWatch.clear(); mu._test.pgState.clear(); state.closedPnl.ADMINK = []; delete state.positions['ADMINK:BTCUSDT'];
+        ok('v2.9.8 live re-entry: needs the LIVE confirm; one master-only order at the resume with the right size, stop and target; managed against its own stop; no second order, no chain; three losses in a row pause it; refusals and failures are logged'); }
+
+      // ---- v2.9.9 the brain: every chance is scored with the pair's own candles; live needs the score; size follows it; shake-outs are recorded and (opt-in) placed
+      { const RB = require(R + '/reentrybrain.js');
+        const lg = async ev => (await db.query(`SELECT * FROM profit_guard_log WHERE event=$1 ORDER BY id`, [ev])).rows;
+        const mkBars = (start, step, half, n, vol) => { const out = []; let prev = start; for (let i = 0; i < n; i++) { const c = start + i * step, o = prev; prev = c; out.push([String(1_700_000_000_000 + i * 900000), String(o), String(Math.max(o, c) + half), String(Math.min(o, c) - half), String(c), String(vol || 100), '0']); } return out; };
+        state.kl = {};
+        Stub.prototype.getKline = async ({ symbol, interval }) => { const k = (state.kl[symbol] || {})[interval]; if (!k) return { retCode: 10001, retMsg: 'no candles in this test' }; return { retCode: 0, result: { list: k.slice().reverse() } }; };
+        const upKl = (sym, base, step) => { state.kl[sym] = { '15': mkBars(base * 0.6, step, 5, 60), '60': mkBars(base * 0.3, step * 3.3, 6, 60) }; };
+        upKl('BTCUSDT', 100, 0.9); state.kl.BTCUSDT['60'] = mkBars(60000, 240, 100, 30);
+        const set = async cfg => assert((await call('/api/admin/profit-guard', 'POST', { reentry: cfg, confirm: 'LIVE' }, admin)).j.success);
+        await set({ live: true, brain: true, minScore: 60, maxStopPct: 15, shake: true, liveShake: false });
+        mu._test.pgState.clear(); mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 125, ETHUSDT: 2000 };
+        await db.query('TRUNCATE pg_trades'); await db.query('TRUNCATE profit_guard_log'); execCalls.length = 0; alerts.length = 0; for (const k of Object.keys(state.positions)) delete state.positions[k];
+        // 1. a healthy chance in an up-trend: scored, placed, sized by the score
+        const PL = (mark, sl) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '5', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl), leverage: '5', positionValue: '500' }; };
+        PL(150, 90); await mu._test.pgTick();
+        state.closedPnl.ADMINK = [{ symbol: 'BTCUSDT', avgExitPrice: '127.6', closedPnl: '2.7', updatedTime: String(Date.now()) }]; delete state.positions['ADMINK:BTCUSDT']; await mu._test.pgTick();
+        assert.strictEqual(mu._test.pgWatch.get('BTCUSDT|Buy').src, 'winner');
+        execImpl = async b => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.4', avgPrice: '135', markPrice: '135', stopLoss: b.sl, leverage: String(b.leverage), positionValue: String(b.usdMargin * b.leverage) }; return { http: 200, body: { ok: true, code: 'OK', detail: '' } }; };
+        state.tickers.BTCUSDT = 120; await mu._test.pgTick(); state.tickers.BTCUSDT = 135; await mu._test.pgTick();
+        const wr1 = await lg('would_reenter'); assert.strictEqual(wr1.length, 1); const sc1 = Number(wr1[0].score); assert(sc1 >= 75, 'a healthy chance scores well: ' + wr1[0].detail);
+        const ft = JSON.parse(wr1[0].feat); assert(ft.src === 'winner' && ft.t15 > 0.9 && ft.dA > 2 && ft.dA < 4, wr1[0].feat);
+        assert(/\[trend .*pullback .*resume .*btc .*stop .*liquidity .*pair /.test(wr1[0].detail), 'the log shows every part: ' + wr1[0].detail);
+        assert.strictEqual(execCalls.length, 1); assert.strictEqual(execCalls[0].usdMargin, Math.round(50 * RB.sizeFactor(sc1, 60) * 100) / 100, 'size follows the score: ' + execCalls[0].usdMargin);
+        const pl1 = (await lg('reentry_placed'))[0]; assert(Number(pl1.score) === sc1 && /score/.test(pl1.detail));
+        await mu._test.pgTick(); state.closedPnl.ADMINK = [{ symbol: 'BTCUSDT', avgExitPrice: '165', closedPnl: '9', updatedTime: String(Date.now()) }]; delete state.positions['ADMINK:BTCUSDT']; await mu._test.pgTick();
+        const lt = (await db.query(`SELECT reentry_score, reentry_src, exit_r FROM pg_trades WHERE reentry`)).rows[0]; assert(Number(lt.reentry_score) === sc1 && lt.reentry_src === 'winner' && Number(lt.exit_r) === 2, JSON.stringify(lt));
+        // 2. the same setup in a falling market is refused for its score, 3. no market data is refused for that, 4. a thin pair is refused
+        execCalls.length = 0; const W0 = sym => ({ symbol: sym || 'ETHUSDT', side: 'Buy', profile: 'fast', bot: 'X', lev: 5, margin: 100, entry: 100, exit: 120, peak: 150, risk: 10, extreme: 120, cand: { price: 135, stop: 120, at: 7 }, src: 'winner', expiresAt: Date.now() + 3600000 });
+        const E0 = { type: 'would_reenter', price: 135, stop: 120, pullR: 3 };
+        state.kl.ETHUSDT = { '15': mkBars(130, -0.9, 5, 60), '60': mkBars(190, -3, 6, 60) }; state.kl.BTCUSDT['60'] = mkBars(60000, -240, 100, 30);
+        let w2 = W0(); const b2 = await mu._test.reentryBrain(w2, { price: 135, stop: 120 }, 135); assert(b2.ok && b2.score < 60, 'falling pair + falling BTC: ' + b2.score);
+        await mu._test.reentryTry(w2, E0, 135, [], b2); let sk = await lg('reentry_skipped'); assert(sk.length === 1 && /^LOWSCORE/.test(sk[0].detail) && execCalls.length === 0, JSON.stringify(sk.map(x => x.detail)));
+        const w3 = W0('ADAUSDT'); const b3 = await mu._test.reentryBrain(w3, { price: 135, stop: 120 }, 135); assert.strictEqual(b3.ok, false);
+        await mu._test.reentryTry(w3, E0, 135, [], b3); sk = await lg('reentry_skipped'); assert(sk.length === 2 && /^NOREAD/.test(sk[1].detail) && execCalls.length === 0, JSON.stringify(sk.map(x => x.detail)));
+        upKl('SOLUSDT', 100, 0.9); state.turnover = { SOLUSDT: 400000 }; const w4 = W0('SOLUSDT'); const b4 = await mu._test.reentryBrain(w4, { price: 135, stop: 120 }, 135); assert(b4.ok && b4.parts.liquidity.pts === 0);
+        await mu._test.reentryTry(w4, E0, 135, [], b4); sk = await lg('reentry_skipped'); assert(sk.length === 3 && /^THIN/.test(sk[2].detail) && execCalls.length === 0, JSON.stringify(sk.map(x => x.detail))); state.turnover = {};
+        // 5. a SHAKE-OUT (a guard stop closed it near breakeven after +0.31R; the original stop never hit): recorded by default, placed only with liveShake
+        mu._test.pgWatch.clear(); mu._test.pgState.clear(); state.kl.BTCUSDT['60'] = mkBars(60000, 240, 100, 30); state.kl.BTCUSDT['15'] = state.kl.BTCUSDT['60'];
+        state.kl.BTCUSDT['15'] = mkBars(60, 0.15, 2, 60); state.kl.BTCUSDT['60'] = mkBars(48, 0.5, 2.5, 60); state.kl.BTCUSDT.btc = true;
+        const keepBtc = state.kl.BTCUSDT; state.kl.BTCUSDT = { '15': mkBars(60, 0.15, 2, 60), '60': mkBars(60000, 240, 100, 30) };
+        const stShake = { entry: 100, initialSl: 90, peak: 103.1, peakAt: Date.now(), maxPull: 0, floor: 100.1, scaled: [], profile: 'fast', bot: 'X', since: Date.now() - 3600000, em: 'live', lev: 5, margin: 100, size: 5, mark: 99.9 };
+        state.closedPnl.ADMINK = [{ symbol: 'BTCUSDT', avgExitPrice: '99.9', closedPnl: '-0.2', updatedTime: String(Date.now()) }];
+        mu._test.pgClosing.push({ key: 'BTCUSDT|Buy', st: stShake, em: 'live', at: Date.now(), tries: 0, mark: 99.9 }); await mu._test.pgTick();
+        assert.strictEqual((await db.query(`SELECT closed_by FROM pg_trades WHERE NOT reentry ORDER BY id DESC LIMIT 1`)).rows[0].closed_by, 'GUARD_STOP', 'a stop that slipped 0.2R is still attributed to the guard');
+        const sw = mu._test.pgWatch.get('BTCUSDT|Buy'); assert(sw && sw.src === 'shake', 'a shake-out starts a watch: ' + JSON.stringify(sw && sw.src));
+        mu._test.pgWatch.get('BTCUSDT|Buy').lev = 5; mu._test.pgWatch.get('BTCUSDT|Buy').margin = 100; state.kl.BTCUSDT['60'] = mkBars(60000, 240, 100, 30); state.kl.BTCUSDT['15'] = mkBars(80, 0.3, 2, 60);
+        execCalls.length = 0; const nW = (await lg('would_reenter')).length;
+        state.tickers.BTCUSDT = 95; await mu._test.pgTick(); state.tickers.BTCUSDT = 99; await mu._test.pgTick();
+        const wrs = (await lg('would_reenter')); assert.strictEqual(wrs.length, nW + 1); assert(/SHAKE-OUT chance/.test(wrs[wrs.length - 1].detail) && JSON.parse(wrs[wrs.length - 1].feat).src === 'shake', wrs[wrs.length - 1].detail);
+        assert.strictEqual(execCalls.length, 0, 'shake-outs are recording only until liveShake is on');
+        state.kl.BTCUSDT = keepBtc;
+        // 6. liveShake is its own opt-in (confirm needed); with it on, a shake-out that scores well (and needs 10 more points than a winner) is placed, tagged shake
+        assert.strictEqual((await call('/api/admin/profit-guard', 'POST', { reentry: { liveShake: true } }, admin)).s, 400, 'live shake-outs need the confirm');
+        await set({ liveShake: true }); state.kl.BTCUSDT = { '60': mkBars(60000, 240, 100, 30) }; upKl('XRPUSDT', 100, 0.9); state.kl.BTCUSDT = { '60': mkBars(60000, 240, 100, 30) };
+        execImpl = async () => ({ http: 200, body: { ok: true, code: 'OK', detail: '' } }); execCalls.length = 0;
+        const wsh = { symbol: 'XRPUSDT', side: 'Buy', profile: 'fast', bot: 'X', lev: 5, margin: 100, entry: 107, exit: 107.2, peak: 112, risk: 4, extreme: 100, src: 'shake', cand: { price: 109, stop: 100, at: 9 }, expiresAt: Date.now() + 3600000 };
+        const bsh = await mu._test.reentryBrain(wsh, { price: 109, stop: 100 }, 109); assert(bsh.ok && bsh.score >= 70, 'the shake-out scores: ' + bsh.score + ' ' + JSON.stringify(bsh.flags));
+        await mu._test.reentryTry(wsh, { type: 'would_reenter', price: 109, stop: 100, pullR: 1 }, 109, [], bsh);
+        assert.strictEqual(execCalls.length, 1, 'a well-scored shake-out is placed once liveShake is on'); assert.strictEqual(execCalls[0].symbol, 'XRPUSDT');
+        const psh = (await lg('reentry_placed')).pop(); assert(/SHAKE-OUT RE-ENTRY PLACED/.test(psh.detail) && JSON.parse(psh.feat).src === 'shake', psh.detail);
+        assert(mu._test.pgPlanned.get('XRPUSDT|Buy').src === 'shake'); mu._test.pgPlanned.clear();
+        ok('v2.9.9 the brain: every chance is scored with the parts logged; a healthy chance is placed and sized by its score and the score is kept with the trade; a falling market, missing data and a thin pair are each refused for their own reason; a shake-out (stop slipped 0.2R) starts a watch tagged shake, recorded but not placed by default');
+        delete Stub.prototype.getKline; state.kl = {}; state.turnover = {};
+        await set({ live: false, brain: false, liveShake: false }); mu._test.pgWatch.clear(); mu._test.pgState.clear(); state.closedPnl.ADMINK = []; for (const k of Object.keys(state.positions)) delete state.positions[k]; }
 
       // scale-out
       await call('/api/admin/profit-guard', 'POST', { mode: 'shadow', swing: { mode: 'shadow', scale: { on: true, steps: [[3, 0.25]] } } }, admin);
@@ -1748,10 +1863,25 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     assert.strictEqual((await rd({ ot: ot - 7200 })).closed, undefined, 'a trade opened hours EARLIER than the one that closed is not the same trade');
     assert.strictEqual((await rd({ ot: ot + 7200 })).closed, undefined, 'a trade opened AFTER the close is not the same trade');
     assert.strictEqual((await rd({ ot, side: 'BUY' })).closed, undefined, 'the other direction is a different trade');
-    mu._test.masterClosed.get('DOTUSDT|Sell').at = Date.now() - 7 * 3600000; assert.strictEqual((await rd({ ot })).closed, undefined, 'stale records are ignored');
+    mu._test.masterClosed.get('DOTUSDT|Sell').at = Date.now() - 49 * 3600000; assert.strictEqual((await rd({ ot })).closed, undefined, 'stale records are ignored');
     mu._test.masterClosed.set('DOTUSDT|Sell', { since: ot * 1000 + 6000, entry: 1.1532, exit: 1.1739689, exitR: -1, at: Date.now() - 60000 });
     mu._test.masterClosed.clear();
     ok('close feedback: the relay returns the real exit only for the SAME trade (open time, direction, freshness all checked); older firmware gets nothing');
+    // v2.9.11: after a restart the memory is empty; the saved scorecard answers instead
+    {
+      await db.query(`DELETE FROM pg_trades WHERE symbol='ZZTESTUSDT'`);
+      const rz = (o) => mu.recordBotEvent({ v: 1, bot: 'YM ORACLE II', ev: 'read', sym: 'ZZTESTUSDT', side: 'SELL', urg: 0.1, rp: 50, st: 0, tr: 0, pf: 0, rm: -0.2, ...o });
+      const otz = Math.floor(Date.now() / 1000) - 5 * 3600;
+      mu._test.masterClosed.clear();
+      assert.strictEqual((await rz({ ot: otz })).closed, undefined, 'no saved trade: nothing');
+      await db.query(`INSERT INTO pg_trades(symbol,side,profile,mode,entry,exit_price,exit_r,at) VALUES ('ZZTESTUSDT','Sell','fast','live',1,1.05,-0.5,now() - interval '3 hours'), ('ZZTESTUSDT','Sell','fast','live',1,NULL,NULL,now() - interval '2 hours')`);
+      mu._test.closedDbMiss && mu._test.closedDbMiss.clear();
+      const z1 = await rz({ ot: otz }); assert.deepStrictEqual(z1.closed, { x: 1.05, r: -0.5 });
+      assert.strictEqual((await rz({ ot: otz + 4 * 3600 })).closed, undefined, 'a trade the bot opened AFTER that close is not the same trade');
+      assert.strictEqual((await rz({ ot: otz, side: 'BUY' })).closed, undefined, 'other direction');
+      await db.query(`DELETE FROM pg_trades WHERE symbol='ZZTESTUSDT'`);
+    }
+    ok('close feedback after a restart: with the memory empty the relay answers from the saved scorecard (first close after the bot opened its trade, real exit only)');
 
     const T = mu._test, now = Date.now();
     const rec = (sym, side, ago) => ({ symbol: sym, side, at: now - ago * 60000 });

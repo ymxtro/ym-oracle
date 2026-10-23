@@ -19,8 +19,8 @@ function world(o) {
   let t = 1_000_000;
   const ex = T.create({
     rest: () => rest, mode: () => o.mode, halted: () => o.halted, now: () => (t += 1), sleep: () => Promise.resolve(),
-    placeOrder: async b => {
-      w.calls.push('order'); await lat(); w.orders.push(b);
+    placeOrder: async (b, opts) => {
+      w.calls.push('order'); w.optsSeen = (w.optsSeen || []).concat([opts]); await lat(); w.orders.push(b);
       if (o.orderThrows) { if (o.orderStillLands) w.positions[b.symbol] = { side: b.side, size: b.qty }; throw new Error('socket hang up'); }
       if (o.orderReply) return o.orderReply;
       if (o.mode === 'paper') return { paper: true, retCode: 0 };
@@ -161,6 +161,14 @@ const open = (x) => Object.assign({ kind: 'open', id: 'T0001', bot: 'YM ORACLE I
   assert.strictEqual(T.decimalsOf(0.1), 1); assert.strictEqual(T.decimalsOf(1), 0); assert.strictEqual(T.decimalsOf('0.001'), 3); assert.strictEqual(T.decimalsOf(1e-7), 7); assert.strictEqual(T.decimalsOf(10), 0);
   assert.strictEqual(T.classify({ retCode: 10001, retMsg: 'Invalid symbol' }).code, 'PAIR'); assert.strictEqual(T.classify({ retCode: 10001, retMsg: 'order value below min' }).code, 'MINQ'); assert.strictEqual(T.classify({ retCode: 34040 }).ok, true);
   ok('step-precision and Bybit-reply classification helpers');
+
+  // ---- v2.9.8: a master-only trade (the relay's own re-entry) never touches users
+  w = world(); r = await w.run(open({ id: 'MO0001', masterOnly: true, trailPct: 1.5 }));
+  assert.strictEqual(r.body.ok, true); assert.strictEqual(w.fan.lev, 0, 'no leverage change on users\' accounts'); assert.strictEqual(w.fan.stop, 0, 'no stop copied to users');
+  assert.deepStrictEqual(w.optsSeen, [{ masterOnly: true }], 'the order pipeline is told to skip copies and plan sizing');
+  w = world(); await w.run(open({ id: 'MO0002' }));
+  assert.strictEqual(w.fan.lev, 1); assert.strictEqual(w.fan.stop, 1); assert.deepStrictEqual(w.optsSeen, [{ masterOnly: false }], 'a normal bot trade still fans out');
+  ok('masterOnly: leverage, stops and the order skip every user account; a normal trade is unchanged');
 
   console.log('\nALL ' + n + ' TRADE EXECUTION CHECKS PASSED');
 })().catch(e => { console.error('FAILED:', e); process.exit(1); });

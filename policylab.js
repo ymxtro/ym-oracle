@@ -102,10 +102,11 @@ function attributeExit(i, tolR) {
   const entry = Number(i.entry), init = Number(i.initialSl), x = Number(i.exit);
   const risk = Math.abs(entry - init);
   if (!(entry > 0) || !(x > 0) || !(risk > 0)) return 'UNKNOWN';
-  const tol = (tolR > 0 ? tolR : 0.12) * risk;
+  // A stop fills at or WORSE than its level (slippage on a thin pair can be 0.2-0.3R), almost never better: allow up to 0.30R adverse and only 0.05R in the trade's favour (v2.9.9; before it was 0.12R either way)
+  const long = String(i.side) === 'Buy', adv = (tolR > 0 ? tolR : 0.30) * risk, fav = 0.05 * risk;
   const c = [['ORIGINAL_SL', init], ['GUARD_STOP', Number(i.guardFloor)], ['SENTINEL_STOP', Number(i.sentinelFloor)], ['BOT_STOP', Number(i.botStop)]].filter(a => a[1] > 0);
   let best = null;
-  for (const a of c) { const d = Math.abs(x - a[1]); if (d <= tol && (!best || d < best.d)) best = { name: a[0], d }; }
+  for (const a of c) { const g = long ? a[1] - x : x - a[1]; /* + = filled worse than the stop */ if (g <= adv && g >= -fav) { const d = Math.abs(g); if (!best || d < best.d) best = { name: a[0], d }; } }
   return best ? best.name : 'OTHER';
 }
 

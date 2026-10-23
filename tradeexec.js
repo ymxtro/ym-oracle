@@ -51,7 +51,7 @@ function parse(b) {
   if (!/^[A-Z0-9]{3,20}$/.test(symbol)) return { error: 'symbol is required' };
   const tp = numStr(b.tp), sl = numStr(b.sl), activePrice = numStr(b.trailActivePrice);
   if (tp === null || sl === null || activePrice === null) return { error: 'tp, sl and trailActivePrice must be positive numbers when given' };
-  const cmd = { kind, id, side, symbol, bot: clip(b.bot || '?', 30), bybitSide: side === 'BUY' ? 'Buy' : side === 'SELL' ? 'Sell' : 'ANY', tp, sl, activePrice, usdMargin: 0, leverage: 0, trailPct: 0 };
+  const cmd = { kind, id, side, symbol, masterOnly: b.masterOnly === true, bot: clip(b.bot || '?', 30), bybitSide: side === 'BUY' ? 'Buy' : side === 'SELL' ? 'Sell' : 'ANY', tp, sl, activePrice, usdMargin: 0, leverage: 0, trailPct: 0 };
   if (kind === 'open') {
     cmd.usdMargin = Number(b.usdMargin);
     cmd.leverage = Math.floor(Number(b.leverage));
@@ -159,9 +159,9 @@ function create(deps) {
     return rounded.toFixed(decimalsOf(inst.qtyStep));
   }
 
-  async function setLeverage(symbol, lev) {
+  async function setLeverage(symbol, lev, masterOnly) {
     const body = { category: 'linear', symbol, buyLeverage: String(lev), sellLeverage: String(lev) };
-    Promise.resolve().then(() => d.fanOutLeverage(body)).catch(() => {});   // users' accounts: never waited on
+    if (!masterOnly) Promise.resolve().then(() => d.fanOutLeverage(body)).catch(() => {});   // users' accounts: never waited on (a master-only trade, like a re-entry, never touches them)
     if (d.mode() === 'paper') return;
     let r;
     try { r = await retry(() => d.rest().setLeverage(body)); } catch (e) { fail('NET', 'could not reach Bybit to set the leverage'); }
@@ -171,9 +171,9 @@ function create(deps) {
   }
 
   // setTradingStop with the manager's "try three times on a non-answer" rule. Returns { ok, code, detail }.
-  async function tradingStop(body) {
+  async function tradingStop(body, masterOnly) {
     try { body = d.guardClamp(body) || body; } catch (e) { /* the guard must never block a stop update */ }
-    Promise.resolve().then(() => d.fanOutTradingStop(body)).catch(() => {});
+    if (!masterOnly) Promise.resolve().then(() => d.fanOutTradingStop(body)).catch(() => {});
     if (d.mode() === 'paper') return { ok: true, code: 'PAPER', detail: 'paper mode: nothing was sent to Bybit', paper: true };
     let c = { ok: false, code: 'NET', detail: 'no reply from Bybit' };
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -201,15 +201,15 @@ function create(deps) {
     if (!(Number(distStr) > 0)) return { ok: false, detail: 'trail distance rounds to zero at this price; trailing stop not set' };
     const body = { category: 'linear', symbol: cmd.symbol, trailingStop: distStr };
     if (cmd.activePrice) body.activePrice = cmd.activePrice;
-    const c = await tradingStop(body);
+    const c = await tradingStop(body, cmd.masterOnly);
     return c.ok ? { ok: true, detail: '' } : { ok: false, detail: 'trailing stop refused: ' + c.detail };
   }
 
   // Places an order through the server's own pipeline. If the reply is lost, asks Bybit whether it landed (same as the manager).
-  async function placeAndConfirm(payload, symbol, wantHeldSide, T) {
+  async function placeAndConfirm(payload, symbol, wantHeldSide, T, masterOnly) {
     T.orderTried = true;
     let c;
-    try { c = classify(await withTimeout(Promise.resolve().then(() => d.placeOrder(payload)), ORDER_TIMEOUT_MS, 'order')); }
+    try { c = classify(await withTimeout(Promise.resolve().then(() => d.placeOrder(payload, { masterOnly: !!masterOnly })), ORDER_TIMEOUT_MS, 'order')); }
     catch (e) { c = { ok: false, code: 'NET', detail: 'order call failed: ' + clip(e.message, 80) }; }
     if (!c.ok && c.code === 'NET') {
       const h = await getHeld(symbol).then(x => ({ x }), () => null);
@@ -238,14 +238,14 @@ function create(deps) {
     const rules = unwrap(inst, 'could not read the instrument rules for ' + cmd.symbol);
     let lev = cmd.leverage;
     if (rules.maxLeverage >= 1 && lev > Math.floor(rules.maxLeverage)) lev = Math.floor(rules.maxLeverage);   // clamp to the pair's cap
-    t = d.now(); await setLeverage(cmd.symbol, lev); T.lev = d.now() - t;
+    t = d.now(); await setLeverage(cmd.symbol, lev, cmd.masterOnly); T.lev = d.now() - t;
     const price = unwrap(px, 'could not read the price for ' + cmd.symbol);
     const qty = calcQty(margin * lev, lev, price, rules);
 
     const payload = { category: 'linear', symbol: cmd.symbol, side: cmd.bybitSide, orderType: 'Market', qty, orderLinkId: 'ym-' + cmd.id };
     if (cmd.tp) payload.takeProfit = cmd.tp;
     if (cmd.sl) payload.stopLoss = cmd.sl;
-    t = d.now(); let c = await placeAndConfirm(payload, cmd.symbol, cmd.bybitSide, T); T.order = d.now() - t;
+    t = d.now(); let c = await placeAndConfirm(payload, cmd.symbol, cmd.bybitSide, T, cmd.masterOnly); T.order = d.now() - t;
     if (!c.ok) return c;
     if (c.code === 'OK' && (scaled || lev !== cmd.leverage)) {   // opened, but not exactly as asked: say so
       const notes = [];
@@ -267,7 +267,7 @@ function create(deps) {
     const body = { category: 'linear', symbol: cmd.symbol };
     if (cmd.tp) body.takeProfit = cmd.tp;
     if (cmd.sl) body.stopLoss = cmd.sl;
-    return tradingStop(body);
+    return tradingStop(body, cmd.masterOnly);
   }
 
   async function execClose(cmd, T) {

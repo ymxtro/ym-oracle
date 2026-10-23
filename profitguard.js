@@ -57,7 +57,12 @@ const copySmart = d => JSON.parse(JSON.stringify(d));
 
 function defaults() {
   return { mode: 'off', pollSec: 5, minGapPct: 0.25, stepR: 0.1, beOffsetPct: 0.1, alerts: true, swingBots: [], smart: copySmart(DEFAULT_SMART),
-    reentry: { on: true, minPullR: 0.5, resumePct: 40, targetR: 2, hoursFast: 6, hoursSwing: 48 },
+    reentry: { on: true, minPullR: 0.5, resumePct: 40, targetR: 2, hoursFast: 6, hoursSwing: 48,
+      // v2.9.8 LIVE re-entry (off by default; the recorder above keeps running either way). Master account only, never copied to users.
+      live: false, sizeMult: 0.5, minStopPct: 0.4, maxStopPct: 6, maxPullR: 3, maxPerDay: 3, maxOpen: 1, cooldownH: 6, pauseR: 1.5, maxSlip: 0.3,
+      // v2.9.9 the brain (reentrybrain.js scores every chance 0-100 from the pair's own trend / pullback / resume / BTC / stop / liquidity; live needs minScore) and shake-outs
+      // (trades a protective stop closed near breakeven although the original stop was never touched: recorded by default, placed for real only when liveShake is on)
+      brain: true, minScore: 60, minTurnover: 1000000, shake: true, liveShake: false },
     fast: copyProfile(DEFAULT_LADDER.fast), swing: copyProfile(DEFAULT_LADDER.swing) };
 }
 
@@ -98,7 +103,12 @@ function normProfile(raw, dflt) {
 function normReentry(raw, d) {
   const r = (raw && typeof raw === 'object') ? raw : {};
   return { on: r.on === undefined ? d.on : r.on === true, minPullR: num(r.minPullR, 0.1, 5, d.minPullR), resumePct: num(r.resumePct, 10, 90, d.resumePct),
-    targetR: num(r.targetR, 0.5, 10, d.targetR), hoursFast: num(r.hoursFast, 1, 72, d.hoursFast), hoursSwing: num(r.hoursSwing, 1, 240, d.hoursSwing) };
+    targetR: num(r.targetR, 0.5, 10, d.targetR), hoursFast: num(r.hoursFast, 1, 72, d.hoursFast), hoursSwing: num(r.hoursSwing, 1, 240, d.hoursSwing),
+    live: r.live === undefined ? d.live === true : r.live === true, sizeMult: num(r.sizeMult, 0.1, 1.5, d.sizeMult), minStopPct: num(r.minStopPct, 0.1, 3, d.minStopPct),
+    maxStopPct: num(r.maxStopPct, 1, 15, d.maxStopPct), maxPullR: num(r.maxPullR, 1, 10, d.maxPullR), maxPerDay: Math.floor(num(r.maxPerDay, 1, 20, d.maxPerDay)),
+    maxOpen: Math.floor(num(r.maxOpen, 1, 5, d.maxOpen)), cooldownH: num(r.cooldownH, 0, 48, d.cooldownH), pauseR: num(r.pauseR, 0.5, 10, d.pauseR), maxSlip: num(r.maxSlip, 0.05, 1, d.maxSlip),
+    brain: r.brain === undefined ? d.brain === true : r.brain === true, minScore: num(r.minScore, 0, 100, d.minScore), minTurnover: num(r.minTurnover, 0, 1e9, d.minTurnover),
+    shake: r.shake === undefined ? d.shake === true : r.shake === true, liveShake: r.liveShake === undefined ? d.liveShake === true : r.liveShake === true };
 }
 
 function normAdapt(raw, d) {
@@ -374,4 +384,68 @@ function reentryStep(w, mark, nowMs, rc) {
   return { events: ev, finished: false };
 }
 
-module.exports = { revOf, sliceOf, curveKeep, curveOf, adaptOf, updatePull, noiseOf, stallExtra, suggestTuning, DEFAULT_SMART, PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };
+// ---- LIVE re-entry (v2.9.8) -------------------------------------------------------------------------------------------------------------------------------------
+// The recorder above spots "pulled back, then resumed". These two pure functions decide whether that spot may become a REAL order and what the order looks like.
+// Nothing here talks to Bybit or the database: the caller passes in what it knows (counts, last prices, the instrument), so every rule can be tested alone.
+//
+// reentryGate(w, c, ctx, rc) -> { ok, code, detail }
+//   w = the watch (side, risk, peak, lev, margin), c = the candidate { price, stop, pullR } from the recorder, rc = reentry settings
+//   ctx = { mark (price right now), todayCount (re-entries placed in the last 24 h), openCount (re-entries open or being opened), symbolHeld (any position on the pair),
+//           lastLossAgoH (hours since a losing re-entry on this pair, or null), liveOk (relay live, guards live, not halted) }
+function reentryGate(w, c, ctx, rc) {
+  const no = (code, detail) => ({ ok: false, code, detail });
+  if (!rc || rc.live !== true) return no('OFF', 'live re-entry is switched off');
+  if (!ctx.liveOk) return no('PAUSED', 'the relay is not live, the guards are not live, or trading is halted');
+  if (!(w.margin > 0) || !(w.lev >= 1)) return no('NOSIZE', 'the size of the original trade was not recorded');
+  const long = w.side === 'Buy', dist = Math.abs(c.price - c.stop), stopPct = dist / c.price * 100;
+  if (!(dist > 0) || (long ? c.stop >= c.price : c.stop <= c.price)) return no('BADSTOP', 'the pullback low is not on the protective side of the entry');
+  if (stopPct < rc.minStopPct) return no('TIGHT', 'stop only ' + stopPct.toFixed(2) + '% away: fees would eat too much of the win (minimum ' + rc.minStopPct + '%)');
+  if (stopPct > rc.maxStopPct) return no('WIDE', 'stop ' + stopPct.toFixed(2) + '% away is wider than the ' + rc.maxStopPct + '% limit');
+  if (w.lev * stopPct > 60) return no('LIQ', 'at ' + w.lev + 'x a ' + stopPct.toFixed(2) + '% stop is too close to liquidation (limit: leverage x stop% <= 60)');
+  if (c.pullR > rc.maxPullR) return no('DEEP', 'the pullback was ' + c.pullR.toFixed(1) + 'R: that looks like a reversal, not a pullback (limit ' + rc.maxPullR + 'R)');
+  if (w.src === 'shake' && !rc.liveShake) return no('SHAKEOFF', 'shake-out re-entries are recording only (liveShake is off)');
+  if (ctx.symbolHeld) return no('HELD', 'there is already a position on this pair');
+  if (ctx.turnover !== null && ctx.turnover !== undefined && ctx.turnover < rc.minTurnover) return no('THIN', 'only $' + (ctx.turnover / 1e6).toFixed(2) + 'M traded in 24 hours (minimum $' + (rc.minTurnover / 1e6).toFixed(2) + 'M): stops slip on a thin book');
+  if (rc.brain) {
+    if (!(ctx.score >= 0)) return no('NOREAD', 'no market reading, so no guess with money: ' + (ctx.scoreWhy || 'the candles could not be read'));
+    const need = rc.minScore + (w.src === 'shake' ? 10 : 0);
+    if (ctx.score < need) return no('LOWSCORE', 'score ' + ctx.score + ' is under the ' + need + ' needed' + (w.src === 'shake' ? ' for a shake-out' : ''));
+  }
+  if (ctx.todayCount >= rc.maxPerDay) return no('DAYCAP', 'already placed ' + ctx.todayCount + ' re-entries in the last 24 hours (limit ' + rc.maxPerDay + ')');
+  if (ctx.openCount >= rc.maxOpen) return no('OPENCAP', 'a re-entry is already open (limit ' + rc.maxOpen + ')');
+  if (ctx.lastLossAgoH !== null && ctx.lastLossAgoH !== undefined && ctx.lastLossAgoH < rc.cooldownH) return no('COOLDOWN', 'the last re-entry on this pair lost ' + ctx.lastLossAgoH.toFixed(1) + ' hours ago (cool-down ' + rc.cooldownH + ' h)');
+  if (!(ctx.mark > 0)) return no('NOPRICE', 'no current price');
+  const slip = (long ? ctx.mark - c.price : c.price - ctx.mark) / dist;   // + = already ran further in our favour, - = ran against us
+  if (long ? ctx.mark <= c.stop : ctx.mark >= c.stop) return no('STOPPED', 'price is already through the stop');
+  if (Math.abs(slip) > rc.maxSlip) return no('MOVED', 'price moved ' + (Math.abs(slip) * 100).toFixed(0) + '% of the stop distance since the signal (limit ' + Math.round(rc.maxSlip * 100) + '%)');
+  return { ok: true, code: 'OK', detail: 'all checks passed', stopPct };
+}
+
+// Rounds a price to the pair's tick. mode: 'down' | 'up' | 'near'. Integer arithmetic on the tick's decimals, so 0.1 + 0.2 style errors cannot leak into an order.
+function roundTick(price, tick, mode) {
+  const t = Number(tick); if (!(t > 0) || !(price > 0)) return price;
+  const dec = (String(tick).split('.')[1] || '').replace(/e.*/i, '').length + (/e-(\d+)/i.test(String(tick)) ? Number(String(tick).match(/e-(\d+)/i)[1]) : 0);
+  const k = Math.pow(10, dec), ti = Math.round(t * k), x = price * k / ti;   // x = price in ticks (a float); 1e-7 forgives binary noise like 12965.000000001
+  const n = mode === 'down' ? Math.floor(x + 1e-7) : mode === 'up' ? Math.ceil(x - 1e-7) : Math.round(x);
+  return Number(((n * ti) / k).toFixed(dec));
+}
+
+// reentryPlan(w, c, rc, tick, mark) -> the order to place: { side, sl, tp, usdMargin, leverage, stopPct, rr }
+//   stop = the pullback low (exactly what the recorder scored), target = entry +/- targetR x the stop distance (rounded toward the entry so it can actually be reached),
+//   margin = the original trade's margin x sizeMult, leverage = the original trade's.
+function reentryPlan(w, c, rc, tick, mark, score) {
+  const long = w.side === 'Buy', entry = mark > 0 ? mark : c.price, dist = Math.abs(entry - c.stop);
+  const sl = roundTick(c.stop, tick, 'near');
+  const tpRaw = long ? entry + rc.targetR * dist : entry - rc.targetR * dist;
+  const tp = roundTick(tpRaw, tick, long ? 'down' : 'up');
+  return { side: long ? 'BUY' : 'SELL', sl, tp, usdMargin: Math.round(w.margin * rc.sizeMult * (rc.brain && score >= 0 ? require('./reentrybrain.js').sizeFactor(score, rc.minScore) : 1) * 100) / 100, leverage: Math.floor(w.lev), stopPct: dist / entry * 100, rr: rc.targetR };
+}
+
+// Safety net after live trading: look at the last N finished LIVE re-entries (newest first, exit in R of their own stop). If they lost this much together, live re-entry pauses itself.
+function reentryShouldPause(lastRs, rc) {
+  const n = 3; if (!Array.isArray(lastRs) || lastRs.length < n) return false;
+  const sum = lastRs.slice(0, n).reduce((t, x) => t + (Number(x) || 0), 0);
+  return sum <= -rc.pauseR;
+}
+
+module.exports = { reentryGate, reentryPlan, reentryShouldPause, roundTick, revOf, sliceOf, curveKeep, curveOf, adaptOf, updatePull, noiseOf, stallExtra, suggestTuning, DEFAULT_SMART, PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };

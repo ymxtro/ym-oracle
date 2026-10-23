@@ -42,5 +42,9 @@ assert.strictEqual(PL.attributeExit({ ...a, exit: 2.137 }), 'ORIGINAL_SL');
 assert.strictEqual(PL.attributeExit({ ...a, exit: 1.95 }), 'OTHER');
 assert.strictEqual(PL.attributeExit({ ...a, exit: 2.0 , botStop: 2.001 }), 'BOT_STOP');
 assert.strictEqual(PL.attributeExit({ ...a, exit: 0 }), 'UNKNOWN'); assert.strictEqual(PL.attributeExit({ side: 'Sell', entry: 2, initialSl: 2, exit: 1.9 }), 'UNKNOWN');
+{ const soon = { side: 'Buy', entry: 0.30093, initialSl: 0.29698, sentinelFloor: 0.30124 };   // the SOON trade: breakeven stop 0.30124, filled at 0.3006 (about 0.16R worse)
+  assert.strictEqual(PL.attributeExit({ ...soon, exit: 0.3006 }), 'SENTINEL_STOP', 'a stop that slipped on a thin pair is still that stop');
+  assert.strictEqual(PL.attributeExit({ ...soon, exit: 0.3022 }), 'OTHER', 'an exit 0.25R BETTER than the stop is not that stop');
+  assert.strictEqual(PL.attributeExit({ side: 'Sell', entry: 2, initialSl: 2.1, sentinelFloor: 1.99, exit: 1.9985 }), 'SENTINEL_STOP', 'a short slips upward'); }
 ok('exit attribution: nearest stop within 0.12R of the exit price; otherwise other; unknown without an exit or a risk');
 console.log('\nALL ' + n + ' CHECKS PASSED');

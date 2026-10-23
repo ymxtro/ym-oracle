@@ -307,6 +307,7 @@ const multiuser = require('./multiuser').init({
   breakerIsTripped,
   requireDashboardAuth,
   getSecurityInfo: () => ({ deviceKeySet: !!DEVICE_API_KEY, deviceKeyMode: DEVICE_KEY_MODE, deviceKeyMisses }),
+  execTrade: b => tradeExec.run({ ...b, masterOnly: true }),   // v2.9.8: the relay's own re-entry orders (master account only)
   getFleet: () => ({ last: fleetStatus, info: fleetInfo, offlineMs: HEARTBEAT_OFFLINE_THRESHOLD_MS }),
   sendAlert: (text) => sendOfflineAlertTelegram(text),
   deliverAlert: (text, opts) => deliverTradeAlert(text, opts),
@@ -582,12 +583,13 @@ async function submitMasterOrder(body) {
   }
 }
 
-async function processOrder(body) {
+async function processOrder(body, opts) {
+  const masterOnly = !!(opts && opts.masterOnly);   // v2.9.8: a relay-originated re-entry trades the master account only: no copies, no plan sizing
   // Copy this signal to every active user's account. Fire-and-forget: the ESP32 must never wait on (or be
   // broken by) other people's accounts, and one user's failure never touches the master order below.
-  multiuser.fanOutOrder(body).catch(e => console.error('[multiuser] fanOutOrder:', e.message));
+  if (!masterOnly) multiuser.fanOutOrder(body).catch(e => console.error('[multiuser] fanOutOrder:', e.message));
   // Optional (MASTER_FOLLOWS_PLAN=true): size the master's open with the same rule as every user. Falls back to the manager's own quantity.
-  if (!body.reduceOnly) {
+  if (!body.reduceOnly && !masterOnly) {
     const sz = await multiuser.sizeMasterOrder(body).catch(() => null);
     if (sz && sz.qty) {
       console.log(`[master-sizing] ${body.symbol} qty ${body.qty} -> ${sz.qty} (about $${Number(sz.marginUsd).toFixed(2)} margin at ${sz.leverage}x, from the plan)`);
@@ -1348,7 +1350,7 @@ const tradeExec = require('./tradeexec').create({
   rest: () => restClient,
   mode: () => TRADE_MODE,
   halted: () => breakerIsTripped(),
-  placeOrder: body => processOrder(body),
+  placeOrder: (body, o) => processOrder(body, o),
   fanOutLeverage: b => multiuser.fanOutLeverage(b),
   fanOutTradingStop: b => multiuser.fanOutTradingStop(b),
   guardClamp: b => (multiuser.guardClamp ? multiuser.guardClamp(b) : b),   // Profit Guard: a looser stop from a bot is held at the guard's floor
@@ -1357,7 +1359,8 @@ const tradeExec = require('./tradeexec').create({
 });
 app.post('/api/trade', requireDevice, async (req, res) => {
   try {
-    const r = await tradeExec.run(req.body);
+    const { masterOnly: _ignored, ...clean } = (req.body && typeof req.body === 'object') ? req.body : {};   // a device can never ask to skip the copies; only the relay's own re-entry may
+    const r = await tradeExec.run(clean);
     return res.status(r.http).json(r.body);
   } catch (error) {
     console.error('[trade]', error && error.message);

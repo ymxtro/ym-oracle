@@ -23,7 +23,7 @@ function defaults() {
     weights: { ...DEFAULT_WEIGHTS },
     th: { watch: 28, alert: 50, danger: 70, hyst: 8, confirm: 2 },                 // score boundaries, how far a state must fall to drop, reads in a row to rise to alert/danger
     loss: { alertR: 0.6, dangerGapAtr: 0.5 },                                       // loss side: alert moves the stop to -alertR; danger puts it dangerGapAtr x ATR behind the price
-    profit: { startR: 0.3, dangerKeep: 0.5 },                                       // past startR the trade counts as "in profit": alert = breakeven, danger = keep this share of the peak profit
+    profit: { startR: 0.7, dangerKeep: 0.5 },                                       // past startR the trade counts as "in profit": alert = breakeven, danger = keep this share of the peak profit. 0.7 since v2.9.10 (was 0.3: on 51 recorded trades a breakeven stop from +0.3R cost about 1.7R, from +0.7R it added about 0.6R-1.2R; SOON was stopped at breakeven then ran +7%)
     label: { afterMin: 5, mult: { runner: 0.85, neutral: 1, grinder: 1.15, chop: 1.1 } },   // per-trade tweak of the score, bounded
     limits: { maxMoves: 3, moveGapSec: 30 },
     fit: { minTrades: 30, minTraps: 10 },
@@ -283,4 +283,11 @@ function evalWeights(samples, weights, th) {
   return { n: samples.length, tp, fp, fn, tn, recall: tp + fn ? tp / (tp + fn) : null, precision: tp + fp ? tp / (tp + fp) : null };
 }
 
-module.exports = { MODES, PMODES, KEYS, STATES, DEFAULT_WEIGHTS, defaults, normalize, effMode, atrOf, features, normFeatures, score, stateFor, step, labelTrade, labelMult, decide, clampStop, replay, fitWeights, evalWeights };
+// v2.9.10 one-time migration: a SAVED Sentinel whose profit start is still exactly the old default (0.3R) moves to the new default (0.7R). A value anyone chose
+// themselves (anything but 0.3) is never touched, and the caller marks the migration done so a later deliberate 0.3 is respected.
+function migrateStart(cfg, hadSaved) {
+  if (!hadSaved || !cfg || !cfg.profit || Math.abs(Number(cfg.profit.startR) - 0.3) > 1e-9) return { cfg, changed: false };
+  return { cfg: normalize({ ...cfg, profit: { ...cfg.profit, startR: 0.7 } }), changed: true };
+}
+
+module.exports = { migrateStart, MODES, PMODES, KEYS, STATES, DEFAULT_WEIGHTS, defaults, normalize, effMode, atrOf, features, normFeatures, score, stateFor, step, labelTrade, labelMult, decide, clampStop, replay, fitWeights, evalWeights };
