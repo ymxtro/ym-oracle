@@ -1378,6 +1378,27 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
       assert(sc.recent.length >= 2 && sc.summary.some(x => x.profile === 'swing' && Number(x.giveback) === 20), JSON.stringify(sc.summary));
       ok('profit guard scorecard: each closed trade is stored with its best point, its real exit and how much it gave back; an unknown exit stays unknown');
 
+      // v2.9.5: which stop a trade exited at, and the same closed trade is never stored twice
+      assert.strictEqual(tr.closed_by, 'OTHER', 'an exit well clear of every stop is not blamed on one');
+      assert.strictEqual(eth.closed_by, 'UNKNOWN', 'no exit price: no attribution');
+      await db.query('TRUNCATE pg_trades'); state.closedPnl.ADMINK = [];
+      PB(150, 90); await mu._test.pgTick(); await sleep(300);
+      const st0 = mu._test.pgState.get('BTCUSDT|Buy'); assert.strictEqual(st0.floor, 127.5);
+      const keep = JSON.parse(JSON.stringify(st0));
+      state.closedPnl.ADMINK = [{ symbol: 'BTCUSDT', avgExitPrice: '127.6', closedPnl: '2.7', updatedTime: String(Date.now()) }];
+      delete state.positions['ADMINK:BTCUSDT']; await mu._test.pgTick();
+      let prow = (await db.query(`SELECT closed_by FROM pg_trades WHERE symbol='BTCUSDT'`)).rows;
+      assert.strictEqual(prow.length, 1); assert.strictEqual(prow[0].closed_by, 'GUARD_STOP');
+      assert((await logs('closed')).some(x => /\[exit at: GUARD_STOP\]/.test(x.detail)), 'the log line says which stop');
+      mu._test.pgClosing.push({ key: 'BTCUSDT|Buy', st: keep, em: 'live', at: Date.now(), tries: 0, mark: 127.6 }); await mu._test.pgTick();
+      prow = (await db.query(`SELECT closed_by FROM pg_trades WHERE symbol='BTCUSDT'`)).rows; assert.strictEqual(prow.length, 1, 'the same closed trade is not recorded twice');
+      // the Sentinel scorecard: a stale saved state that brings a closed trade back must not add a second row
+      await db.query('TRUNCATE sentinel_trades'); state.closedPnl.ADMINK = [{ symbol: 'BTCUSDT', avgExitPrice: '105', closedPnl: '0.5', updatedTime: String(Date.now()) }];
+      const sit = () => ({ key: 'BTCUSDT|Buy', st: { entry: 100, initialSl: 90, peak: 110, profile: 'fast', label: 'neutral', moves: 1, maxScore: 60, since: Date.now() - 3600000, entryAt: Date.now() - 3600000 }, em: 'live', at: Date.now(), tries: 0 });
+      assert.strictEqual(await mu._test.snRecordClose(sit()), true); assert.strictEqual(await mu._test.snRecordClose(sit()), true);
+      assert.strictEqual((await db.query('SELECT 1 FROM sentinel_trades')).rows.length, 1, 'recorded once however many times the close is replayed');
+      ok('v2.9.5: each closed trade is tagged with the stop it exited at (guard / sentinel / original / bot / other); a replayed close never makes a second scorecard row (guard or sentinel)');
+
       // re-entry recorder: pulled back, resumed, +2R (recording only; nothing is ordered)
       assert(mu._test.pgWatch.has('BTCUSDT|Buy'), 'a winner that closed is being watched');
       const sub0 = state.submits.length;
@@ -1557,6 +1578,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
       assert.strictEqual(state.submits.length, nS0, 'shadow closes nothing');
       const ws = await logs('would_scale'); assert.strictEqual(ws.length, 1, 'once per trade'); assert(/early slice/.test(ws[0].detail) && /reversal/.test(ws[0].detail), ws[0].detail);
       assert.strictEqual((await rd({})).hold, false, 'shadow: the bot keeps its own whole-trade close');
+      assert.strictEqual((await rd({})).sl, undefined, 'v2.9.6: shadow: no real stop is reported to the bot');
       ok('bot reversal reading (shadow): validated, the slice it would take is recorded once, nothing is closed, and the bot is told to keep its own close');
       // live: needs the confirm; a strong reading takes one reduce-only slice and the bot is told the relay is handling it
       await reset(); mu._test.botReads.clear();
@@ -1569,6 +1591,11 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
       assert.strictEqual(rs.length, 1, JSON.stringify(state.submits.slice(nS1).map(x => x.body))); assert(Number(rs[0].body.qty) > 0 && Number(rs[0].body.qty) <= 0.05 + 1e-9 && rs[0].body.side === 'Sell', JSON.stringify(rs[0].body));
       assert(/reversal/.test((await logs('scaled'))[0].detail));
       assert.strictEqual((await rd({})).hold, true, 'live: the relay is handling this trade');
+      { const rr = await rd({}), g1 = mu._test.pgState.get('BTCUSDT|Buy');
+        assert(rr.sl > 90 && rr.sl === g1.curSl, 'v2.9.6: live: the reply carries the stop that is really on Bybit: ' + JSON.stringify(rr));
+        g1.seenAt = Date.now() - 200000; assert.strictEqual((await rd({})).sl, undefined, 'a trade the guard has not looked at for 2+ minutes: nothing reported');
+        g1.seenAt = Date.now(); assert(((await rd({})).sl) > 90);
+        halted = true; assert.strictEqual((await rd({})).sl, undefined, 'trading halted: nothing reported'); halted = false; }
       await mu._test.pgTick(); assert.strictEqual(state.submits.slice(nS1).filter(x => x.k === 'ADMINK' && x.body.reduceOnly === true).length, 1, 'only one slice per trade');
       ok('bot reversal reading (live): needs the confirm, takes one reduce-only slice, once, and tells the bot the relay is handling it');
       // a middling reading only shrinks the stop room (no slice); no reading and a stale one change nothing

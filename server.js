@@ -212,6 +212,34 @@ function breakerTrip(reason) {
   fs.writeFileSync(CIRCUIT_BREAKER_FILE, JSON.stringify({ trippedAt: new Date().toISOString(), reason: reason || 'manually halted' }, null, 2));
 }
 function breakerReset() { if (fs.existsSync(CIRCUIT_BREAKER_FILE)) fs.unlinkSync(CIRCUIT_BREAKER_FILE); }
+
+// v2.9.7: mirror the Halt switch and the mode in the database (when there is one). The files stay the fast copy the code reads; the database is what survives a
+// redeploy on a host with no persistent disk. On startup the two are reconciled (see reconcileControl). Safety rule: if either says HALTED, the relay is halted.
+async function persistHalt(tripped, reason) {
+  if (!multiuser.canPersist) return true;
+  return multiuser.saveControl('halt', { tripped: !!tripped, reason: reason || '', at: Date.now() });
+}
+async function persistMode(mode) {
+  if (!multiuser.canPersist) return true;
+  return multiuser.saveControl('mode', { mode, at: Date.now() });
+}
+async function reconcileControl() {
+  if (!multiuser.canPersist) return { skipped: true };
+  const out = {};
+  try {
+    const db = await multiuser.loadControl();
+    const fileTripped = breakerIsTripped();
+    if (db.halt && db.halt.tripped && !fileTripped) { breakerTrip((db.halt.reason || 'halted') + ' (restored from the database after a restart)'); out.halt = 'restored from the database'; }
+    else if (fileTripped && !(db.halt && db.halt.tripped)) { await persistHalt(true, breakerStatus().reason); out.halt = 'saved to the database'; }
+    let fileMode = null;
+    if (fs.existsSync(MODE_FILE)) { try { const m = JSON.parse(fs.readFileSync(MODE_FILE, 'utf8')); if (m.mode === 'paper' || m.mode === 'live') fileMode = { mode: m.mode, at: Date.parse(m.setAt) || 0 }; } catch { /* unreadable */ } }
+    const dbMode = db.mode && (db.mode.mode === 'paper' || db.mode.mode === 'live') ? db.mode : null;
+    if (dbMode && (!fileMode || dbMode.at > fileMode.at)) { if (dbMode.mode !== TRADE_MODE || !fileMode) { setMode(dbMode.mode); } out.mode = 'restored from the database: ' + dbMode.mode; }
+    else if (fileMode && (!dbMode || fileMode.at > dbMode.at)) { await persistMode(fileMode.mode); out.mode = 'saved to the database'; }
+  } catch (e) { console.error('[control] could not check the database for the halt switch and the mode:', e.message); out.error = e.message; }
+  if (out.halt || out.mode) console.log('[control] ' + JSON.stringify(out));
+  return out;
+}
 function breakerStatus() {
   if (!breakerIsTripped()) return { tripped: false };
   try { return { tripped: true, ...JSON.parse(fs.readFileSync(CIRCUIT_BREAKER_FILE, 'utf8')) }; }
@@ -609,7 +637,7 @@ app.post('/api/order', requireDevice, async (req, res) => {
 app.post('/api/bot-event', requireDevice, async (req, res) => {
   try {
     const r = await multiuser.recordBotEvent(req.body);
-    return res.status(r.status).json({ success: r.status === 200, message: r.message, hold: r.hold === true, ...(r.closed ? { closed: r.closed } : {}) });
+    return res.status(r.status).json({ success: r.status === 200, message: r.message, hold: r.hold === true, ...(r.closed ? { closed: r.closed } : {}), ...(r.sl > 0 ? { sl: r.sl } : {}) });
   } catch (error) {
     console.error('[bot-event]', error.message);
     return res.status(500).json({ success: false });
@@ -1270,13 +1298,16 @@ app.get('/api/health', (req, res) => {
 app.get('/api/status', requireDashboardAuth, (req, res) => {
   res.status(200).json({ mode: TRADE_MODE, testnet: IS_TESTNET, demo: IS_DEMO, masterEnv: masterEnvName(), breaker: breakerStatus() });
 });
-app.post('/api/halt', requireDashboardAuth, (req, res) => {
-  breakerTrip((req.body && req.body.reason) || 'manually halted via dashboard');
-  res.status(200).json({ success: true, status: breakerStatus() });
+app.post('/api/halt', requireDashboardAuth, async (req, res) => {
+  const why = (req.body && req.body.reason) || 'manually halted via dashboard';
+  breakerTrip(why);   // halted at once; the database copy follows
+  const saved = await persistHalt(true, why);
+  res.status(200).json({ success: true, status: breakerStatus(), persisted: saved });
 });
-app.post('/api/resume', requireDashboardAuth, (req, res) => {
+app.post('/api/resume', requireDashboardAuth, async (req, res) => {
   breakerReset();
-  res.status(200).json({ success: true, status: breakerStatus() });
+  const saved = await persistHalt(false, '');
+  res.status(200).json({ success: true, status: breakerStatus(), persisted: saved });
 });
 
 // REAL FEATURE ADDED at the user's explicit request: switching TO live
@@ -1285,7 +1316,7 @@ app.post('/api/resume', requireDashboardAuth, (req, res) => {
 // this, since it's always the safe direction. Mismatched confirm text
 // is rejected with 400, same status a validation failure gets
 // elsewhere in this file.
-app.post('/api/mode', requireDashboardAuth, (req, res) => {
+app.post('/api/mode', requireDashboardAuth, async (req, res) => {
   const { mode, confirm } = req.body || {};
   if (mode !== 'paper' && mode !== 'live') {
     return res.status(400).json({ success: false, message: 'mode must be "paper" or "live"' });
@@ -1294,7 +1325,8 @@ app.post('/api/mode', requireDashboardAuth, (req, res) => {
     return res.status(400).json({ success: false, message: 'Switching to live requires confirm:"LIVE"' });
   }
   setMode(mode);
-  res.status(200).json({ success: true, mode: TRADE_MODE });
+  const saved = await persistMode(mode);
+  res.status(200).json({ success: true, mode: TRADE_MODE, persisted: saved });
 });
 
 app.post('/api/clear-trade-log', requireDashboardAuth, (req, res) => {
@@ -1303,10 +1335,9 @@ app.post('/api/clear-trade-log', requireDashboardAuth, (req, res) => {
   return res.status(200).json({ success: true, message: 'Trade log cleared' });
 });
 
-// Global Exception Safety Net
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-});
+// Global safety net (v2.9.7): see crashguard.js. An uncaught exception now alerts and restarts the relay instead of carrying on half-working.
+const crashGuard = require('./crashguard').create({ log: (...a) => console.error(...a), alert: t => sendOfflineAlertTelegram(t) });
+process.on('unhandledRejection', reason => crashGuard.onRejection(reason));
 
 // ---- SERVER-SIDE TRADE EXECUTION (POST /api/trade) -------------------------------------------------------------------------
 // A bot sends ONE request with its decision; the server does what the manager ESP32 used to do with ~8 HTTPS calls (balance, held-pair
@@ -1334,9 +1365,7 @@ app.post('/api/trade', requireDevice, async (req, res) => {
   }
 });
 
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception thrown:', err);
-});
+process.on('uncaughtException', err => crashGuard.onException(err));
 
 // Never leak stack traces or internals to a client (Express's default error page does exactly that outside production).
 app.use((err, req, res, next) => {
@@ -1345,7 +1374,8 @@ app.use((err, req, res, next) => {
   res.status(err && err.status && err.status < 500 ? err.status : 500).json({ success: false, message: 'Request error' });
 });
 
-app.listen(PORT, () => {
+// v2.9.7: reconcile the Halt switch and the mode with the database BEFORE accepting a single request (bounded at 8 s, so a slow database cannot keep the relay down).
+Promise.race([reconcileControl(), new Promise(r => setTimeout(r, 8000))]).catch(() => {}).then(() => app.listen(PORT, () => {
   if (!DASHBOARD_PASSWORD) console.warn('[security] WARNING: DASHBOARD_PASSWORD is not set -- the dashboard, halt and mode switches are open to anyone, and /admin is disabled.');
   if (!DEVICE_API_KEY) console.warn('[security] WARNING: DEVICE_API_KEY is not set -- anyone who finds this URL can place trades through /api/order' + (process.env.DATABASE_URL ? ', and with multi-user on that reaches EVERY user account.' : '.'));
   else if (DEVICE_KEY_MODE === 'warn') console.warn('[security] DEVICE_API_KEY set in WARN mode: requests without the key are logged but still accepted. Set DEVICE_KEY_MODE=enforce once your ESP32s send it.');
@@ -1354,4 +1384,4 @@ app.listen(PORT, () => {
   setTimeout(() => reconcileMasterPositions().catch(() => {}), 15000).unref();
   console.log(`TRADE_MODE=${TRADE_MODE}${TRADE_MODE === 'paper' ? '  (no real orders will be submitted)' : ''}`);
   console.log(`Bybit endpoint: ${BYBIT_BASE_URL ? `EXPLICIT OVERRIDE (${BYBIT_BASE_URL})` : IS_DEMO ? 'DEMO TRADING (api-demo.bybit.com)' : IS_TESTNET ? 'TESTNET' : 'LIVE MAINNET'}`);
-});
+}));

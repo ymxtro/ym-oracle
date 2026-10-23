@@ -174,7 +174,7 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
   assert.strictEqual((await A.post('/api/bot-event', { v: 1, bot: 'YM ORACLE I', ev: 'status', t: 1 })).s, 200);
   ok('/api/bot-event exists and accepts the bots\' reports');
   { const rr = await A.post('/api/bot-event', { v: 1, bot: 'YM ORACLE I', ev: 'read', sym: 'BTCUSDT', side: 'BUY', urg: 0.2, rp: 40, ot: 1792564363 }); assert.strictEqual(rr.s, 200); assert.strictEqual(rr.j.hold, false); assert.strictEqual(rr.j.closed, undefined);
-    assert(/closed: r\.closed/.test(fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8')), 'server.js passes the relay\'s close feedback through to the bot'); ok('/api/bot-event read: answers hold:false and no close feedback for an unknown trade; the close feedback is passed through'); }
+    assert(/closed: r\.closed/.test(fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8')), 'server.js passes the relay\'s close feedback through to the bot'); assert(/r\.sl > 0 \? \{ sl: r\.sl \}/.test(fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8')), 'server.js passes the real stop through to the bot'); ok('/api/bot-event read: answers hold:false and no close feedback for an unknown trade; the close feedback is passed through'); }
 
   // 9. heartbeat: old firmware (name only), new beacon, junk
   assert.strictEqual((await A.post('/api/heartbeat', { name: 'YM ORACLE I' })).s, 200);
@@ -423,6 +423,30 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
   assert.strictEqual((await db.query(`SELECT 1 FROM meta WHERE k='master_creds'`)).rowCount, 0, 'saved key removed');
   fake.keysSeen = []; assert.strictEqual((await C.post('/api/order', order('ym-KEYSWAP3'))).s, 200); assert(fake.keysSeen.includes('k'), 'back on the Render key');
   ok('reset puts the Render settings back and deletes the saved key');
+
+  // v2.9.7: Halt and the mode survive a redeploy that wipes the local files (no persistent disk)
+  { const haltF = path.join(tmp, 'p' + P3 + '-halt'), modeF = path.join(tmp, 'p' + P3 + '-mode.json');
+    const h = await C.post('/api/halt', { reason: 'test halt' }, DASH); assert(h.s === 200 && h.j.persisted === true && h.j.status.tripped, JSON.stringify(h.j));
+    const m = await C.post('/api/mode', { mode: 'paper' }, DASH); assert(m.s === 200 && m.j.persisted === true && m.j.mode === 'paper', JSON.stringify(m.j));
+    assert.strictEqual((await db.query(`SELECT count(*)::int n FROM meta WHERE k IN ('ctl_halt','ctl_mode')`)).rows[0].n, 2, 'both saved in the database');
+    s3.kill(); await sleep(400); fs.rmSync(haltF, { force: true }); fs.rmSync(modeF, { force: true });   // what a redeploy on an ephemeral disk does
+    s3 = boot(P3, { ...dbEnv, TRADE_MODE: 'live' }); await waitUp(P3); C = mk(P3);
+    const st = (await C.get('/api/status', DASH)).j; assert(st.breaker.tripped === true && /restored from the database/.test(st.breaker.reason || ''), 'still halted after the wipe: ' + JSON.stringify(st.breaker));
+    assert.strictEqual(st.mode, 'paper', 'still paper after the wipe (the env var says live)');
+    assert.strictEqual((await C.post('/api/order', order('ym-HALTED1'))).s, 503, 'and a halted relay refuses orders');
+    const r = await C.post('/api/resume', {}, DASH); assert(r.j.persisted === true && !r.j.status.tripped);
+    const m2 = await C.post('/api/mode', { mode: 'live', confirm: 'LIVE' }, DASH); assert(m2.j.mode === 'live');
+    s3.kill(); await sleep(400); fs.rmSync(haltF, { force: true }); fs.rmSync(modeF, { force: true });
+    s3 = boot(P3, { ...dbEnv, TRADE_MODE: 'paper' }); await waitUp(P3); C = mk(P3);
+    const st2 = (await C.get('/api/status', DASH)).j; assert(st2.breaker.tripped === false && st2.mode === 'live', 'resume and live also survive a wipe: ' + JSON.stringify(st2));
+    // a halt that exists only in the local file (the database write was lost) is pushed to the database and stays halted
+    await db.query(`DELETE FROM meta WHERE k='ctl_halt'`); s3.kill(); await sleep(400);
+    fs.writeFileSync(haltF, JSON.stringify({ trippedAt: new Date().toISOString(), reason: 'file only' }));
+    s3 = boot(P3, dbEnv); await waitUp(P3); C = mk(P3);
+    assert((await C.get('/api/status', DASH)).j.breaker.tripped === true, 'file-only halt still holds');
+    assert(JSON.parse((await db.query(`SELECT v FROM meta WHERE k='ctl_halt'`)).rows[0].v).tripped === true, 'and is now saved in the database');
+    await C.post('/api/resume', {}, DASH);
+    ok('halt and paper/live mode survive a restart that wipes the local files; a file-only halt is saved; a halted relay refuses orders'); }
   s3.kill(); await db.end();
 
   console.log('\nALL ' + n + ' SERVER CHECKS PASSED');

@@ -916,6 +916,7 @@ function viewSettings(){
   h+='<div class="card"><h2 style="margin:0 0 8px">Data tools</h2><div class="btns"><button class="btn" data-act="sync">Sync PnL</button><button class="btn" data-act="csv">Download CSV</button><button class="btn" data-act="backup">Backup to Telegram</button><button class="btn" data-act="testAlert">Send test alert</button></div></div>';
   var td=new Date(),fd=new Date(td.getTime()-6*864e5),iso=function(d){return d.toISOString().slice(0,10)};
   h+='<div class="card"><h2 style="margin:0 0 4px">Download everything</h2><div class="small" style="margin-bottom:8px">One file with every trade a bot took in the range: its own ledger, what Bybit and the copy users did with it, the Profit Guard and Sentinel actions, each trade\'s price path and the alerts it sent. Dates are UTC.</div><div class="fgrid"><div><label class="l" for="ea-bot">Bot</label><select id="ea-bot"><option value="all">All bots</option><option>YM ORACLE I</option><option>YM ORACLE II</option><option>YM ORACLE III</option><option>YM ORACLE IV</option></select></div><div><label class="l" for="ea-from">From</label><input type="date" id="ea-from" value="'+iso(fd)+'"></div><div><label class="l" for="ea-to">To</label><input type="date" id="ea-to" value="'+iso(td)+'"></div></div><div class="btns" style="margin-top:8px"><button class="btn pri" data-act="exportAll">Download everything</button></div></div>';
+  h+='<div class="card"><h2 style="margin:0 0 4px">Policy lab (read-only)</h2><div class="small" style="margin-bottom:8px">Replays simple stop rules on the stored trade paths and shows which layer each trade exited at. It changes nothing. Use it to pick what to test in shadow, not as proof: it is a small sample and ignores slippage.</div><div class="fgrid"><div><label class="l" for="pl-days">Days</label><input type="number" id="pl-days" min="1" max="60" value="14"></div></div><div class="btns" style="margin-top:8px"><button class="btn pri" data-act="labLoad">Run</button></div><div id="pl-out" class="small" style="margin-top:8px">Press Run.</div></div>';
   h+='<div class="card"><h2 style="margin:0 0 4px">Burst brake (copy users)</h2><div class="small" style="margin-bottom:8px">When several bots open the same direction on different coins within minutes, later copies for your signed-up users can be made smaller (100% / 60% / 40% by default). The master account is never changed. <b>Shadow</b> only records what it would have done.</div><div class="fgrid"><div><label class="l" for="bb-mode">Mode</label><select id="bb-mode"><option value="off">Off</option><option value="shadow" selected>Shadow (log only)</option><option value="live">Live</option></select></div><div><label class="l" for="bb-win">Window (minutes)</label><input type="number" id="bb-win" min="1" max="120" value="15"></div></div><label class="small" style="display:block;margin-top:8px"><input type="checkbox" id="bb-conf"> I understand Live changes the size of real copy trades</label><div class="btns" style="margin-top:8px"><button class="btn" data-act="burstLoad">Refresh</button><button class="btn pri" data-act="burstSave">Save</button></div><div id="bb-out" class="small" style="margin-top:8px">Press Refresh to see the current setting and what it did.</div></div>';
   h+='</div><div class="stack">';
   if(S.sec){var ok=S.sec.filter(function(c){return c.ok}).length;
@@ -1071,6 +1072,26 @@ function render(){
 }
 
 /* ---------- actions ---------- */
+function labLoad(){
+  $('#pl-out').textContent='Working...';
+  return j('/api/admin/policy-lab?days='+(Number($('#pl-days').value)||14)).then(function(r){
+    if(!r||!r.report){$('#pl-out').textContent='Could not load';return}
+    var p=r.report,o=[];
+    o.push('<b>'+p.trades+'</b> trades with a stored path ('+r.days+' days). Actual result on these paths: <b>'+p.baselineR+'R</b>.');
+    o.push('Never reached +0.3R: <b>'+p.neverMoved.n+'</b> trades, '+p.neverMoved.exitR+'R. Reached it: <b>'+p.moved.n+'</b> trades, '+p.moved.exitR+'R kept of '+p.moved.peakR+'R at their peak.');
+    o.push('<br><b>Stop ladder replay</b> (total R; rows = start at R, columns = share of the peak kept after it)');
+    var ks=p.ladder.length?p.ladder[0].cells.map(function(c){return Math.round(c.keep*100)+'%'}):[];
+    o.push('start \\ keep: '+ks.join(' | '));
+    p.ladder.forEach(function(row){o.push(row.start+'R: '+row.cells.map(function(c){return c.totalR}).join(' | '))});
+    if(p.bestLadder)o.push('Best cell: start '+p.bestLadder.start+'R, keep '+Math.round(p.bestLadder.keep*100)+'% = '+p.bestLadder.totalR+'R');
+    o.push('<br><b>Early loss-cut replay</b> (after N min, if it never showed +P R and is down X R, close it)');
+    p.lossCut.filter(function(c){return c.afterMin===15}).forEach(function(c){o.push('after '+c.afterMin+' min, never +'+c.neverShowed+'R, cut at '+c.cutAt+'R: '+(c.deltaR>=0?'+':'')+c.deltaR+'R vs actual ('+c.cut+' trades cut, saved '+c.savedR+'R, hurt '+c.hurtR+'R)')});
+    o.push('<br><b>Which stop each closed trade exited at</b>');
+    (r.closedBy||[]).forEach(function(c){o.push(esc(c.closed_by)+': '+c.n+' trades, average exit '+(c.avg_exit_r===null?'n/a':Number(c.avg_exit_r).toFixed(2))+'R, average peak '+(c.avg_peak_r===null?'n/a':Number(c.avg_peak_r).toFixed(2))+'R')});
+    o.push('<br><i>'+p.caveats.map(esc).join(' ')+'</i>');
+    $('#pl-out').innerHTML=o.join('<br>');
+  });
+}
 function burstLoad(){
   return j('/api/admin/burst-brake').then(function(r){
     if(!r||!r.cfg){toast('Could not load');return}
@@ -1157,6 +1178,7 @@ document.addEventListener('click',function(e){
   if(a==='sync'){t.textContent='Syncing…';j('/api/admin/sync-now','POST').then(function(){t.textContent='Sync PnL';toast('PnL synced');refreshAll(true)});return}
   if(a==='csv'){exportCsv();return}
   if(a==='exportAll'){exportAll();return}
+  if(a==='labLoad'){labLoad();return}
   if(a==='burstLoad'){burstLoad();return}
   if(a==='burstSave'){burstSave();return}
   if(a==='testAlert'){var to=t.getAttribute('data-to')||'',lab=t.textContent;t.textContent='Sending…';j('/api/admin/test-alert','POST',to?{target:to}:{}).then(function(r){t.textContent=lab;toast(!r.configured?'No alert channel is set up on Render yet (Telegram token and chat id)':r.muted?'Muted by your alert settings ('+(r.reason||'see the panel')+'): nothing was sent':r.success?'Test sent'+(to==='group'?' to the group':to==='dm'?' to your DM':'')+(r.telegram&&r.telegram.indexOf('sent')===0?'':'')+(r.email==='sent'?' and email':''):'Sending failed: Telegram '+r.telegram+(r.email!=='off'?', email '+r.email:''))}).catch(function(){t.textContent=lab;toast('Could not reach the server')});return}
