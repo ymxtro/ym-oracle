@@ -32,6 +32,7 @@ function build() {
     listOpenPositions: async () => st.positions, getInstrument: async () => ({ tickSize: 0.01 }),
     pgLookup: async () => ({ bot: 'ORACLE I', sl: 99, eng: 'fast' }), deliverAlert: async t => { rec.alerts.push(t); return { ok: true }; },
     fanOutTradingStop: async b => { rec.fan.push(b); },
+    stopWrite: async (side, b) => ({ res: await restClient.setTradingStop(b) }),   // v2.9.14: the real one reads the stop on Bybit first (covered by the integration suite)
   };
   const names = Object.keys(deps);
   const make = new Function(...names, `${block}\n return { snTick, snState, snRun, snView, snBars, snLog };`);

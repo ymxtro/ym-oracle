@@ -23,11 +23,13 @@ const MODES = ['off', 'shadow', 'live'];   // off: does nothing. shadow: records
 
 const DEFAULT_LADDER = {
   fast:  { beR: 1, ladder: [[1.5, 0.45], [3, 0.60], [6, 0.70]], scale: { on: false, steps: [[2, 0.25]] } },
-  swing: { beR: 1, ladder: [[2, 0.35], [4, 0.55], [8, 0.65]], scale: { on: false, steps: [[3, 0.25]] } },
+  // v2.9.12: swing runs on a days time scale. Its first lock waits for +1.5R (the +1R breakeven belongs to the Swing Manager and needs a CLOSED 4h candle), the stop keeps at least 1.2% from the
+  // price (the fast 0.25% is noise on a multi-day trade), and one planned partial is taken at +1.75R.
+  swing: { beR: 1.5, minGapPct: 1.2, ladder: [[2, 0.35], [4, 0.55], [8, 0.65]], scale: { on: true, steps: [[1.75, 0.3]] } },
 };
 const PMODES = ['inherit', 'off', 'shadow', 'live'];   // a profile can follow the overall switch ("inherit") or have its own
 
-const copyProfile = p => ({ mode: 'inherit', beR: p.beR, ladder: p.ladder.map(x => x.slice()), scale: { on: p.scale.on, steps: p.scale.steps.map(x => x.slice()) } });
+const copyProfile = p => ({ mode: 'inherit', beR: p.beR, minGapPct: p.minGapPct || 0, ladder: p.ladder.map(x => x.slice()), scale: { on: p.scale.on, steps: p.scale.steps.map(x => x.slice()) } });
 
 const DEFAULT_SMART = {
   noise: { on: true, mult: 1.0, capR: 1.5 },                                   // breathing room: gap >= mult x the trade's largest pullback, never more than capR x R
@@ -83,7 +85,7 @@ function normSteps(arr, dflt, maxFrac) {
 function normProfile(raw, dflt) {
   const r = (raw && typeof raw === 'object') ? raw : {};
   const sc = (r.scale && typeof r.scale === 'object') ? r.scale : {};
-  const out = { mode: PMODES.includes(r.mode) ? r.mode : 'inherit', beR: num(r.beR, 0.3, 5, dflt.beR), ladder: dflt.ladder.map(x => x.slice()),
+  const out = { mode: PMODES.includes(r.mode) ? r.mode : 'inherit', beR: num(r.beR, 0.3, 5, dflt.beR), minGapPct: num(r.minGapPct, 0, 5, dflt.minGapPct || 0), ladder: dflt.ladder.map(x => x.slice()),
     scale: { on: sc.on === undefined ? dflt.scale.on : sc.on === true, steps: normSteps(sc.steps, dflt.scale.steps, 0.5) } };
   if (out.scale.steps.reduce((t, x) => t + x[1], 0) > 0.7) out.scale.steps = dflt.scale.steps.map(x => x.slice());   // never take more than 70% off in total: a runner always stays
   if (Array.isArray(r.ladder)) {
@@ -206,9 +208,10 @@ function decide(i) {
     if (long ? cand > target : cand < target) { target = cand; label = keepFrac > 0 ? label + ' +' + Math.round(stallExtra * 100) + ' pts (stalled)' : 'keep ' + Math.round(f * 100) + '% of the peak (stalled)'; keepFrac = f; }
   }
   const atrGap = Number(sm.atrPrice) > 0 ? Math.min(Number(sm.atrPrice), (Number(sm.atrCapR) > 0 ? Number(sm.atrCapR) : 1.5) * risk) : 0;   // breathing room from this pair's own speed
-  const gapDist = Math.max(mark * cfg.minGapPct / 100, noiseGap, atrGap);
+  const baseGapPct = pf.minGapPct > 0 ? pf.minGapPct : cfg.minGapPct;   // v2.9.12: a profile can have its own minimum gap (swing)
+  const gapDist = Math.max(mark * baseGapPct / 100, noiseGap, atrGap);
   const limit = long ? mark - gapDist : mark + gapDist;          // never closer to the price than this
-  if (long ? target > limit : target < limit) { target = limit; label += Math.max(noiseGap, atrGap) > mark * cfg.minGapPct / 100 ? (atrGap > noiseGap ? ' (held back: pair volatility)' : ' (held back: breathing room)') : ' (held back from the price)'; }
+  if (long ? target > limit : target < limit) { target = limit; label += Math.max(noiseGap, atrGap) > mark * baseGapPct / 100 ? (atrGap > noiseGap ? ' (held back: pair volatility)' : ' (held back: breathing room)') : ' (held back from the price)'; }
   target = roundTo(target, tick);
   if (tick > 0) { if (long && target > limit) target -= tick; if (!long && target < limit) target += tick; }
   target = fixTick(target, tick);

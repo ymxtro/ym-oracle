@@ -101,7 +101,9 @@ function envOptsFor(base, env) {
 // BURST BRAKE (v2.9.4). Several bots often fire the same direction within minutes of each other (Oct 21 2026: three shorts at 01:15, then more later). For the COPY
 // USERS that is one big bet in disguise. Each new same-side open on a DIFFERENT coin inside `windowMin` minutes counts as one earlier burst trade, and the n-th later copy
 // is sized by factors[n] (default 1, 0.6, 0.4). The master account is never touched. Pure function so it can be tested directly.
-const BURST_DEFAULT = { mode: 'shadow', windowMin: 15, factors: [1, 0.6, 0.4] };   // mode: 'off' | 'shadow' (log what it would do) | 'live'
+const BURST_DEFAULT = { mode: 'shadow', windowMin: 15, factors: [1, 0.6, 0.4],
+  // v2.9.12 EXPOSURE: how many OTHER coins the master already holds on the same side, fast and swing together (a swing short from yesterday and three fast shorts today are one big bet). Index = that count.
+  expo: { on: true, factors: [1, 1, 1, 0.7, 0.5, 0.35] } };   // mode: 'off' | 'shadow' (log what it would do) | 'live'
 function burstNorm(c) {
   const b = { ...BURST_DEFAULT, ...(c && typeof c === 'object' ? c : {}) };
   if (!['off', 'shadow', 'live'].includes(b.mode)) b.mode = 'shadow';
@@ -109,6 +111,10 @@ function burstNorm(c) {
   let f = Array.isArray(b.factors) ? b.factors.map(Number).filter(x => Number.isFinite(x) && x > 0 && x <= 1).slice(0, 6) : [];
   if (!f.length) f = BURST_DEFAULT.factors.slice();
   b.factors = f;
+  const ex = b.expo && typeof b.expo === 'object' ? b.expo : {};
+  let ef = Array.isArray(ex.factors) ? ex.factors.map(Number).filter(x => Number.isFinite(x) && x > 0 && x <= 1).slice(0, 10) : [];
+  if (!ef.length) ef = BURST_DEFAULT.expo.factors.slice();
+  b.expo = { on: ex.on === undefined ? true : ex.on === true, factors: ef };
   return b;
 }
 function burstFactor(recent, symbol, side, now, cfg) {
@@ -353,6 +359,9 @@ function init(deps) {
   const RB = require('./reentrybrain.js');
   const PL = require('./policylab.js');
   const SN = require('./sentinel.js');
+  const SC = require('./scalpmodel.js');       // v2.9.15: scalp lane model (confirmed entry, small target, quick exit; shadow test)
+  const PM = require('./pacemodel.js');        // v2.9.13: fast / slow pace of a call (signal-time class, proof after entry, labels)
+  const SW = require('./swingmgr.js');        // v2.9.12: swing-specific management (grace, 4h-close breakeven, thesis exit, time rule)
   const LQ = require('./livequality.js');
   let snCfg = SN.defaults();            // Trade Sentinel settings (off until switched on from the admin console)
   let pgCfg = PG.defaults();            // Profit Guard settings (off until switched on from the admin console)
@@ -376,6 +385,10 @@ function init(deps) {
     if (closedDbMiss.size > 200) for (const [kk, vv] of closedDbMiss) if (Date.now() - vv > 300000) closedDbMiss.delete(kk);
     return null;
   }
+  let pcCfg = PM.normalize(null);        // PACE MODEL settings (meta 'pace_model'); default = shadow: record and show only
+  const scNorm = c => ({ mode: c && c.mode === 'off' ? 'off' : 'shadow', ...SC.normalize(c) });   // the scalp lane has no live mode yet: off or shadow only
+  let scCfg = scNorm(null);              // SCALP LANE settings (meta 'scalp_lane'); default = shadow: records virtual trades only, no orders
+  let swCfg = SW.normalize(null);        // SWING MANAGER settings (meta 'swing_mgr'); default = shadow: log only
   let burstCfg = burstNorm(null);        // BURST BRAKE settings (meta 'burst_brake'); default = shadow: log only
   const burstRecent = [];                // recent non-reduce orders {symbol, side, at, key}
   const burstLog = [];                   // what the brake did / would have done: newest last, max 60           // the bots' own reversal readings, by 'SYMBOL|Side' (memory only: a reading is only useful for a few minutes)
@@ -472,6 +485,8 @@ function init(deps) {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE UNIQUE INDEX IF NOT EXISTS order_log_link_uq ON order_log(user_id, order_link_id) WHERE order_link_id IS NOT NULL;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS lane TEXT NOT NULL DEFAULT 'core';
+    ALTER TABLE invites ADD COLUMN IF NOT EXISTS lane TEXT NOT NULL DEFAULT 'core';
     ALTER TABLE users ADD COLUMN IF NOT EXISTS share_token TEXT UNIQUE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS share_show_balance BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE;
@@ -586,6 +601,27 @@ function init(deps) {
       id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(), symbol TEXT, side TEXT, mark NUMERIC, now_r NUMERIC, peak_r NUMERIC, atr NUMERIC, score NUMERIC, state TEXT
     );
     CREATE INDEX IF NOT EXISTS trade_path_at_idx ON trade_path(at);
+    CREATE TABLE IF NOT EXISTS scalp_trades (
+      k TEXT PRIMARY KEY, symbol TEXT, side TEXT, bot TEXT, eng TEXT, klass TEXT, score NUMERIC, signal_px NUMERIC, signal_at TIMESTAMPTZ,
+      target NUMERIC, entered BOOLEAN, reason TEXT, exit TEXT, gross_pct NUMERIC, net_pct NUMERIC, usd NUMERIC, mfe NUMERIC, mae NUMERIC, held_min NUMERIC,
+      inst_exit TEXT, inst_net NUMERIC, path JSONB, cfg JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    ALTER TABLE scalp_trades ADD COLUMN IF NOT EXISTS lev NUMERIC;
+    ALTER TABLE scalp_trades ADD COLUMN IF NOT EXISTS base_net NUMERIC;
+    ALTER TABLE scalp_trades ADD COLUMN IF NOT EXISTS base_exit TEXT;
+    ALTER TABLE scalp_trades ADD COLUMN IF NOT EXISTS base_usd NUMERIC;
+    ALTER TABLE scalp_trades ADD COLUMN IF NOT EXISTS feat JSONB;
+    ALTER TABLE scalp_trades ADD COLUMN IF NOT EXISTS gate TEXT;
+    ALTER TABLE scalp_trades ADD COLUMN IF NOT EXISTS tgt_src TEXT;
+    ALTER TABLE scalp_trades ADD COLUMN IF NOT EXISTS entry_min NUMERIC;
+    CREATE INDEX IF NOT EXISTS scalp_trades_at_idx ON scalp_trades(signal_at DESC);
+    CREATE INDEX IF NOT EXISTS scalp_trades_sym_idx ON scalp_trades(symbol, signal_at DESC);
+    CREATE TABLE IF NOT EXISTS pace_trades (
+      k TEXT PRIMARY KEY, symbol TEXT, side TEXT, bot TEXT, eng TEXT, entry_at TIMESTAMPTZ, entry NUMERIC, sl NUMERIC, tp NUMERIC,
+      features JSONB, score NUMERIC, klass TEXT, hours NUMERIC, why TEXT, late BOOLEAN DEFAULT false,
+      cp JSONB, peak_r NUMERIC, t05_min NUMERIC, t10_min NUMERIC, proof TEXT, label TEXT, closed_at TIMESTAMPTZ, exit_r NUMERIC, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS pace_trades_at_idx ON pace_trades(entry_at DESC);
     CREATE TABLE IF NOT EXISTS sentinel_log (
       id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(), symbol TEXT, side TEXT, mode TEXT, profile TEXT, event TEXT, state TEXT, score NUMERIC,
       entry NUMERIC, mark NUMERIC, old_sl NUMERIC, new_sl NUMERIC, detail TEXT
@@ -639,13 +675,17 @@ function init(deps) {
       catch (e) { console.error('[multiuser] alert routes not loaded, using defaults:', e.message); }
     }
     try {                                                // Profit Guard: saved settings and the peaks/floors of trades that were open (so a restart forgets nothing)
-      const pg = await q(`SELECT k, v FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch','sentinel','sentinel_state','guards_master','burst_brake','sn_start_0_7')`);
+      const pg = await q(`SELECT k, v FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch','sentinel','sentinel_state','guards_master','burst_brake','sn_start_0_7','swing_mgr','sw_v2912','pace_model','scalp_lane','scalp_state')`);
       for (const row of pg.rows) {
         if (row.k === 'guards_master') guardsMaster = JSON.parse(row.v).on !== false;
         else if (row.k === 'burst_brake') burstCfg = burstNorm(JSON.parse(row.v));
         else if (row.k === 'profit_guard') pgCfg = PG.normalize(JSON.parse(row.v));
         else if (row.k === 'sentinel') snCfg = SN.normalize(JSON.parse(row.v));
-        else if (row.k === 'sn_start_0_7') { /* marker only */ }
+        else if (row.k === 'sn_start_0_7' || row.k === 'sw_v2912') { /* marker only */ }
+        else if (row.k === 'swing_mgr') swCfg = SW.normalize(JSON.parse(row.v));
+        else if (row.k === 'pace_model') pcCfg = PM.normalize(JSON.parse(row.v));
+        else if (row.k === 'scalp_lane') scCfg = scNorm(JSON.parse(row.v));
+        else if (row.k === 'scalp_state') { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) scState.set(k, v); }
         else if (row.k === 'sentinel_state') { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) snState.set(k, v); }
         else if (row.k === 'profit_guard_watch') { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) pgWatch.set(k, v); }
         else { const st = JSON.parse(row.v); for (const [k, v] of Object.entries(st || {})) pgState.set(k, v); }
@@ -659,6 +699,15 @@ function init(deps) {
           if (sendAlert) Promise.resolve(sendAlert('🛡️ Sentinel: "in profit" now starts at +0.7R (was +0.3R). Between 0.3R and 0.7R an alert uses the loss-side stop instead of jumping to breakeven. Change it in the Sentinel card if you prefer.')).catch(() => {});
         }
         await q(`INSERT INTO meta(k,v) VALUES('sn_start_0_7','1') ON CONFLICT (k) DO NOTHING`);
+      }
+      if (!pg.rows.some(r => r.k === 'sw_v2912')) {   // v2.9.12: swing's own Profit Guard numbers (first lock 1.5R, 1.2% gap, one 30% partial at 1.75R), once, only if the saved swing profile is still the old default
+        const sw = pgCfg.swing;
+        if (pg.rows.some(r => r.k === 'profit_guard') && sw && sw.beR === 1 && sw.scale && sw.scale.on === false && JSON.stringify(sw.scale.steps) === '[[3,0.25]]') {
+          pgCfg = PG.normalize({ ...pgCfg, swing: { ...sw, beR: 1.5, minGapPct: 1.2, scale: { on: true, steps: [[1.75, 0.3]] } } });
+          await q(`INSERT INTO meta(k,v) VALUES('profit_guard',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(pgCfg)]);
+          console.log('[profit guard] swing profile updated to the v2.9.12 defaults (first lock 1.5R, 1.2% gap, one 30% partial at 1.75R)');
+        }
+        await q(`INSERT INTO meta(k,v) VALUES('sw_v2912','1') ON CONFLICT (k) DO NOTHING`);
       }
     } catch (e) { console.error('[multiuser] profit guard settings not loaded, it stays off:', e.message); }
     const dr = await q(`SELECT v FROM meta WHERE k='dry_run_all'`);
@@ -965,10 +1014,12 @@ function init(deps) {
   async function runLimited(items, limit, fn) {
     for (let i = 0; i < items.length; i += limit) await Promise.allSettled(items.slice(i, i + limit).map(fn));
   }
-  async function tradableUsers({ forOpen }) {
+  // LANES: every existing fan-out (orders, stops, partial closes, leverage) is the CORE lane. Scalp-lane users are a separate
+  // group and are never returned unless a caller asks for lane 'scalp' explicitly (only the scalp lane code does).
+  async function tradableUsers({ forOpen, lane = 'core' }) {
     await ready; await globalReady;
     if (forOpen && pausedAll) return [];
-    const r = await q(`SELECT * FROM users WHERE active AND key_enc IS NOT NULL AND key_status='ok' ${forOpen ? 'AND NOT paused' : ''} ORDER BY id`);
+    const r = await q(`SELECT * FROM users WHERE active AND key_enc IS NOT NULL AND key_status='ok' AND lane=$1 ${forOpen ? 'AND NOT paused' : ''} ORDER BY id`, [lane === 'scalp' ? 'scalp' : 'core']);
     return r.rows;
   }
   async function todaysPnl(userId) {
@@ -1099,6 +1150,11 @@ function init(deps) {
     }
   }
 
+  const expoCache = { at: 0, list: [] };
+  async function openSameSide(side, symbol) {   // other coins the master holds on this side right now (cached 20 s)
+    if (Date.now() - expoCache.at > 20000) { expoCache.list = await listOpenPositions(restClient); expoCache.at = Date.now(); }
+    return expoCache.list.filter(p => p.side === side && p.symbol !== symbol).length;
+  }
   async function fanOutOrder(body) {
     const o = sanitizeOrder(body);
     if (!o) { console.warn('[multiuser] fan-out skipped: order failed validation'); return; }
@@ -1111,7 +1167,13 @@ function init(deps) {
       if (!burstRecent.some(r => r.key === keyB)) {
         burst = burstFactor(burstRecent, o.symbol, o.side, nowB, burstCfg);
         burstRecent.push({ symbol: o.symbol, side: o.side, at: nowB, key: keyB });
-        if (burst.factor < 1) { burstLog.push({ at: new Date(nowB).toISOString(), symbol: o.symbol, side: o.side, n: burst.n, factor: burst.factor, mode: burst.mode }); if (burstLog.length > 60) burstLog.shift(); }
+        try {   // v2.9.12 exposure across fast + swing: the smaller of the two factors wins
+          if (burstCfg.expo && burstCfg.expo.on) {
+            const open = await openSameSide(o.side, o.symbol), fx = burstCfg.expo.factors[Math.min(open, burstCfg.expo.factors.length - 1)];
+            if (fx < burst.factor) burst = { n: burst.n, factor: fx, mode: burst.mode, expo: open };
+          }
+        } catch (e) { console.error('[multiuser] exposure check:', e.message); }
+        if (burst.factor < 1) { burstLog.push({ at: new Date(nowB).toISOString(), symbol: o.symbol, side: o.side, n: burst.n, factor: burst.factor, mode: burst.mode, ...(burst.expo !== undefined ? { sameSideOpen: burst.expo } : {}) }); if (burstLog.length > 60) burstLog.shift(); }
       }
     }
     const users = await tradableUsers({ forOpen: !reduceOnly }); // pause stops NEW trades only; closes always go through
@@ -1285,7 +1347,13 @@ function init(deps) {
       if (!closed && otMs) closed = await closedFromDb(rkey, otMs);
       // v2.9.6: the stop that is really on Bybit for this trade, only while the Profit Guard is LIVE for it and the relay is trading normally. The bot copies it
       // (tighter only) and, while it receives it, leaves stop moves to the relay instead of sending its own through the manager.
-      const slNow = (g0 && guardsMaster && PG.effMode(pgCfg, g0.profile) === 'live' && getMode() === 'live' && !breakerIsTripped() && Number(g0.curSl) > 0 && Date.now() - (g0.seenAt || Date.now()) < 120000) ? Number(g0.curSl) : 0;
+      let slNow = (g0 && guardsMaster && PG.effMode(pgCfg, g0.profile) === 'live' && getMode() === 'live' && !breakerIsTripped() && Number(g0.curSl) > 0 && Date.now() - (g0.seenAt || Date.now()) < 120000) ? Number(g0.curSl) : 0;
+      // v2.9.12: a swing trade's stop may be moved by the swing manager (live) rather than the Profit Guard: report that real stop too, so the bot's own picture follows it and never re-sends a looser one
+      const sw0 = swState.get(rkey);
+      if (sw0 && sw0.profile === 'swing' && swCfg.mode === 'live' && guardsMaster && getMode() === 'live' && !breakerIsTripped() && Number(sw0.curSl) > 0 && Date.now() - (sw0.seenAt || 0) < 120000) {
+        const swS = Number(sw0.curSl);                                     // the tighter of the two reported stops
+        if (!(slNow > 0) || (rsd === 'BUY' ? swS > slNow : swS < slNow)) slNow = swS;
+      }
       const out = { status: 200, hold };
       if (closed) out.closed = closed;
       if (slNow > 0) out.sl = slNow;
@@ -1375,7 +1443,7 @@ function init(deps) {
     for (const row of r.rows) {
       const c = await q(`UPDATE bot_msgs SET claimed_at=now() WHERE k=$1 AND sent_at IS NULL AND (claimed_at IS NULL OR claimed_at < now() - interval '40 seconds') RETURNING *`, [row.k]);
       const m = c.rows[0]; if (!m) continue;
-      let res; try { res = await deliverAlert(m.text, { html: true, priv: m.priv, email: m.kind === 'daily', cat: catOfMsg(m) }); } catch (e) { res = { ok: false, configured: true }; }
+      let res; try { res = await deliverAlert(await pcAlertText(m), { html: true, priv: m.priv, email: m.kind === 'daily', cat: catOfMsg(m) }); } catch (e) { res = { ok: false, configured: true }; }
       if (res && res.ok) { sent++; await q(`UPDATE bot_msgs SET sent_at=now(), last_result=$2 WHERE k=$1`, [m.k, [res.telegram && 'telegram ' + res.telegram, res.email && res.email !== 'off' && 'email ' + res.email].filter(Boolean).join(', ')]); continue; }
       const cfgd = !(res && res.configured === false);
       await q(`UPDATE bot_msgs SET claimed_at=NULL, tries=tries+$2, last_result=$3 WHERE k=$1`, [m.k, cfgd ? 1 : 0, res ? [res.telegram, res.email].filter(x => x && x !== 'off').join(', ') || 'not configured' : 'failed']);
@@ -1601,9 +1669,25 @@ function init(deps) {
     } catch (e) { console.error('[multiuser] profit guard state:', e.message); }
   }
   // Which profile a trade follows, and the stop the bot originally planned for it (from what the bot reported when it opened the trade).
-  async function pgLookup(symbol, side) {
+  // v2.9.14: the Profit Guard, the Sentinel and the Swing Manager each read the positions at the start of their own pass and may write a stop a second or two later. Without a check the last one to write wins,
+  // even when it is LOOSER than a stop another one has just set. This reads the real stop on Bybit right before writing and refuses anything that is not tighter (and reads the real size before a close).
+  async function freshPos(symbol, side, positionIdx) {
+    try {
+      const r = await restClient.getPositionInfo({ category: 'linear', symbol });
+      if (r.retCode !== 0) return null;
+      const list = (r.result && r.result.list || []).filter(x => parseFloat(x.size) > 0 && x.side === side);
+      const hit = list.find(x => (Number(x.positionIdx) || 0) === (Number(positionIdx) || 0)) || list[0];
+      return hit ? { size: parseFloat(hit.size), stopLoss: parseFloat(hit.stopLoss) || 0 } : { size: 0, stopLoss: 0 };
+    } catch { return null; }
+  }
+  async function stopWrite(side, body) {   // -> { res } when written, { skipped: true, cur } when the real stop is already as tight or tighter
+    const fp = await freshPos(body.symbol, side, body.positionIdx), nw = Number(body.stopLoss);
+    if (fp && fp.size > 0 && fp.stopLoss > 0 && nw > 0 && (side === 'Buy' ? nw <= fp.stopLoss : nw >= fp.stopLoss)) return { skipped: true, cur: fp.stopLoss };
+    return { res: await restClient.setTradingStop(body) };
+  }
+  async function pgLookup(symbol, side, peek) {   // peek = true: read the plan without using it up (only the Profit Guard uses a re-entry plan up; the Sentinel, Swing Manager and Pace tracker just look)
     const pl = pgPlanned.get(symbol + '|' + side);
-    if (pl && Date.now() - pl.at < 600000) { pgPlanned.delete(symbol + '|' + side); return { bot: pl.bot, sl: pl.sl, eng: pl.eng, reentry: true, score: pl.score, src: pl.src }; }
+    if (pl && Date.now() - pl.at < 600000) { if (!peek) pgPlanned.delete(symbol + '|' + side); return { bot: pl.bot, sl: pl.sl, eng: pl.eng, reentry: true, score: pl.score, src: pl.src }; }
     try {
       const r = await q(`SELECT bot, sl, eng FROM signals WHERE symbol=$1 AND side=$2 AND opened_at > now() - interval '30 days' ORDER BY opened_at DESC LIMIT 1`, [symbol, side === 'Buy' ? 'BUY' : 'SELL']);
       const x = r.rows[0]; if (!x) return { bot: '', sl: 0, eng: null };
@@ -1839,7 +1923,7 @@ function init(deps) {
         st.rev = rvNow ? { urg: rvNow.urg, t: rvNow.t } : null;
         if ((pgCfg.smart.adapt && pgCfg.smart.adapt.on) || (pgCfg.smart.curve && pgCfg.smart.curve.on)) {
           try {
-            const bars = await snBars(symbol), btcRaw = await snBtcMove();
+            const bars = st.profile === 'swing' ? await swBars(symbol, '60', 40, 900000).catch(() => snBars(symbol)) : await snBars(symbol), btcRaw = await snBtcMove();   // v2.9.12: a swing trade's pace is read from hourly candles
             const risk0 = st.initialSl > 0 ? Math.abs(entry - st.initialSl) : 0, peakD0 = long ? st.peak - entry : entry - st.peak, peakR0 = risk0 > 0 ? Math.max(0, peakD0 / risk0) : 0;
             const btcDir = long ? btcRaw : -btcRaw;
             adaptNow = PG.adaptOf(pgCfg, { atr: SN.atrOf(bars), btcPct: btcDir, peakR: peakR0, maxPull: st.maxPull });
@@ -1895,7 +1979,7 @@ function init(deps) {
         // live: move the master's real stop, then the copies' stops
         const body = { category: 'linear', symbol, positionIdx: Number(p.positionIdx) || 0, stopLoss: String(d.newSl) };
         let res;
-        try { res = await restClient.setTradingStop(body); }
+        try { const w = await stopWrite(side, body); if (w.skipped) { st.floor = Math.max(st.floor || 0, 0); st.curSl = w.cur; await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'skipped', entry, mark, oldSl: w.cur, newSl: d.newSl, peakR: d.peakR, detail: 'the stop on Bybit is already ' + w.cur + ' (as tight or tighter than ' + d.newSl + '): left alone' }); continue; } res = w.res; }
         catch (e) { await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'failed', entry, mark, oldSl: curSl || null, newSl: d.newSl, peakR: d.peakR, detail: 'Bybit call failed: ' + (e.message || e) }); continue; }
         if (res.retCode !== 0 && res.retCode !== 34040) { await pgLog({ symbol, side, profile: st.profile, mode: em, event: 'failed', entry, mark, oldSl: curSl || null, newSl: d.newSl, peakR: d.peakR, detail: 'Bybit refused: ' + (res.retMsg || res.retCode) }); continue; }
         st.floor = d.newSl; st.curSl = d.newSl; st.dirty = true; pgRun.raises++; pgForce = true;
@@ -1911,7 +1995,7 @@ function init(deps) {
       for (const [key, st] of [...pgState.entries()]) {
         if (seen.has(key)) continue;
         pgClosing.push({ key, st, em: st.em || pgEm(st), at: Date.now(), tries: 0, mark: st.mark });
-        pgState.delete(key); gone = true;
+        pgState.delete(key); swFloor.delete(key); swState.delete(key); gone = true;
       }
       for (let i = 0; i < pgClosing.length;) { if (await pgRecordClose(pgClosing[i]).catch(() => false)) { pgClosing.splice(i, 1); gone = true; } else i++; }
       // re-entry watches (recording only: this never places a trade)
@@ -2007,6 +2091,417 @@ function init(deps) {
     } catch (e) { console.error('[multiuser] sentinel scorecard:', e.message); }
     return true;
   }
+  // ---- SWING MANAGER (v2.9.12) -------------------------------------------------------------------------------------------------------------------------
+  // Swing trades live for days. This reads them on hours-and-days evidence (closed 4h candles, hourly ranges) instead of the seconds-and-minutes reads of the fast engines:
+  // breakeven only after a CLOSED 4h candle held +holdR, a thesis exit when a closed 4h candle shows the setup has failed, a time rule for trades that go nowhere.
+  // Default mode is SHADOW (it only records what it would do). The real stop on Bybit is never removed.
+  const swState = new Map();   // 'SYMBOL|Side' -> { profile, entry, initialSl, entryAt, peak, logged }
+  const swFloor = new Map();   // 'SYMBOL|Side' -> the stop the manager set (live)
+  const swRun = { at: 0, ok: null, err: null, busy: false, raised: 0, exits: 0, note: '' };
+  const swBarCache = new Map();
+  async function swBars(symbol, interval, limit, ttlMs) {
+    const k = symbol + '|' + interval, hit = swBarCache.get(k);
+    if (hit && Date.now() - hit.at < ttlMs) return hit.bars;
+    const r = await restClient.getKline({ category: 'linear', symbol, interval, limit });
+    if (r.retCode !== 0) throw new Error('kline ' + (r.retMsg || r.retCode));
+    const bars = snBarsFrom(r.result && r.result.list);
+    swBarCache.set(k, { at: Date.now(), bars });
+    if (swBarCache.size > 120) for (const [kk, vv] of swBarCache) if (Date.now() - vv.at > 3600000) swBarCache.delete(kk);
+    return bars;
+  }
+  const swLog = row => pgLog({ ...row, profile: 'swing', mode: row.mode || swCfg.mode });
+  async function swTick() {
+    if (swRun.busy || swCfg.mode === 'off') return;
+    if (!guardsMaster) { swRun.note = 'master switch is off: trades run on their own stops'; return; }
+    if (getMode() !== 'live' || breakerIsTripped()) { swRun.note = 'paused: the relay is not live or trading is halted'; return; }
+    swRun.busy = true;
+    try {
+      await ready;
+      const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
+      for (const p of positions) {
+        if (p.side !== 'Buy' && p.side !== 'Sell') continue;
+        const symbol = p.symbol, side = p.side, key = symbol + '|' + side, long = side === 'Buy'; seen.add(key);
+        const entry = parseFloat(p.avgPrice), mark = parseFloat(p.markPrice), curSl = parseFloat(p.stopLoss) || 0;
+        if (!(entry > 0) || !(mark > 0)) continue;
+        let st = swState.get(key);
+        if (st && Math.abs(st.entry - entry) / st.entry > 0.005) st = null;
+        if (!st) {
+          const lk = await pgLookup(symbol, side, true);
+          let init = lk.sl > 0 && (long ? lk.sl < entry : lk.sl > entry) ? lk.sl : 0;
+          if (!init && curSl > 0 && (long ? curSl < entry : curSl > entry)) init = curSl;
+          st = { profile: PG.profileOf(pgCfg, lk.eng, lk.bot), entry, initialSl: init, entryAt: Number(p.createdTime) > 0 ? Number(p.createdTime) : now, peak: entry, logged: {} };
+          swState.set(key, st);
+        }
+        if (st.profile !== 'swing') continue;
+        st.peak = long ? Math.max(st.peak, mark) : Math.min(st.peak, mark);
+        const g0 = pgState.get(key); if (g0 && g0.peak > 0) st.peak = long ? Math.max(st.peak, g0.peak) : Math.min(st.peak, g0.peak);
+        st.mark = mark; st.curSl = curSl; st.seenAt = now;
+        const risk = st.initialSl > 0 ? Math.abs(entry - st.initialSl) : 0, peakR = risk > 0 ? Math.max(0, (long ? st.peak - entry : entry - st.peak) / risk) : 0;
+        st.peakR = peakR; st.nowR = risk > 0 ? (long ? mark - entry : entry - mark) / risk : null;
+        let bars4h;
+        try { bars4h = await swBars(symbol, '240', 12, 300000); } catch (e) { st.why = 'no 4h candles: ' + e.message; continue; }
+        const inst = await getInstrument(symbol).catch(() => null);
+        const inp = { side, entry, initialSl: st.initialSl, curSl, mark, peakR, now, entryAt: st.entryAt, bars4h, tick: inst && inst.tickSize || 0, cfg: swCfg };
+        const th = SW.thesis(inp), tm = SW.timeRule(inp), be = SW.breakeven(inp);
+        const base = { symbol, side, entry, mark, peakR };
+        const act = async (kind, d) => {   // one decision: shadow records it once per trade and kind, live does it
+          if (swCfg.mode === 'shadow') {
+            const sig = kind + ':' + (d.newSl || '');
+            if (st.logged[sig]) return;
+            st.logged[sig] = 1;
+            await swLog({ ...base, mode: 'shadow', event: 'would_' + kind, newSl: d.newSl || null, oldSl: curSl || null, detail: d.label || d.why });
+            return;
+          }
+          if (d.action === 'exit') {
+            const opp = long ? 'Sell' : 'Buy', pos = Number(p.positionIdx) || 0, fp = await freshPos(symbol, side, pos), size = String(fp && fp.size > 0 ? fp.size : p.size);   // the real size right now (a scale-out may have just reduced it)
+            if (fp && fp.size === 0) return;                                                // already closed
+            let res = null, err = null;
+            try { res = await restClient.submitOrder({ category: 'linear', symbol, side: opp, orderType: 'Market', qty: size, reduceOnly: true, positionIdx: pos }); } catch (e) { err = e.message || String(e); }
+            if (res && res.retCode === 0) {
+              swRun.exits++;
+              await swLog({ ...base, mode: 'live', event: 'sw_' + kind, detail: d.why });
+              fanOutOrder({ symbol, side: opp, orderType: 'Market', qty: size, reduceOnly: true, positionIdx: pos }).catch(e => console.error('[multiuser] swing exit fan-out:', e.message));
+              deliverAlert('🧭 Swing exit (' + (kind === 'thesis' ? 'thesis' : 'time rule') + '): ' + symbol.replace(/USDT$/, '') + ' ' + (long ? 'long' : 'short') + ' closed. ' + d.why, { cat: 'updates' }).catch(() => {});
+            } else await swLog({ ...base, mode: 'live', event: 'failed', detail: 'swing ' + kind + ' exit: ' + (err || (res && res.retMsg) || 'no answer') });
+            return;
+          }
+          if (st.lastMoveAt && now - st.lastMoveAt < 60000) return;
+          let res = null;
+          try { const w = await stopWrite(side, { category: 'linear', symbol, positionIdx: Number(p.positionIdx) || 0, stopLoss: String(d.newSl) }); if (w.skipped) { st.lastMoveAt = now; st.curSl = w.cur; await swLog({ ...base, mode: 'live', event: 'skipped', oldSl: w.cur, newSl: d.newSl, detail: 'the stop on Bybit is already ' + w.cur + ' (as tight or tighter than ' + d.newSl + '): left alone' }); return; } res = w.res; }
+          catch (e) { st.lastMoveAt = now; await swLog({ ...base, mode: 'live', event: 'failed', oldSl: curSl || null, newSl: d.newSl, detail: 'Bybit call failed: ' + (e.message || e) }); return; }
+          if (res.retCode !== 0 && res.retCode !== 34040) { st.lastMoveAt = now; await swLog({ ...base, mode: 'live', event: 'failed', oldSl: curSl || null, newSl: d.newSl, detail: 'Bybit refused: ' + (res.retMsg || res.retCode) }); return; }
+          st.lastMoveAt = now; swRun.raised++; swFloor.set(key, d.newSl);
+          await swLog({ ...base, mode: 'live', event: 'sw_' + kind, oldSl: curSl || null, newSl: d.newSl, detail: d.label });
+          fanOutTradingStop({ symbol, positionIdx: Number(p.positionIdx) || 0, stopLoss: String(d.newSl) }).catch(e => console.error('[multiuser] swing stop fan-out:', e.message));
+        };
+        if (th.action === 'exit') { st.why = th.why; await act('thesis', th); continue; }
+        if (tm.action === 'exit') { st.why = tm.why; await act('time', tm); continue; }
+        const cand = [['time', tm], ['breakeven', be]].filter(([, d]) => d.action === 'raise').sort((a, b) => (long ? b[1].newSl - a[1].newSl : a[1].newSl - b[1].newSl))[0];
+        if (cand) { st.why = cand[1].label; await act(cand[0], cand[1]); }
+        else st.why = be.why === 'breakeven rule is off' ? th.why : be.why;
+      }
+      for (const key of [...swState.keys()]) if (!seen.has(key)) { swState.delete(key); swFloor.delete(key); }
+      swRun.at = Date.now(); swRun.ok = true; swRun.err = null; swRun.note = '';
+    } catch (e) { swRun.at = Date.now(); swRun.ok = false; swRun.err = e.message; console.error('[multiuser] swing manager:', e.message); }
+    finally { swRun.busy = false; }
+  }
+  async function swView() {
+    const trades = [...swState.entries()].filter(([, st]) => st.profile === 'swing').map(([key, st]) => ({ symbol: key.split('|')[0], side: key.split('|')[1], entry: st.entry, mark: st.mark || null, nowR: st.nowR ?? null, peakR: st.peakR || 0, curSl: st.curSl || null, floor: swFloor.get(key) || null, ageH: Math.round((Date.now() - st.entryAt) / 360000) / 10, why: st.why || '' }));
+    const log = (await q(`SELECT at, symbol, side, mode, event, entry, mark, old_sl, new_sl, detail FROM profit_guard_log WHERE profile='swing' AND (event LIKE 'would\\_%' ESCAPE '\\' OR event LIKE 'sw\\_%' ESCAPE '\\') ORDER BY id DESC LIMIT 30`)).rows;
+    return { cfg: swCfg, run: { at: swRun.at, ok: swRun.ok, err: swRun.err, note: swRun.note, raised: swRun.raised, exits: swRun.exits }, trades, log };
+  }
+  // ===== PACE MODEL (v2.9.13) =====
+  // Which calls run fast (hours) and which are slow (days)? At signal time the relay scores the call (stop distance in hourly ranges, speed now, volume, move already used, BTC) and shows
+  // one line on the entry alert. After entry it records the R really made by 15/30/60/120/240 min and labels the trade FAST / NORMAL / SLOW afterwards, so the score can be checked against
+  // what happened. SHADOW by default: it records and shows, it never changes a trade. 'alert' mode also sends one Telegram note when a trade proves slow.
+  const pcPre = new Map();     // 'SYMBOL|Side' -> { at, entry, sl, f, sc }   (signal-time reading, reused by the alert line and the tracker)
+  const pcState = new Map();   // 'SYMBOL|Side' -> the open trade being tracked
+  const pcRun = { at: 0, ok: null, err: null, busy: false, note: '' };
+  let pcHist = { at: 0, rows: [] };
+  let pcCal = { at: 0, cal: null, busy: false };   // v2.9.14: observed durations by group (history + the live-recorded trades), refreshed in the background every 10 min
+  const PC_CPS = [15, 30, 60, 120, 240];
+  async function pcCompute(symbol, side, entry, sl) {
+    const key = symbol + '|' + side, hit = pcPre.get(key);
+    if (hit && Date.now() - hit.at < 1800000 && Math.abs(hit.entry - entry) / entry < 0.005 && Math.abs(hit.sl - sl) / sl < 0.005) return hit;
+    const [m1, h1, btc] = await Promise.all([snBars(symbol).catch(() => []), swBars(symbol, '60', 40, 900000).catch(() => []), snBtcMove().catch(() => NaN)]);
+    const f = PM.features({ side, entry, sl, bars1m: m1, bars1h: h1, btcPct: btc });
+    const out = { at: Date.now(), entry, sl, f, sc: f ? PM.score(f, pcCfg) : null };
+    if (out.sc) { pcPre.set(key, out); if (pcPre.size > 100) for (const [k2, v2] of pcPre) if (Date.now() - v2.at > 3600000) pcPre.delete(k2); }
+    return out;
+  }
+  async function pcCalRefresh() {
+    if (pcCal.busy) return; pcCal.busy = true;
+    try {
+      const hist = await pcHistory().catch(() => []);
+      const live = (await q(`SELECT features, t10_min, label, EXTRACT(EPOCH FROM (closed_at - entry_at))/60 AS life FROM pace_trades WHERE closed_at IS NOT NULL AND label IS NOT NULL ORDER BY entry_at DESC LIMIT 600`)).rows
+        .map(r => ({ stopPct: Number((r.features || {}).stopPct), stopAtr: (r.features || {}).stopAtr === undefined ? null : Number(r.features.stopAtr), t10Min: r.t10_min === null ? null : Number(r.t10_min), lifeMin: Number(r.life), closed: true }));
+      const rows = hist.map(h => ({ stopPct: h.stopPct, stopAtr: null, t10Min: h.t10Min, lifeMin: h.lifeMin, closed: true })).concat(live);
+      pcCal = { at: Date.now(), cal: PM.calibrate(rows), busy: false };
+    } catch (e) { pcCal.busy = false; pcCal.at = Date.now() - 480000; console.error('[multiuser] pace calibration:', e.message); }
+  }
+  const pcEstimate = (f, sc) => { if (Date.now() - pcCal.at > 600000 && !pcCal.busy) pcCalRefresh(); return PM.estimate(f, pcCal.cal, sc); };
+  // The line for the bot's entry alert. The text is the bot's own; entry, stop and direction are read back out of it. Any problem = no line (the alert is never held up for long).
+  async function pcAlertText(m) {
+    if (!m || m.kind !== 'entry' || pcCfg.mode === 'off' || /Pace\s+(FAST|NORMAL|SLOW)/.test(m.text)) return m && m.text;
+    try {
+      const plain = stripTags(m.text), num = re => { const x = re.exec(plain); return x ? parseFloat(x[1]) : NaN; };
+      const entry = num(/Entry\s+\$?([0-9.]+)/), sl = num(/Stop\s+\$?([0-9.]+)/), symbol = String(m.sym || '').toUpperCase();
+      const side = /\bSHORT\b/.test(plain) ? 'Sell' : /\bLONG\b/.test(plain) ? 'Buy' : '';
+      if (!(entry > 0) || !(sl > 0) || !side || !SYMBOL_RE.test(symbol)) return m.text;
+      const r = await Promise.race([pcCompute(symbol, side, entry, sl), new Promise((_, rej) => setTimeout(() => rej(new Error('slow')), 2500))]);
+      const line = r && r.sc ? PM.lineOfEst(r.sc, pcEstimate(r.f, r.sc)) : '';
+      if (!line) return m.text;
+      return /<\/pre>\s*$/.test(m.text) ? m.text.replace(/<\/pre>\s*$/, '\n' + line + '</pre>') : m.text + '\n' + line;
+    } catch { return m.text; }
+  }
+  async function pcSave(st, closed) {
+    const peakR = st.peakR || 0;
+    await q(`INSERT INTO pace_trades(k,symbol,side,bot,eng,entry_at,entry,sl,tp,features,score,klass,hours,why,late,cp,peak_r,t05_min,t10_min,proof,label,closed_at,exit_r,updated_at)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,now())
+             ON CONFLICT (k) DO UPDATE SET cp=EXCLUDED.cp, peak_r=EXCLUDED.peak_r, t05_min=EXCLUDED.t05_min, t10_min=EXCLUDED.t10_min, proof=EXCLUDED.proof, label=EXCLUDED.label, closed_at=EXCLUDED.closed_at, exit_r=EXCLUDED.exit_r, updated_at=now()`,
+      [st.k, st.symbol, st.side, st.bot || '', st.eng || null, new Date(st.entryAt), st.entry, st.sl, st.tp || null, st.f ? JSON.stringify(st.f) : null, st.sc ? st.sc.score : null, st.sc ? st.sc.klass : null, st.sc ? st.sc.hours : null,
+       st.sc ? st.sc.why.join('; ').slice(0, 600) : null, !!st.late, JSON.stringify(st.cp || {}), Math.round(peakR * 100) / 100, st.t05, st.t10, st.proof ? st.proof.state : null, closed ? closed.label : null, closed ? new Date() : null, closed && closed.exitR !== null ? closed.exitR : null]);
+  }
+
+  // ===================== SCALP LANE (v2.9.15, smarter in v2.9.16) =====================
+  // SHADOW ONLY. For every call the master opens, record the price every few seconds for SC_TRACK_MIN minutes, then replay the scalp rules
+  // on that path (SC.simulate). No order is ever sent for the scalp lane in this version; the ledger and the Lab are the evidence for
+  // deciding whether it should ever go live. v2.9.16 adds, per call: a target picked from the coin's own recorded history, leverage worked
+  // out from the stop distance and the loss you accept, trailing / stall exits, quality gates and portfolio guards. Every call is also
+  // replayed with the plain v2.9.15 rules (fixed target, fixed leverage) so the card shows whether the smarter parts really help.
+  // It reads positions and prices only. It never writes stops, never touches users, and does not depend on PG / Sentinel / Swing / Pace.
+  const scalpSignupOpen = () => process.env.SCALP_SIGNUP_OPEN === '1';   // v2.9.16: scalp sign-up and scalp invites stay CLOSED until you set SCALP_SIGNUP_OPEN=1 on Render
+  const SCALP_MAX_TRADE_USD = Math.max(10, Number(process.env.SCALP_MAX_TRADE_USD) || 10000);   // scalp accounts are funded for size: their own ceiling, not the $500 core cap
+  const SC_TRACK_MIN = 50;                     // covers the longest confirm window + time stop the Lab tries
+  const scState = new Map();                   // k -> { k, symbol, side, bot, eng, signalPx, signalAt, klass, score, target, baseTarget, lev, plan, feat, cfg, path:[[sec, price]], lastAt }
+  const scSeen = new Set();                    // keys already registered or stored (this process)
+  const scRun = { at: 0, ok: null, err: null, busy: false, note: '', lastDisc: 0, lastSave: 0, tick: 0 };
+  const scTgt = { at: 0, v: null };
+  const scGrp = new Map();                     // symbol -> { at, rows } recorded paths of that coin; '*' = all coins
+  async function scTarget() {
+    if (scTgt.v && Date.now() - scTgt.at < 600000) return scTgt.v;
+    let w = [];
+    try { w = (await q(`SELECT peak_pct FROM pg_trades WHERE at > now() - interval '14 days' AND exit_pct > 0 AND peak_pct > 0 ORDER BY at DESC LIMIT 400`)).rows.map(r => Number(r.peak_pct)); } catch { /* fallback target */ }
+    scTgt.v = SC.targetPct(w, scCfg); scTgt.at = Date.now();
+    return scTgt.v;
+  }
+  // step 3 = keep every third point (about 15 s apart) for the target picker so the cache stays small; the Lab uses every point
+  const scPathRows = (rs, step = 1) => rs.filter(r => Array.isArray(r.path) && r.path.length > 2).map(r => ({ side: r.side, signalPx: Number(r.signal_px), ts: new Date(r.signal_at).getTime(), path: r.path.filter((x, i, a) => step === 1 || i % step === 0 || i === a.length - 1).map(x => ({ t: x[0] * 1000, p: x[1] })) }));
+  async function scGroup(symbol) {
+    const hit = scGrp.get(symbol);
+    if (hit && Date.now() - hit.at < 600000) return hit.rows;
+    let rows = scPathRows((await q(`SELECT side, signal_px, signal_at, path FROM scalp_trades WHERE symbol=$1 AND signal_at > now() - interval '30 days' AND path IS NOT NULL ORDER BY signal_at DESC LIMIT 120`, [symbol])).rows, 3);
+    let src = symbol;
+    if (rows.length < scCfg.minGroupRows) {
+      const all = scGrp.get('*');
+      if (all && Date.now() - all.at < 600000) rows = all.rows;
+      else { rows = scPathRows((await q(`SELECT side, signal_px, signal_at, path FROM scalp_trades WHERE signal_at > now() - interval '30 days' AND path IS NOT NULL ORDER BY signal_at DESC LIMIT 200`)).rows, 3); scGrp.set('*', { at: Date.now(), rows }); }
+      src = '*';
+    }
+    const out = { rows, src }; scGrp.set(symbol, { at: Date.now(), rows: out.rows, src });
+    if (scGrp.size > 8) for (const k of scGrp.keys()) { if (k !== '*' && k !== symbol) { scGrp.delete(k); break; } }   // keep memory small: at most 8 cached groups
+    return out.rows;
+  }
+  // the plan for one call: target (from the coin's history, else all coins, else the winners rule) and the leverage that follows from its stop
+  async function scPlan(symbol) {
+    const tg = await scTarget();
+    const rows = await scGroup(symbol);
+    const bt = SC.bestTarget(rows, { ...scCfg, fallbackTargetPct: tg.pct });
+    const stopPct = bt.pct * scCfg.stopFrac, lv = SC.leverageFor(stopPct, scCfg);
+    return { target: bt.pct, baseTarget: tg.pct, tgtSrc: bt.source === 'group' ? ((scGrp.get(symbol) || {}).src === symbol ? 'coin' : 'all coins') : tg.source, n: bt.n, skip: !!bt.skip, why: bt.why || null, lev: lv.lev, limitedBy: lv.limitedBy };
+  }
+  function scPathPts(st) { return (st.path || []).map(x => ({ t: x[0] * 1000, p: x[1] })); }
+  function scSim(st, cfg) { return SC.simulate(scPathPts(st), st.side, st.signalPx, cfg || st.cfg || scCfg, { target: st.target }); }
+  async function scSaveState(force) {
+    if (!force && Date.now() - scRun.lastSave < 180000) return;
+    scRun.lastSave = Date.now();
+    const o = {}; for (const [k, v] of scState.entries()) o[k] = v;
+    await q(`INSERT INTO meta(k,v) VALUES('scalp_state',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(o)]).catch(() => {});
+  }
+  async function scFinish(st) {
+    let klass = st.klass, score = st.score, feat = { ...(st.feat || {}) };
+    try {
+      const r = (await q(`SELECT klass, score, features FROM pace_trades WHERE k=$1`, [st.k])).rows[0];
+      if (r) { if (!klass && r.klass) { klass = r.klass; score = Number(r.score); } if (r.features && r.features.movedAtr !== undefined && feat.movedAtr === undefined) feat.movedAtr = Number(r.features.movedAtr); }
+    } catch { /* unknown class */ }
+    const cfg = st.cfg || scCfg, sim = scSim(st, cfg);
+    const baseCfg = { ...cfg, ...SC.styleOf('fixed', cfg) };
+    const base = SC.simulate(scPathPts(st), st.side, st.signalPx, baseCfg, { target: st.baseTarget || st.target });
+    const inst = SC.simulate(scPathPts(st), st.side, st.signalPx, { ...baseCfg, instant: true }, { target: st.baseTarget || st.target });
+    const lev = st.lev || cfg.leverage;
+    const usd = sim.entered ? SC.usdOf(sim.netPct, cfg, cfg.shadowUsd, lev) : null;
+    const baseUsd = base.entered ? SC.usdOf(base.netPct, cfg, cfg.shadowUsd, cfg.leverage) : null;
+    const gate = !sim.entered ? null : (st.plan && st.plan.skip ? 'no edge for this coin' : SC.gateCheck(feat, sim.entryT / 60000, klass, cfg));
+    await q(`INSERT INTO scalp_trades(k,symbol,side,bot,eng,klass,score,signal_px,signal_at,target,entered,reason,exit,gross_pct,net_pct,usd,mfe,mae,held_min,inst_exit,inst_net,path,cfg,lev,base_net,base_exit,base_usd,feat,gate,tgt_src,entry_min)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31) ON CONFLICT (k) DO NOTHING`,
+      [st.k, st.symbol, st.side, st.bot || null, st.eng || null, klass || null, score ?? null, st.signalPx, new Date(st.signalAt), st.target, !!sim.entered, sim.reason || null, sim.exit || null,
+       sim.entered ? sim.grossPct : null, sim.entered ? sim.netPct : null, usd, sim.entered ? sim.mfePct : null, sim.entered ? sim.maePct : null, sim.entered ? sim.heldMin : null,
+       inst.entered ? inst.exit : null, inst.entered ? inst.netPct : null, JSON.stringify(st.path || []), JSON.stringify(cfg), lev,
+       base.entered ? base.netPct : null, base.entered ? base.exit : null, baseUsd, JSON.stringify(feat), gate, st.plan ? st.plan.tgtSrc : null, sim.entered ? Math.round(sim.entryT / 600) / 100 : null]);
+  }
+  async function scTick() {
+    if (scCfg.mode === 'off' || scRun.busy) return;
+    if (getMode() !== 'live') { scRun.note = 'paper mode: nothing is open on Bybit'; return; }
+    scRun.busy = true; scRun.tick++;
+    try {
+      await ready;
+      const now = Date.now();
+      // 1. find new calls the master has just opened (every 10 s)
+      if (now - scRun.lastDisc >= 10000) {
+        scRun.lastDisc = now;
+        const positions = await listOpenPositions(restClient);
+        for (const p of positions) {
+          if (p.side !== 'Buy' && p.side !== 'Sell') continue;
+          const entry = parseFloat(p.avgPrice), created = Number(p.createdTime) > 0 ? Number(p.createdTime) : now;
+          if (!(entry > 0) || now - created > 180000) continue;            // only fresh calls: a position found late would have a wrong starting point
+          const key = p.symbol + '|' + p.side, k = key + '|' + Math.floor(created / 1000);
+          if (scSeen.has(k) || scState.has(k)) continue;
+          scSeen.add(k); if (scSeen.size > 2000) scSeen.delete(scSeen.values().next().value);
+          const done = await q(`SELECT 1 FROM scalp_trades WHERE k=$1`, [k]);
+          if (done.rows[0] || scState.size >= 40) continue;
+          const lk = await pgLookup(p.symbol, p.side, true).catch(() => ({}));
+          const plan = await scPlan(p.symbol).catch(() => null) || { target: scCfg.fallbackTargetPct, baseTarget: scCfg.fallbackTargetPct, tgtSrc: 'default', n: 0, skip: false, lev: SC.leverageFor(scCfg.fallbackTargetPct * scCfg.stopFrac, scCfg).lev };
+          scState.set(k, { k, symbol: p.symbol, side: p.side, bot: lk.bot || null, eng: lk.eng || null, signalPx: entry, signalAt: created, klass: null, score: null, target: plan.target, baseTarget: plan.baseTarget, lev: plan.lev, plan, feat: null, cfg: { ...scCfg }, path: [[0, entry]], lastAt: now });
+        }
+      }
+      // 2. one price call for every watched symbol, then record a point each
+      if (scState.size) {
+        const r = await restClient.getTickers({ category: 'linear' });
+        const px = new Map(); for (const t of (r.result.list || [])) { const v = parseFloat(t.lastPrice); if (v > 0) px.set(t.symbol, { v, t }); }
+        for (const [k, st] of [...scState.entries()]) {
+          const age = now - st.signalAt;
+          const pc = pcState.get(st.symbol + '|' + st.side);
+          if (!st.klass && pc && pc.sc && pc.sc.klass) { st.klass = pc.sc.klass; st.score = pc.sc.score; }
+          const tk = px.get(st.symbol);
+          if (tk && !st.feat) {            // quality facts, read once at the start: how wide the bid/ask gap is and how thin the coin is
+            const bid = parseFloat(tk.t.bid1Price), ask = parseFloat(tk.t.ask1Price), tov = parseFloat(tk.t.turnover24h);
+            st.feat = { spreadPct: bid > 0 && ask > 0 ? Math.round((ask - bid) / ((ask + bid) / 2) * 1e5) / 1e3 : null, turnoverUsd: tov > 0 ? tov : null };
+            if (pc && pc.f && pc.f.movedAtr !== undefined) st.feat.movedAtr = Number(pc.f.movedAtr);
+          }
+          if (tk && now - st.lastAt >= 4000 && age < SC_TRACK_MIN * 60000) { st.path.push([Math.round(age / 100) / 10, tk.v]); st.lastAt = now; }
+          if (age >= SC_TRACK_MIN * 60000) {
+            try { await scFinish(st); scState.delete(k); } catch (e) { st.fails = (st.fails || 0) + 1; if (st.fails > 5) scState.delete(k); console.error('[multiuser] scalp finish:', e.message); }
+          }
+        }
+      }
+      await scSaveState(false);
+      scRun.at = now; scRun.ok = true; scRun.err = null; scRun.note = scState.size + ' call' + (scState.size === 1 ? '' : 's') + ' being watched';
+    } catch (e) { scRun.ok = false; scRun.err = e.message; throw e; }
+    finally { scRun.busy = false; }
+  }
+  const scN = v => v === null || v === undefined ? null : Number(v);
+  const scRows = rs => rs.map(r => ({ k: r.k, symbol: r.symbol, side: r.side, klass: r.klass, at: r.signal_at, target: scN(r.target), lev: scN(r.lev), entered: r.entered, reason: r.reason, exit: r.exit, net: scN(r.net_pct), usd: scN(r.usd), baseNet: scN(r.base_net), baseUsd: scN(r.base_usd), gate: r.gate, src: r.tgt_src, mfe: scN(r.mfe), mae: scN(r.mae), heldMin: scN(r.held_min), instNet: scN(r.inst_net), instExit: r.inst_exit }));
+  async function scView(withLab) {
+    const cols = withLab ? '*' : 'k,symbol,side,bot,eng,klass,score,signal_px,signal_at,target,entered,reason,exit,gross_pct,net_pct,usd,mfe,mae,held_min,inst_exit,inst_net,lev,base_net,base_exit,base_usd,feat,gate,tgt_src,entry_min';
+    const all = (await q(`SELECT ${cols} FROM scalp_trades WHERE signal_at > now() - interval '60 days' ORDER BY signal_at DESC LIMIT 600`)).rows;
+    const entered = all.filter(r => r.entered);
+    const tsOf = r => new Date(r.signal_at).getTime();
+    const mkTrade = r => ({ netPct: Number(r.net_pct), exit: r.exit, ts: tsOf(r), klass: r.klass });
+    const sumUsd = rs => Math.round(rs.reduce((a, r) => a + (Number(r.usd) || 0), 0) * 100) / 100;
+    const smartAll = SC.summarize(entered.map(mkTrade));
+    const passed = entered.filter(r => !r.gate);
+    const pf = SC.portfolio(passed.map(r => ({ startMs: tsOf(r) + (Number(r.entry_min) || 0) * 60000, endMs: tsOf(r) + ((Number(r.entry_min) || 0) + (Number(r.held_min) || 0)) * 60000, side: r.side, usd: Number(r.usd) || 0, r })), scCfg);
+    const smart = SC.summarize(pf.accepted.map(x => mkTrade(x.r)));
+    const base = SC.summarize(all.filter(r => r.base_net !== null).map(r => ({ netPct: Number(r.base_net), exit: r.base_exit, ts: tsOf(r) })));
+    const inst = SC.summarize(all.filter(r => r.inst_net !== null).map(r => ({ netPct: Number(r.inst_net), exit: r.inst_exit, ts: tsOf(r) })));
+    const byClass = {}; for (const c of ['FAST', 'NORMAL', 'SLOW', null]) { const sub = pf.accepted.filter(x => (x.r.klass || null) === c).map(x => mkTrade(x.r)); if (sub.length) byClass[c || 'unknown'] = SC.summarize(sub); }
+    const fastConf = SC.summarize(pf.accepted.filter(x => Number(x.r.entry_min) <= 5).map(x => mkTrade(x.r))), slowConf = SC.summarize(pf.accepted.filter(x => Number(x.r.entry_min) > 5).map(x => mkTrade(x.r)));
+    const fast = SC.summarize(pf.accepted.filter(x => x.r.klass === 'FAST').map(x => mkTrade(x.r)));
+    const gates = {}; for (const r of entered) if (r.gate) gates[r.gate] = (gates[r.gate] || 0) + 1;
+    const lanes = (await q(`SELECT lane, COUNT(*) AS n, COUNT(*) FILTER (WHERE active AND key_status='ok') AS ready FROM users GROUP BY lane`)).rows;
+    const tg = await scTarget();
+    const levs = pf.accepted.map(x => Number(x.r.lev)).filter(v => v > 0);
+    const live = [...scState.values()].map(st => { const s = scSim(st); const last = st.path[st.path.length - 1]; return { symbol: st.symbol, side: st.side, klass: st.klass, ageMin: Math.round((Date.now() - st.signalAt) / 6000) / 10, target: st.target, lev: st.lev, src: st.plan && st.plan.tgtSrc, move: Math.round((st.side === 'Buy' ? last[1] - st.signalPx : st.signalPx - last[1]) / st.signalPx * 10000) / 100, entered: !!s.entered, exit: s.exit || null, net: s.entered ? s.netPct : null }; });
+    const rowsForLab = withLab ? scPathRows(all) : null;
+    return {
+      cfg: scCfg, run: { at: scRun.at, ok: scRun.ok, err: scRun.err, note: scRun.note }, target: tg, trackMin: SC_TRACK_MIN,
+      summary: smartAll, smart, base, instant: inst, fast, byClass, speed: { fast: fastConf, slow: slowConf },
+      usdTotal: sumUsd(pf.accepted.map(x => x.r)), usdAll: sumUsd(entered), usdBase: Math.round(all.reduce((a, r) => a + (Number(r.base_usd) || 0), 0) * 100) / 100,
+      guards: { gated: gates, crowd: pf.skipped.crowd, dayloss: pf.skipped.dayloss, passed: pf.accepted.length }, avgLev: levs.length ? Math.round(levs.reduce((a, b) => a + b, 0) / levs.length * 10) / 10 : null,
+      calls: all.length, notEntered: all.length - entered.length,
+      verdict: SC.verdict(smart), verdictBasis: 'smart rules after gates and guards',
+      lanes: Object.fromEntries(lanes.map(x => [x.lane, { users: Number(x.n), ready: Number(x.ready) }])), watching: live,
+      recent: scRows(all.slice(0, 30)),
+      lab: rowsForLab ? SC.lab(rowsForLab.filter(r => r.path.length > 2), scCfg) : null,
+      suggestion: rowsForLab ? SC.walkForward(rowsForLab, scCfg) : null,
+    };
+  }
+
+  async function pcTick() {
+    if (pcCfg.mode !== 'off' && Date.now() - pcCal.at > 600000 && !pcCal.busy) pcCalRefresh();
+    if (pcRun.busy || pcCfg.mode === 'off') return;
+    if (getMode() !== 'live') { pcRun.note = 'paper mode: nothing is open on Bybit'; return; }
+    pcRun.busy = true;
+    try {
+      await ready;
+      const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
+      for (const p of positions) {
+        if (p.side !== 'Buy' && p.side !== 'Sell') continue;
+        const symbol = p.symbol, side = p.side, key = symbol + '|' + side, long = side === 'Buy'; seen.add(key);
+        const entry = parseFloat(p.avgPrice), mark = parseFloat(p.markPrice);
+        if (!(entry > 0) || !(mark > 0)) continue;
+        let st = pcState.get(key);
+        if (st && Math.abs(st.entry - entry) / st.entry > 0.005) { await pcFinish(key, st, now).catch(() => {}); st = null; }
+        if (!st) {
+          const lk = await pgLookup(symbol, side, true);
+          const g0 = pgState.get(key), s0 = snState.get(key), sw0 = swState.get(key);
+          let sl = lk.sl > 0 && (long ? lk.sl < entry : lk.sl > entry) ? lk.sl : 0;
+          if (!sl) for (const c of [g0 && g0.initialSl, s0 && s0.initialSl, sw0 && sw0.initialSl]) if (c > 0 && (long ? c < entry : c > entry)) { sl = c; break; }
+          if (!sl) continue;                                                     // no original stop (a manual trade without a signal): nothing to measure R from
+          const entryAt = Number(p.createdTime) > 0 ? Number(p.createdTime) : now, k = key + '|' + Math.floor(entryAt / 1000);
+          st = { k, key, symbol, side, entryAt, entry, sl, tp: parseFloat(p.takeProfit) || 0, bot: lk.bot, eng: lk.eng, cp: {}, peakPx: entry, peakR: 0, t05: null, t10: null, proof: null, alerted: false, late: false, f: null, sc: null };
+          const old = (await q(`SELECT features, score, klass, hours, why, late, cp, peak_r, t05_min, t10_min FROM pace_trades WHERE k=$1`, [k])).rows[0];
+          if (old) { st.f = old.features; st.cp = old.cp || {}; st.peakR = Number(old.peak_r) || 0; st.t05 = old.t05_min === null ? null : Number(old.t05_min); st.t10 = old.t10_min === null ? null : Number(old.t10_min); st.late = !!old.late;
+            st.sc = old.klass ? { score: Number(old.score), klass: old.klass, hours: old.hours === null ? null : Number(old.hours), why: old.why ? old.why.split('; ') : [] } : null; }
+          else {
+            try { const r = await pcCompute(symbol, side, entry, sl); st.f = r.f; st.sc = r.sc; st.late = now - entryAt > 600000 || r.at > entryAt + 900000; } catch { /* the trade is still tracked, without a signal-time class */ }
+          }
+          pcState.set(key, st);
+        }
+        const risk = Math.abs(st.entry - st.sl);
+        let bars = []; try { bars = await snBars(symbol); } catch { /* marks only */ }
+        let peak = st.peakPx; const g1 = pgState.get(key); if (g1 && g1.peak > 0) peak = long ? Math.max(peak, g1.peak) : Math.min(peak, g1.peak);
+        for (const b of bars) { if (b.t < st.entryAt - 60000) continue; const ex = long ? b.h : b.l; if (long ? ex > peak : ex < peak) peak = ex; }
+        if (long ? mark > peak : mark < peak) peak = mark;
+        st.peakPx = peak;
+        const rOf = px => (long ? px - st.entry : st.entry - px) / risk;
+        st.peakR = Math.max(st.peakR || 0, rOf(peak)); st.nowR = rOf(mark);
+        const elapsed = (now - st.entryAt) / 60000;
+        const crossMin = lvl => { for (const b of bars) { if (b.t < st.entryAt - 60000) continue; if (rOf(long ? b.h : b.l) >= lvl) return Math.max(0, Math.round((b.t - st.entryAt) / 600) / 100); } return Math.max(0, Math.round(elapsed * 100) / 100); };
+        if (st.t05 === null && st.peakR >= pcCfg.label.slowR) st.t05 = crossMin(pcCfg.label.slowR);
+        if (st.t10 === null && st.peakR >= pcCfg.label.fastR) st.t10 = crossMin(pcCfg.label.fastR);
+        for (const c of PC_CPS) if (!st.cp[c] && elapsed >= c) st.cp[c] = { r: Math.round(st.nowR * 100) / 100, p: Math.round(st.peakR * 100) / 100 };
+        st.proof = PM.proof({ elapsedMin: elapsed, peakR: st.peakR, nowR: st.nowR }, pcCfg);
+        st.seenAt = now;
+        if (pcCfg.mode === 'alert' && st.proof.state === 'slow' && !st.alerted && elapsed < 600) {
+          st.alerted = true;
+          deliverAlert('⏳ Pace: ' + symbol.replace(/USDT$/, '') + ' ' + (long ? 'long' : 'short') + ' is moving like a slow trade (' + st.proof.why + (st.sc ? '; at signal time it was read as ' + st.sc.klass + ', about ' + PM.hoursText(st.sc.hours) + ' to +1R' : '') + '). Nothing was changed.', { cat: 'updates' }).catch(() => {});
+        }
+        if (!st.lastSave || now - st.lastSave > 60000) { st.lastSave = now; await pcSave(st, null).catch(e => console.error('[multiuser] pace save:', e.message)); }
+      }
+      for (const [key, st] of [...pcState.entries()]) {
+        if (seen.has(key)) { st.missed = 0; continue; }
+        st.missed = (st.missed || 0) + 1;                                   // a position list that is briefly empty must not close the record: two misses in a row
+        if (st.missed >= 2) await pcFinish(key, st, now).catch(e => console.error('[multiuser] pace finish:', e.message));
+      }
+      pcRun.at = Date.now(); pcRun.ok = true; pcRun.err = null; pcRun.note = '';
+    } catch (e) { pcRun.at = Date.now(); pcRun.ok = false; pcRun.err = e.message; console.error('[multiuser] pace:', e.message); }
+    finally { pcRun.busy = false; }
+  }
+  async function pcFinish(key, st, now) {
+    pcState.delete(key);
+    const life = (now - st.entryAt) / 60000;
+    const label = PM.label({ t05Min: st.t05, t10Min: st.t10, lifeMin: life, closed: true }, pcCfg);
+    await pcSave(st, { label, exitR: st.nowR === undefined ? null : Math.round(st.nowR * 100) / 100 });
+  }
+  const pcOpenView = () => [...pcState.values()].map(st => ({ est: st.f && st.sc ? PM.estimate(st.f, pcCal.cal, st.sc) : null, symbol: st.symbol, side: st.side, entry: st.entry, sl: st.sl, ageMin: Math.round((Date.now() - st.entryAt) / 60000), klass: st.sc ? st.sc.klass : null, score: st.sc ? st.sc.score : null, hours: st.sc ? st.sc.hours : null,
+    why: st.sc ? st.sc.why : [], late: !!st.late, nowR: st.nowR === undefined ? null : Math.round(st.nowR * 100) / 100, peakR: Math.round((st.peakR || 0) * 100) / 100, proof: st.proof ? st.proof.state : null, proofWhy: st.proof ? st.proof.why : '', cp: st.cp || {}, f: st.f }));
+  // Past trades from the Sentinel's own records: stop distance and the recorded path give a label for each, so the stop-distance split can be read today (a separate report from the live-recorded rows).
+  async function pcHistory() {
+    if (Date.now() - pcHist.at < 21600000) return pcHist.rows;   // past trades change slowly and this reads a lot of path rows: once every 6 hours is plenty
+    const tr = (await q(`SELECT at, symbol, side, entry, initial_sl FROM sentinel_trades WHERE initial_sl > 0 AND entry > 0 ORDER BY at DESC LIMIT 150`)).rows, rows = [];
+    for (const t of tr) {
+      const end = new Date(t.at).getTime();
+      const path = (await q(`SELECT at, peak_r FROM trade_path WHERE symbol=$1 AND side=$2 AND at <= $3 AND at > $4 ORDER BY at DESC LIMIT 8000`, [t.symbol, t.side, new Date(end + 120000), new Date(end - 7 * 86400000)])).rows;
+      if (path.length < 3) continue;
+      const run = [path[0]];
+      for (let i = 1; i < path.length; i++) { if (new Date(path[i - 1].at).getTime() - new Date(path[i].at).getTime() > 900000) break; run.push(path[i]); }
+      run.reverse(); const t0 = new Date(run[0].at).getTime();
+      const pts = run.map(x => ({ min: (new Date(x.at).getTime() - t0) / 60000, peakR: Number(x.peak_r) || 0 })), life = pts[pts.length - 1].min, tm = PM.timesFromPath(pts, pcCfg);
+      rows.push({ symbol: t.symbol, side: t.side, at: end, stopPct: Math.abs(Number(t.entry) - Number(t.initial_sl)) / Number(t.entry) * 100, lifeMin: Math.round(life), t05Min: tm.t05Min, t10Min: tm.t10Min, label: PM.label({ ...tm, lifeMin: life, closed: true }, pcCfg) });
+    }
+    pcHist = { at: Date.now(), rows };
+    return rows;
+  }
+  async function pcView() {
+    const recent = (await q(`SELECT k, symbol, side, bot, entry_at, entry, sl, features, score, klass, hours, why, late, cp, peak_r, t05_min, t10_min, proof, label, closed_at, exit_r FROM pace_trades ORDER BY entry_at DESC LIMIT 40`)).rows;
+    const done = (await q(`SELECT features, klass, label FROM pace_trades WHERE label IN ('FAST','NORMAL','SLOW') AND klass IS NOT NULL ORDER BY entry_at DESC LIMIT 500`)).rows;
+    let hist = []; try { hist = await pcHistory(); } catch (e) { hist = []; }
+    const liveRows = done.map(r => ({ klass: r.klass, label: r.label, features: r.features || {}, stopPct: Number((r.features || {}).stopPct) }));
+    return { cfg: pcCfg, run: { at: pcRun.at, ok: pcRun.ok, err: pcRun.err, note: pcRun.note }, open: pcOpenView(), recent,
+      cal: pcCal.cal, calAt: pcCal.at,
+      report: { recorded: done.length, accuracy: PM.accuracy(liveRows), separation: PM.separation(liveRows), history: { n: hist.length, byStop: PM.buckets(hist) } } };
+  }
   async function snTick() {
     if (snRun.busy || snCfg.mode === 'off') return;
     if (!guardsMaster) { snRun.note = 'master switch is off: trades run on their own stops'; return; }
@@ -2025,7 +2520,7 @@ function init(deps) {
         let st = snState.get(key);
         if (st && Math.abs(st.entry - entry) / st.entry > 0.005) st = null;
         if (!st) {
-          const lk = await pgLookup(symbol, side);
+          const lk = await pgLookup(symbol, side, true);
           let init = lk.sl > 0 && (long ? lk.sl < entry : lk.sl > entry) ? lk.sl : 0;
           if (!init && curSl > 0 && (long ? curSl < entry : curSl > entry)) init = curSl;
           const created = Number(p.createdTime) > 0 ? Number(p.createdTime) : now;
@@ -2068,12 +2563,19 @@ function init(deps) {
         }
         // act (tighten only)
         if (st.mem.state !== 'alert' && st.mem.state !== 'danger') { st.why = 'state ' + st.mem.state; continue; }
+        if (st.profile === 'swing') {   // v2.9.12: 15-second reads must not drive a multi-day trade: a grace period, then danger only
+          const sws = snCfg.swing;
+          if (SW.graceActive(st.entryAt, now, sws.graceH)) { st.why = 'swing: grace period (' + sws.graceH + ' h after entry)'; continue; }
+          if (sws.actOn === 'danger' && st.mem.state !== 'danger') { st.why = 'swing: acts only in danger'; continue; }
+        }
         if ((st.moves || 0) >= snCfg.limits.maxMoves || now - (st.lastMoveAt || 0) < snCfg.limits.moveGapSec * 1000) { st.why = 'move limit or pause between moves'; continue; }
         const inst = await getInstrument(symbol).catch(() => null);
         const eff = em === 'shadow' && st.shadowSl > 0 ? (long ? Math.max(curSl, st.shadowSl) : (curSl > 0 ? Math.min(curSl, st.shadowSl) : st.shadowSl)) : curSl;
         let keepFrac = 0;
         try { const g0 = pgState.get(key), cm = PG.curveOf(pgCfg, { btcPct, peakDist: long ? st.peak - entry : entry - st.peak, maxPull: g0 ? g0.maxPull : undefined, pullNow: long ? st.peak - mark : mark - st.peak, atr: f.atr, sn: { state: st.mem.state }, rev: PG.revOf(pgCfg, botReads.get(key)) }); keepFrac = PG.curveKeep(pgCfg, f.peakR, cm.curveMul) || 0; } catch { keepFrac = 0; }
-        const d = SN.decide({ side, entry, mark, peak: st.peak, curSl: eff, initialSl: st.initialSl, tick: inst && inst.tickSize || 0, atr: f.atr, state: st.mem.state, cfg: snCfg, keepFrac });
+        let atrD = f.atr;
+        if (st.profile === 'swing') { try { atrD = SN.atrOf(await swBars(symbol, '60', 40, 900000)) || f.atr; } catch { /* the 1-minute ATR stays */ } }   // v2.9.12: the danger gap is measured in hourly ranges for a swing trade
+        const d = SN.decide({ side, entry, mark, peak: st.peak, curSl: eff, initialSl: st.initialSl, tick: inst && inst.tickSize || 0, atr: atrD, state: st.mem.state, cfg: snCfg, keepFrac, profile: st.profile });
         st.why = d.action === 'raise' ? d.label : d.why;
         if (d.action !== 'raise') continue;
         if (em === 'shadow') {
@@ -2083,7 +2585,7 @@ function init(deps) {
         }
         const body = { category: 'linear', symbol, positionIdx: Number(p.positionIdx) || 0, stopLoss: String(d.newSl) };
         let res;
-        try { res = await restClient.setTradingStop(body); }
+        try { const w = await stopWrite(side, body); if (w.skipped) { st.curSl = w.cur; st.lastMoveAt = now; await snLog({ symbol, side, profile: st.profile, mode: em, event: 'skipped', state: st.mem.state, score: sc, entry, mark, oldSl: w.cur, newSl: d.newSl, detail: 'the stop on Bybit is already ' + w.cur + ' (as tight or tighter than ' + d.newSl + '): left alone' }); continue; } res = w.res; }
         catch (e) { await snLog({ symbol, side, profile: st.profile, mode: em, event: 'failed', state: st.mem.state, score: sc, entry, mark, oldSl: curSl || null, newSl: d.newSl, detail: 'Bybit call failed: ' + (e.message || e) }); st.lastMoveAt = now; continue; }
         if (res.retCode !== 0 && res.retCode !== 34040) { await snLog({ symbol, side, profile: st.profile, mode: em, event: 'failed', state: st.mem.state, score: sc, entry, mark, oldSl: curSl || null, newSl: d.newSl, detail: 'Bybit refused: ' + (res.retMsg || res.retCode) }); st.lastMoveAt = now; continue; }
         st.floor = d.newSl; st.curSl = d.newSl; st.moves = (st.moves || 0) + 1; st.lastMoveAt = now; snRun.moves++;
@@ -2171,6 +2673,12 @@ function init(deps) {
     try {
       if (!guardsMaster) return body;
       if (!body || typeof body !== 'object' || body.stopLoss === undefined) return body;
+      if (swCfg.mode === 'live') {   // v2.9.12: a stop the Swing Manager raised is not loosened by a bot's own (wider) structure stop
+        for (const sd of ['Buy', 'Sell']) {
+          const fl = swFloor.get(String(body.symbol) + '|' + sd), use = fl > 0 ? PG.clampStop(sd, body.stopLoss, fl) : null;
+          if (use !== null) { pgLog({ symbol: body.symbol, side: sd, profile: 'swing', mode: 'live', event: 'held', newSl: fl, oldSl: Number(body.stopLoss) || null, detail: 'a stop of ' + body.stopLoss + ' was held at the Swing Manager floor ' + fl }); body = { ...body, stopLoss: String(use) }; }
+        }
+      }
       const sym = String(body.symbol), cands = [];
       for (const side of ['Buy', 'Sell']) {                       // the tighter of the Profit Guard's and the Sentinel's floor, each only while it is live
         let floor = 0, st = pgState.get(sym + '|' + side);
@@ -2277,6 +2785,10 @@ function init(deps) {
       (await q(`SELECT * FROM sentinel_log g WHERE at >= $1 AND at < $2 ${onBot('g', 'at')} ORDER BY at LIMIT ${cap}`, P)).rows);
     add('GUARD_TRADES', ['at', 'symbol', 'side', 'profile', 'mode', 'entry', 'initial_sl', 'peak_price', 'exit_price', 'peak_pct', 'exit_pct', 'giveback_pct', 'peak_r', 'exit_r', 'guard_floor', 'scaled', 'pnl'],
       (await q(`SELECT * FROM pg_trades g WHERE at >= $1 AND at < $2 ${onBot('g', 'at')} ORDER BY at LIMIT ${cap}`, P)).rows);
+    add('PACE', ['entry_at', 'symbol', 'side', 'eng', 'read_class', 'read_score', 'read_hours', 'stop_pct', 'stop_atr', 'vol_exp', 'vol_ratio', 'moved_atr', 'btc_dir', 'late', 'r15', 'r30', 'r60', 'r120', 'r240', 'peak_r', 't05_min', 't10_min', 'proof', 'label', 'closed_at', 'exit_r', 'why'],
+      (await q(`SELECT g.entry_at, g.symbol, g.side, g.eng, g.klass AS read_class, g.score AS read_score, g.hours AS read_hours, g.features->>'stopPct' AS stop_pct, g.features->>'stopAtr' AS stop_atr, g.features->>'volExp' AS vol_exp,
+          g.features->>'volRatio' AS vol_ratio, g.features->>'movedAtr' AS moved_atr, g.features->>'btcDir' AS btc_dir, g.late, g.cp->'15'->>'p' AS r15, g.cp->'30'->>'p' AS r30, g.cp->'60'->>'p' AS r60, g.cp->'120'->>'p' AS r120, g.cp->'240'->>'p' AS r240,
+          g.peak_r, g.t05_min, g.t10_min, g.proof, g.label, g.closed_at, g.exit_r, g.why FROM pace_trades g WHERE g.entry_at >= $1 AND g.entry_at < $2 ${onBot('g', 'entry_at')} ORDER BY g.entry_at LIMIT ${cap}`, P)).rows);
     add('SENTINEL_TRADES', ['at', 'symbol', 'side', 'profile', 'mode', 'label', 'entry', 'initial_sl', 'peak_r', 'max_score', 'first_alert_at', 'first_danger_at', 'moves', 'shadow_exit_r', 'exit_price', 'exit_r', 'pnl'],
       (await q(`SELECT * FROM sentinel_trades g WHERE at >= $1 AND at < $2 ${onBot('g', 'at')} ORDER BY at LIMIT ${cap}`, P)).rows);
     add('PATH', ['at', 'symbol', 'side', 'mark', 'now_r', 'peak_r', 'atr', 'score', 'state'],
@@ -2352,6 +2864,7 @@ function init(deps) {
       ['audit_log', `at < now() - ($1 || ' days')::interval`, adays],
       ['profit_guard_log', `at < now() - ($1 || ' days')::interval`, adays],
       ['sentinel_log', `at < now() - ($1 || ' days')::interval`, adays],
+      ['scalp_trades', `signal_at < now() - ($1 || ' days')::interval`, 60],   // v2.9.15: shadow scalp ledger (each row carries its price path)
       ['trade_path', `at < now() - ($1 || ' days')::interval`, Math.max(7, Number(process.env.SENTINEL_PATH_DAYS) || 30)]);   // sentinel_trades is never pruned
     for (const [table, cond, d] of jobs) {
       try { out[table] = await batch(table, cond, String(d)); }
@@ -2372,7 +2885,13 @@ function init(deps) {
     const pgLoop = () => { pgTick().catch(e => console.error('[multiuser] profit guard:', e.message)).finally(() => { const t = setTimeout(pgLoop, Math.max(3000, (pgCfg.pollSec || 5) * 1000)); if (t.unref) t.unref(); }); };
     setTimeout(pgLoop, 15000);
     const snLoop = () => { snTick().catch(e => console.error('[multiuser] sentinel:', e.message)).finally(() => { const t = setTimeout(snLoop, Math.max(3000, (snCfg.pollSec || 5) * 1000)); if (t.unref) t.unref(); }); };
-    setTimeout(snLoop, 17000);   // Trade Sentinel loop (does nothing while it is switched off)   // Profit Guard loop (does nothing while it is switched off)
+    setTimeout(snLoop, 17000);
+    const swLoop = () => { swTick().catch(e => console.error('[multiuser] swing manager:', e.message)).finally(() => { const t = setTimeout(swLoop, 30000); if (t.unref) t.unref(); }); };
+    setTimeout(swLoop, 21000);
+    const pcLoop = () => { pcTick().catch(e => console.error('[multiuser] pace:', e.message)).finally(() => { const t = setTimeout(pcLoop, 30000); if (t.unref) t.unref(); }); };
+    const scLoop = () => { scTick().catch(e => console.error('[multiuser] scalp lane:', e.message)).finally(() => { const t = setTimeout(scLoop, 5000); if (t.unref) t.unref(); }); };
+    setTimeout(scLoop, 27000);   // Scalp lane shadow recorder (every 5 s; does nothing while off)
+    setTimeout(pcLoop, 25000);   // Pace model loop (every 30 s; does nothing while it is off)   // Swing Manager loop (every 30 s; does nothing while it is off)   // Trade Sentinel loop (does nothing while it is switched off)   // Profit Guard loop (does nothing while it is switched off)
     setInterval(() => checkSignalAlarms().catch(e => console.error('[multiuser] signal alarm:', e.message)), Number(process.env.ALERT_SWEEP_MS) || 20000);
     setTimeout(() => syncAll().catch(e => console.error('[multiuser] initial sync:', e.message)), 20000);
     setInterval(() => syncAll().catch(e => console.error('[multiuser] sync:', e.message)), SYNC_INTERVAL_MS);
@@ -2417,6 +2936,13 @@ function init(deps) {
 
   app.get('/api/public-info', (req, res) => res.json({ success: true, outboundIps: process.env.PUBLIC_OUTBOUND_IPS || '', demo: demoLike, demoKeys: DEMO_KEYS_ALLOWED }));
 
+  // tells the sign-up page which kind of invite this is (core or scalp) so it can show the right step; reveals nothing else
+  app.get('/api/auth/invite-info', limited, h(async (req, res) => {
+    await ready;
+    const r = await q('SELECT used_by, lane FROM invites WHERE code=$1', [String(req.query.code || '').trim().toUpperCase()]);
+    if (!r.rows[0] || r.rows[0].used_by !== null) return res.status(400).json({ success: false, message: 'Invalid or already-used invite code.' });
+    res.json({ success: true, lane: r.rows[0].lane === 'scalp' ? 'scalp' : 'core' });
+  }));
   app.post('/api/auth/signup', limited, h(async (req, res) => {
     await ready;
     const { username, password, inviteCode, apiKey, apiSecret } = req.body || {};
@@ -2426,8 +2952,10 @@ function init(deps) {
     if (typeof password !== 'string' || password.length < 10) return res.status(400).json({ success: false, message: 'Password must be at least 10 characters.' });
     if (!apiKey || !apiSecret) return res.status(400).json({ success: false, message: 'Bybit API key and secret are required.' });
     const code = String(inviteCode || '').trim().toUpperCase();
-    const inv = await q('SELECT used_by FROM invites WHERE code=$1', [code]);
+    const inv = await q('SELECT used_by, lane FROM invites WHERE code=$1', [code]);
     if (!inv.rows[0] || inv.rows[0].used_by !== null) return res.status(400).json({ success: false, message: 'Invalid or already-used invite code.' });
+    const lane = inv.rows[0].lane === 'scalp' ? 'scalp' : 'core'; // the invite decides the lane; nobody can pick it themselves
+    if (lane === 'scalp' && !scalpSignupOpen()) return res.status(400).json({ success: false, message: 'Scalp accounts are not open yet. Scalp trading is still being tested.' });
 
     // the starting trade size picked on the sign-up page (optional; otherwise the plan's standard percent)
     const sb = req.body || {};
@@ -2439,6 +2967,13 @@ function init(deps) {
       if (pv.error) return res.status(400).json({ success: false, message: pv.error });
       if (pv.values.sizePct > STD.userPctConfirmAbove && sb.confirmHigh !== true) return res.status(400).json({ success: false, needConfirm: true, message: 'More than ' + STD.userPctConfirmAbove + '% per trade is risky. Confirm that you understand to continue.' });
       startMode = pv.values.sizeMode; startPct = pv.values.sizePct ?? null; startUsd = pv.values.sizeUsd ?? null;
+    }
+    if (lane === 'scalp') { // scalp accounts always use a fixed USD amount per trade (set by the user, changeable any time)
+      const usd = Number(sb.sizeUsd);
+      if (!(usd >= 10)) return res.status(400).json({ success: false, message: 'Scalp accounts need a fixed amount per trade in USD (at least 10).' });
+      if (usd > SCALP_MAX_TRADE_USD) return res.status(400).json({ success: false, message: 'The most a scalp account can use per trade is $' + SCALP_MAX_TRADE_USD + '.' });
+      if (sb.riskAck !== true) return res.status(400).json({ success: false, message: 'Please accept the scalp risk notice first.' });
+      startMode = 'fixed'; startPct = null; startUsd = usd;
     }
 
     const v = await validateKey(String(apiKey).trim(), String(apiSecret).trim(), env);
@@ -2452,8 +2987,8 @@ function init(deps) {
     try {
       await client.query('BEGIN');
       const ins = await client.query(
-        `INSERT INTO users(username,pass_hash,key_enc,key_hash,ips_unrestricted,last_equity,key_env,size_mode,size_pct,size_usd,risk_ack_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
-        [username.toLowerCase(), passHash, keyEnc, sha256(String(apiKey).trim()), v.ipsUnrestricted, v.equity, env, startMode, startPct, startUsd, sb.riskAck === true ? new Date() : null]);
+        `INSERT INTO users(username,pass_hash,key_enc,key_hash,ips_unrestricted,last_equity,key_env,size_mode,size_pct,size_usd,risk_ack_at,lane) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+        [username.toLowerCase(), passHash, keyEnc, sha256(String(apiKey).trim()), v.ipsUnrestricted, v.equity, env, startMode, startPct, startUsd, sb.riskAck === true ? new Date() : null, lane]);
       userId = ins.rows[0].id;
       const claim = await client.query('UPDATE invites SET used_by=$2 WHERE code=$1 AND used_by IS NULL RETURNING code', [code, userId]);
       if (!claim.rows[0]) { await client.query('ROLLBACK'); return res.status(400).json({ success: false, message: 'Invalid or already-used invite code.' }); }
@@ -2466,7 +3001,7 @@ function init(deps) {
       }
       throw e;
     } finally { client.release(); }
-    await audit(username.toLowerCase(), 'signup', username.toLowerCase(), req, (env === 'demo' ? 'DEMO key' : '') + (v.ipsUnrestricted && env === 'live' ? (env === 'demo' ? ', ' : '') + 'key not IP-restricted' : ''));
+    await audit(username.toLowerCase(), 'signup', username.toLowerCase(), req, (lane === 'scalp' ? 'SCALP lane. ' : '') + (env === 'demo' ? 'DEMO key' : '') + (v.ipsUnrestricted && env === 'live' ? (env === 'demo' ? ', ' : '') + 'key not IP-restricted' : ''));
     res.status(200).json({ success: true, token: await newSession(userId), warnings: v.warnings });
   }));
 
@@ -2520,6 +3055,7 @@ function init(deps) {
     const lossLimitNow = minPositive(eff.daily_loss_limit_usd, pctLimit) || null;
     res.json({
       success: true, username: u.username, paused: u.paused, active: u.active, hasKey: !!u.key_enc, env: normEnv(u.key_env), demoKeys: DEMO_KEYS_ALLOWED,
+      lane: u.lane === 'scalp' ? 'scalp' : 'core', scalpLive: false,   // scalp accounts are accepted now; real scalp orders start only after the shadow test passes
       keyStatus: u.key_status, keyError: u.key_error, equity: u.last_equity === null ? null : Number(u.last_equity),
       pnl: Number(t.pnl), funding: Number(f.rows[0].funding), trades: Number(t.trades), wins: Number(t.wins),
       shareToken: u.share_token || null, shareShowBalance: !!u.share_show_balance,
@@ -2658,8 +3194,13 @@ function init(deps) {
     const u = req.user, body = { ...(req.body || {}) };
     delete body.sizeMult; // retired
     if (body.sizeMode === 'match') return res.status(400).json({ success: false, message: 'Choose a percent of your balance or a fixed amount.' });
+    if (u.lane === 'scalp') { // scalp accounts always trade a fixed USD amount that the user can change any time
+      if (body.sizeMode !== undefined && body.sizeMode !== 'fixed') return res.status(400).json({ success: false, message: 'Scalp accounts use a fixed amount per trade in USD.' });
+      if (body.sizeUsd !== undefined && !(Number(body.sizeUsd) >= 10)) return res.status(400).json({ success: false, message: 'The amount per trade must be at least 10 USD.' });
+      body.sizeMode = 'fixed'; delete body.sizePct;
+    }
     const parsed = parseControls(body, { current: ownView(effective(u)), allowed: MANUAL_KEYS, pctMax: STD.userPctMax,
-      ceilUsd: Number(effective(u).max_trade_usd) > 0 ? Number(effective(u).max_trade_usd) : 0 });
+      ceilUsd: u.lane === 'scalp' ? SCALP_MAX_TRADE_USD : (Number(effective(u).max_trade_usd) > 0 ? Number(effective(u).max_trade_usd) : 0) });
     if (parsed.error) return res.status(400).json({ success: false, message: parsed.error });
     if (parsed.values.sizePct > STD.userPctConfirmAbove && body.confirmHigh !== true) return res.status(400).json({ success: false, needConfirm: true, message: 'More than ' + STD.userPctConfirmAbove + '% per trade risks a lot of your balance on a single signal. Confirm that you understand to continue.' });
     const colOf = { sizeMode: 'size_mode', sizeUsd: 'size_usd', sizePct: 'size_pct', dailyLossLimitUsd: 'daily_loss_limit_usd' };
@@ -2840,7 +3381,7 @@ function init(deps) {
     const r = await q(`
       SELECT u.id, u.username, u.active, u.paused, u.key_status, u.key_error, u.size_mult, u.size_mult_max, u.daily_loss_limit_usd, u.ips_unrestricted,
              u.size_mode, u.size_usd, u.size_pct, u.max_open_trades, u.symbols_allow, u.direction, u.user_max_lev, u.max_trade_usd, u.max_lev_ceiling, u.control_mode, u.manual_ack_at, u.dry_run,
-             u.created_at, u.last_equity, u.last_synced_at, u.totp_enabled, u.key_env, (u.tg_chat_id IS NOT NULL) AS tg_linked,
+             u.created_at, u.last_equity, u.last_synced_at, u.totp_enabled, u.key_env, u.lane, (u.tg_chat_id IS NOT NULL) AS tg_linked,
              COALESCE((SELECT SUM(closed_pnl) FROM pnl_ledger WHERE user_id=u.id),0) AS pnl,
              (SELECT COUNT(*) FROM pnl_ledger WHERE user_id=u.id) AS trades,
              (SELECT COUNT(*) FROM pnl_ledger WHERE user_id=u.id AND closed_pnl>0) AS wins,
@@ -2861,7 +3402,7 @@ function init(deps) {
         coins: eff.symbols_allow ? String(eff.symbols_allow).split(',').length : null, direction: eff.direction, userMaxLeverage: numOrNull(eff.user_max_lev),
         maxTradeUsd: numOrNull(x.max_trade_usd), maxLeverageCeiling: numOrNull(x.max_lev_ceiling),
         ipsUnrestricted: x.ips_unrestricted, createdAt: x.created_at, equity: eq, lastSyncedAt: x.last_synced_at,
-        totpEnabled: x.totp_enabled, tgLinked: x.tg_linked, env: normEnv(x.key_env),
+        totpEnabled: x.totp_enabled, tgLinked: x.tg_linked, env: normEnv(x.key_env), lane: x.lane === 'scalp' ? 'scalp' : 'core',
         pnl, funding, net: pnl + funding, trades: Number(x.trades), wins: Number(x.wins), startEquity: start,
         // what the balance change can't be explained by trading = money moved in or out (an estimate; snapshots are daily)
         estNetDeposits: (start !== null && eq !== null) ? Math.round((eq - start - pnl - funding) * 100) / 100 : null,
@@ -3293,7 +3834,7 @@ function init(deps) {
       const size = parseFloat(p.size) || 0, lev = parseFloat(p.leverage) || 1;
       out.trades.push({ symbol, side, bot: sig ? sig.bot : '', engine: sig ? sig.eng : null, entry, mark, peak, stopLoss: parseFloat(p.stopLoss) || 0, takeProfit: parseFloat(p.takeProfit) || (sig ? Number(sig.tp) : 0) || 0,
         initialSl, size, leverage: lev, upl: parseFloat(p.unrealisedPnl) || 0, margin: size * entry / lev, openedAt: created, atr,
-        quality: as, trail,
+        quality: as, trail, pace: (() => { const ps = pcState.get(key); return ps && ps.sc ? { klass: ps.sc.klass, score: ps.sc.score, hours: ps.sc.hours, proof: ps.proof ? ps.proof.state : null, proofWhy: ps.proof ? ps.proof.why : '', why: ps.sc.why.slice(0, 3) } : null; })(),
         profitGuard: gst ? { mode: gst.em || null, why: gst.lastWhy || '', shadowSl: gst.shadowSl || 0, room: gst.curveWhy || '', slice: gst.slicePlan || null, reversal: gst.rev || null, sliced: !!(gst.sliced || gst.slicedShadow), slicedLive: !!gst.sliced } : null,
         sentinel: sst ? { mode: sst.em || null, state: sst.mem && sst.mem.state, score: sst.score === undefined ? null : sst.score } : null });
     }
@@ -3319,10 +3860,44 @@ function init(deps) {
   app.post('/api/admin/burst-brake', adminAuth, h(async (req, res) => {
     const b = req.body || {};
     if (b.mode === 'live' && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: "Going live needs confirm: 'LIVE'. Shadow mode only logs what it would do." });
-    burstCfg = burstNorm({ ...burstCfg, ...(['off', 'shadow', 'live'].includes(b.mode) ? { mode: b.mode } : {}), ...(b.windowMin !== undefined ? { windowMin: b.windowMin } : {}), ...(b.factors !== undefined ? { factors: b.factors } : {}) });
+    burstCfg = burstNorm({ ...burstCfg, ...(['off', 'shadow', 'live'].includes(b.mode) ? { mode: b.mode } : {}), ...(b.windowMin !== undefined ? { windowMin: b.windowMin } : {}), ...(b.factors !== undefined ? { factors: b.factors } : {}), ...(b.expo && typeof b.expo === 'object' ? { expo: { ...burstCfg.expo, ...b.expo } } : {}) });
     await q(`INSERT INTO meta(k,v) VALUES('burst_brake',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(burstCfg)]);
     await audit('admin', 'burst_brake', null, req, 'mode ' + burstCfg.mode + ', window ' + burstCfg.windowMin + ' min, factors ' + burstCfg.factors.join('/'));
     res.json({ success: true, cfg: burstCfg });
+  }));
+  app.get('/api/admin/swing-mgr', adminAuth, h(async (req, res) => { res.json({ success: true, ...(await swView()) }); }));
+  app.post('/api/admin/swing-mgr', adminAuth, h(async (req, res) => {
+    const b = req.body || {};
+    if (b.mode === 'live' && b.confirm !== 'LIVE') return res.status(400).json({ success: false, message: "Going live needs confirm: 'LIVE'. Shadow mode only records what it would do." });
+    const was = swCfg.mode;
+    swCfg = SW.normalize({ ...swCfg, ...(b.mode !== undefined ? { mode: b.mode } : {}), ...(b.graceH !== undefined ? { graceH: b.graceH } : {}), ...(b.gapPct !== undefined ? { gapPct: b.gapPct } : {}),
+      be: { ...swCfg.be, ...(b.be && typeof b.be === 'object' ? b.be : {}) }, thesis: { ...swCfg.thesis, ...(b.thesis && typeof b.thesis === 'object' ? b.thesis : {}) }, time: { ...swCfg.time, ...(b.time && typeof b.time === 'object' ? b.time : {}) } });
+    if (swCfg.mode !== 'live') swFloor.clear();
+    await q(`INSERT INTO meta(k,v) VALUES('swing_mgr',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(swCfg)]);
+    await audit('admin', 'swing_mgr', null, req, was + ' -> ' + swCfg.mode + ' ' + JSON.stringify({ graceH: swCfg.graceH, be: swCfg.be, thesis: swCfg.thesis, time: swCfg.time }));
+    res.json({ success: true, cfg: swCfg });
+  }));
+  app.get('/api/admin/scalp', adminAuth, h(async (req, res) => { res.json({ success: true, ...(await scView(req.query.lab === '1')) }); }));
+  app.post('/api/admin/scalp', adminAuth, h(async (req, res) => {
+    const b = req.body || {};
+    if (b.mode !== undefined && b.mode !== 'off' && b.mode !== 'shadow') return res.status(400).json({ success: false, message: 'The scalp lane can only be Off or Shadow in this version. No real scalp orders are sent until the shadow test shows an edge.' });
+    const was = scCfg.mode, keys = ['confirmPct', 'confirmWindowMin', 'targetFrac', 'targetFloorPct', 'targetCapPct', 'fallbackTargetPct', 'stopFrac', 'beFrac', 'timeStopMin', 'feePct', 'slipPct', 'minWins', 'leverage', 'shadowUsd',
+      'riskPct', 'maxLev', 'liqMult', 'mmrPct', 'trail', 'trailGive', 'trailMinPct', 'trailLockFrac', 'stallMin', 'minGroupRows', 'maxSpreadPct', 'minTurnoverUsd', 'onlyFast', 'fastConfirmMin', 'maxMovedAtr', 'maxSameSide', 'dailyLossUsd'];
+    const next = { ...scCfg }; for (const k of keys) if (b[k] !== undefined) next[k] = b[k]; if (b.mode !== undefined) next.mode = b.mode;
+    scCfg = scNorm(next); scTgt.at = 0; scGrp.clear();
+    await q(`INSERT INTO meta(k,v) VALUES('scalp_lane',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(scCfg)]);
+    await audit('admin', 'scalp_lane', null, req, was + ' -> ' + scCfg.mode + ' ' + JSON.stringify({ confirmPct: scCfg.confirmPct, targetFrac: scCfg.targetFrac, timeStopMin: scCfg.timeStopMin, shadowUsd: scCfg.shadowUsd, riskPct: scCfg.riskPct, maxLev: scCfg.maxLev, trail: scCfg.trail, stallMin: scCfg.stallMin }));
+    res.json({ success: true, cfg: scCfg });
+  }));
+  app.get('/api/admin/pace', adminAuth, h(async (req, res) => { res.json({ success: true, ...(await pcView()) }); }));
+  app.post('/api/admin/pace', adminAuth, h(async (req, res) => {
+    const b = req.body || {}, was = pcCfg.mode;
+    pcCfg = PM.normalize({ ...pcCfg, ...(b.mode !== undefined ? { mode: b.mode } : {}), ...(b.fastAt !== undefined ? { fastAt: b.fastAt } : {}), ...(b.slowAt !== undefined ? { slowAt: b.slowAt } : {}),
+      ...(b.hardSlowStopPct !== undefined ? { hardSlowStopPct: b.hardSlowStopPct } : {}), proof: { ...pcCfg.proof, ...(b.proof && typeof b.proof === 'object' ? b.proof : {}) }, label: { ...pcCfg.label, ...(b.label && typeof b.label === 'object' ? b.label : {}) } });
+    pcPre.clear(); pcHist = { at: 0, rows: [] }; pcCal = { at: 0, cal: null, busy: false };
+    await q(`INSERT INTO meta(k,v) VALUES('pace_model',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [JSON.stringify(pcCfg)]);
+    await audit('admin', 'pace_model', null, req, was + ' -> ' + pcCfg.mode + ' ' + JSON.stringify({ fastAt: pcCfg.fastAt, slowAt: pcCfg.slowAt, hardSlowStopPct: pcCfg.hardSlowStopPct }));
+    res.json({ success: true, cfg: pcCfg });
   }));
   app.get('/api/admin/guards-master', adminAuth, h(async (req, res) => { res.json({ success: true, master: guardsMaster }); }));
   app.post('/api/admin/guards-master', adminAuth, h(async (req, res) => {
@@ -3478,19 +4053,21 @@ function init(deps) {
   }));
 
   app.get('/api/admin/invites', adminAuth, h(async (req, res) => {
-    const r = await q('SELECT i.code, i.created_at, u.username AS used_by FROM invites i LEFT JOIN users u ON u.id=i.used_by ORDER BY i.created_at DESC LIMIT 100');
+    const r = await q('SELECT i.code, i.lane, i.created_at, u.username AS used_by FROM invites i LEFT JOIN users u ON u.id=i.used_by ORDER BY i.created_at DESC LIMIT 100');
     res.json({ success: true, invites: r.rows });
   }));
   app.post('/api/admin/invites', adminAuth, h(async (req, res) => {
     const n = Math.min(10, Math.max(1, parseInt((req.body || {}).count, 10) || 1));
     const codes = [];
+    const laneIn = (req.body || {}).lane === 'scalp' ? 'scalp' : 'core';
+    if (laneIn === 'scalp' && !scalpSignupOpen()) return res.status(400).json({ success: false, message: 'Scalp sign-up is closed while scalp is in testing. Set SCALP_SIGNUP_OPEN=1 on Render to open it.' });
     for (let i = 0; i < n; i++) {
       const code = crypto.randomBytes(5).toString('hex').toUpperCase();
-      await q('INSERT INTO invites(code) VALUES($1)', [code]);
+      await q('INSERT INTO invites(code, lane) VALUES($1,$2)', [code, laneIn]);
       codes.push(code);
     }
-    await audit('admin', 'invites_created', null, req, String(n));
-    res.json({ success: true, codes });
+    await audit('admin', 'invites_created', null, req, String(n) + (laneIn === 'scalp' ? ' scalp' : ''));
+    res.json({ success: true, codes, lane: laneIn });
   }));
 
   app.post('/api/admin/sync-now', adminAuth, h(async (req, res) => {
@@ -3545,7 +4122,7 @@ function init(deps) {
   app.get('/admin', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
   app.get('/s/:token', sec.pageHeaders, (req, res) => res.sendFile(path.join(__dirname, 'public', 'share.html')));
 
-  return { enabled: true, canPersist: true, loadControl, saveControl, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, reentryTry, reentryBrain, reentryCheckPause, pgPlanned, pruneOldRows, pgTune: pgTuneEval, pgAutoTune, pgTick, snRecordClose, botStopSeen, pgState, botReads, masterClosed, closedDbMiss, pgWatch, pgClosing, pgRun, snTick, snState, snRun, snBackfill, snView, getSnCfg: () => snCfg, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, buildExportAll, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
+  return { enabled: true, canPersist: true, loadControl, saveControl, loadMasterCreds, saveMasterCreds, clearMasterCreds, fanOutOrder, fanOutTradingStop, guardClamp, guardFitClose, fanOutLeverage, recordExec, recordBotEvent, sizeMasterOrder, syncAll, verifyAdminToken, _test: { ...off._test, tradableUsers, scState, scSeen, scGrp, scPlan, scTick, scView, scFinish, scSim, getScCfg: () => scCfg, scRun, scTgt, reentryTry, reentryBrain, reentryCheckPause, pgPlanned, pruneOldRows, pgTune: pgTuneEval, pgAutoTune, pgTick, snRecordClose, botStopSeen, pgState, botReads, masterClosed, closedDbMiss, swState, swFloor, swBarCache, snCandlesClear: () => snCandles.clear(), swTick, swView, pcState, pcPre, pcTick, pcView, pcAlertText, pcCalRefresh, getPcCal: () => pcCal, pcHist: () => pcHist, getPcCfg: () => pcCfg, getSwCfg: () => swCfg, pgWatch, pgClosing, pgRun, snTick, snState, snRun, snBackfill, snView, getSnCfg: () => snCfg, fanOutPartialClose, getPgCfg: () => pgCfg, envOpts, normEnv, tgPollOnce, runBackupIfDue, buildCsv, buildExportAll, settlePending, withRetry, checkSignalAlarms, pushSignalAlerts, pushBotMsgs, alertSweep, getPlan: () => masterPlan, rerunStdMigration: async (legacy) => { await q(`DELETE FROM meta WHERE k='std_v1_migrated'`); await migrateToStandardV1(legacy ? { ...LEGACY_PLAN, ...legacy } : LEGACY_PLAN, !!legacy); }, migrateOnce: (legacy) => migrateToStandardV1({ ...LEGACY_PLAN, ...(legacy || {}) }, !!legacy), ageAdminEquity: (ms, clear) => { adminEq = { at: Date.now() - ms, v: clear ? null : adminEq.v }; } } };
 }
 
 module.exports = { init };

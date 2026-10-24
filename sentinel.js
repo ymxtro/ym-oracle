@@ -19,7 +19,10 @@ const DEFAULT_WEIGHTS = { giveback: 20, vel: 22, vol: 10, stall: 8, cross: 12, g
 function defaults() {
   return {
     mode: 'off', pollSec: 5, candleSec: 15, minGapPct: 0.25, beOffsetPct: 0.1, alerts: true,
-    fast: { mode: 'inherit', stallMin: 30 }, swing: { mode: 'inherit', stallMin: 360 },
+    fast: { mode: 'inherit', stallMin: 30 },
+    // v2.9.12 swing: the 15-second reads are noise on a multi-day trade. After a grace period it acts only in 'danger' (graceH hours, actOn), a loss-side alert goes to -alertR (not -0.6R),
+    // it stays minGapPct from the price, the danger gap is dangerGapAtr x the HOURLY ATR, and 'in profit' starts at startR.
+    swing: { mode: 'inherit', stallMin: 360, graceH: 5, actOn: 'danger', alertR: 0.85, minGapPct: 1.2, dangerGapAtr: 1.0, startR: 1.0 },
     weights: { ...DEFAULT_WEIGHTS },
     th: { watch: 28, alert: 50, danger: 70, hyst: 8, confirm: 2 },                 // score boundaries, how far a state must fall to drop, reads in a row to rise to alert/danger
     loss: { alertR: 0.6, dangerGapAtr: 0.5 },                                       // loss side: alert moves the stop to -alertR; danger puts it dangerGapAtr x ATR behind the price
@@ -50,7 +53,9 @@ function normalize(raw) {
     pollSec: num(r.pollSec, 3, 60, d.pollSec), candleSec: num(r.candleSec, 5, 120, d.candleSec), minGapPct: num(r.minGapPct, 0.05, 5, d.minGapPct),
     beOffsetPct: num(r.beOffsetPct, 0, 1, d.beOffsetPct), alerts: r.alerts === undefined ? d.alerts : r.alerts === true,
     fast: { mode: PMODES.includes(obj(r.fast).mode) ? r.fast.mode : 'inherit', stallMin: num(obj(r.fast).stallMin, 5, 720, d.fast.stallMin) },
-    swing: { mode: PMODES.includes(obj(r.swing).mode) ? r.swing.mode : 'inherit', stallMin: num(obj(r.swing).stallMin, 30, 4320, d.swing.stallMin) },
+    swing: { mode: PMODES.includes(obj(r.swing).mode) ? r.swing.mode : 'inherit', stallMin: num(obj(r.swing).stallMin, 30, 4320, d.swing.stallMin), graceH: num(obj(r.swing).graceH, 0, 48, d.swing.graceH),
+             actOn: obj(r.swing).actOn === 'alert' ? 'alert' : 'danger', alertR: num(obj(r.swing).alertR, 0.1, 0.95, d.swing.alertR), minGapPct: num(obj(r.swing).minGapPct, 0.05, 5, d.swing.minGapPct),
+             dangerGapAtr: num(obj(r.swing).dangerGapAtr, 0.1, 5, d.swing.dangerGapAtr), startR: num(obj(r.swing).startR, 0.05, 3, d.swing.startR) },
     weights: normWeights(r.weights, d.weights),
     th: { watch: num(th.watch, 5, 90, d.th.watch), alert: num(th.alert, 10, 95, d.th.alert), danger: num(th.danger, 15, 100, d.th.danger),
           hyst: num(th.hyst, 0, 30, d.th.hyst), confirm: Math.round(num(th.confirm, 1, 6, d.th.confirm)) },
@@ -181,8 +186,10 @@ function decide(i) {
   if (!(entry > 0) || !(mark > 0) || !(init > 0) || (long ? init >= entry : init <= entry)) return { action: 'none', why: 'no original stop to measure the risk from' };
   const risk = Math.abs(entry - init), peakDist = Math.max(0, long ? peak - entry : entry - peak), peakR = peakDist / risk;
   const be = long ? entry * (1 + cfg.beOffsetPct / 100) : entry * (1 - cfg.beOffsetPct / 100);
-  const inProfit = peakR >= cfg.profit.startR;
-  const gap = Math.max(mark * cfg.minGapPct / 100, i.state === 'danger' ? atr * cfg.loss.dangerGapAtr : 0);
+  const sw = i.profile === 'swing' ? cfg.swing : null;   // v2.9.12: swing has its own numbers
+  const startR = sw ? sw.startR : cfg.profit.startR, alertR = sw ? sw.alertR : cfg.loss.alertR, gapPct = sw ? sw.minGapPct : cfg.minGapPct, dangerAtr = sw ? sw.dangerGapAtr : cfg.loss.dangerGapAtr;
+  const inProfit = peakR >= startR;
+  const gap = Math.max(mark * gapPct / 100, i.state === 'danger' ? atr * dangerAtr : 0);
   const limit = long ? mark - gap : mark + gap;                                   // never closer to the price than this
   let target, label;
   if (inProfit) {
@@ -195,7 +202,7 @@ function decide(i) {
       const keep = long ? entry + f * peakDist : entry - f * peakDist;
       target = long ? Math.max(be, keep) : Math.min(be, keep); label = 'danger: keep ' + Math.round(f * 100) + '% of the peak' + (kf ? ' (curve)' : '');
     }
-  } else if (i.state === 'alert') { target = long ? entry - cfg.loss.alertR * risk : entry + cfg.loss.alertR * risk; label = 'alert: stop to -' + cfg.loss.alertR + 'R'; }
+  } else if (i.state === 'alert') { target = long ? entry - alertR * risk : entry + alertR * risk; label = 'alert: stop to -' + alertR + 'R'; }
   else { target = limit; label = 'danger: stop just behind the price'; }
   if (long ? target > limit : target < limit) { target = limit; label += ' (held back from the price)'; }
   target = roundTo(target, tick);

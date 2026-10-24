@@ -850,6 +850,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     await call('/api/admin/plan', 'POST', { maxOpenTrades: 3 }, admin);
     ok('admin page: plan form fills from the live plan, review panel previews changes without saving, Apply saves a new version');
 
+    click(aw, q1(aw, '[data-tab="guards"]')); await sleep(900);   // v2.9.16: the Profit Guard card lives on the Guards tab (this page check was never run with jsdom since v2.9.10)
     assert(q1(aw, '#pgcard') && /Profit Guard/.test(q1(aw, '#pgcard').textContent) && /OFF/.test(q1(aw, '#pgcard').textContent) && q1(aw, '#pg-swing-be'), 'the Profit Guard card shows, off by default');
     click(aw, q1(aw, '#pgcard [data-v="shadow"]')); await sleep(900);
     assert((await call('/api/admin/profit-guard', 'GET', null, admin)).j.cfg.mode === 'shadow' && /SHADOW/.test(q1(aw, '#pgcard').textContent));
@@ -890,7 +891,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     assert.strictEqual((await realFetch(base + '/api/status')).status, 401, 'trading routes refuse a stranger');
     assert.strictEqual((await realFetch(base + '/api/status', { headers: { Authorization: 'Bearer nonsense' } })).status, 401);
     assert.strictEqual((await realFetch(base + '/api/status', { headers: { Authorization: admin.Authorization } })).status, 200, 'the admin session works on the trading routes');
-    assert(qa(aw, '#nav [data-tab]').length === 8 && ['overview', 'trading', 'bots', 'users', 'plan', 'activity', 'payments', 'settings'].every(k => q1(aw, '#nav [data-tab="' + k + '"]')), 'side menu has every section');
+    assert(qa(aw, '#nav [data-tab]').length === 10 && ['overview', 'live', 'trading', 'guards', 'bots', 'users', 'plan', 'activity', 'payments', 'settings'].every(k => q1(aw, '#nav [data-tab="' + k + '"]')), 'side menu has every section');
     click(aw, q1(aw, '[data-tab="trading"]')); await sleep(900);
     assert(/\$1,234\.50/.test(body()) && /Open positions/.test(body()) && /BTC/.test(body()) && /LONG/.test(body()) && /Recent trades/.test(body()) && /ETH/.test(body()) && /Win rate/.test(body()) && /50%/.test(body()), 'trading: balance, position, trades, win rate');
     assert(/XRP/.test(body()) && /insufficient balance/.test(body()), 'trading: order alert');
@@ -1285,7 +1286,9 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     await db.query('TRUNCATE profit_guard_log, pg_trades'); await db.query(`DELETE FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch')`);
     mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 125, ETHUSDT: 2000 };
     for (const kk of Object.keys(state.positions)) delete state.positions[kk];
+    mu._test.swBarCache.clear();
     mu._test.pgState.clear(); mode = 'live'; halted = false; await call('/api/admin/profit-guard', 'POST', { mode: 'off' }, admin);   // a failed earlier run may have left it on
+    await call('/api/admin/profit-guard', 'POST', { mode: 'off', swing: { beR: 1, minGapPct: 0, scale: { on: false, steps: [[3, 0.25]] } } }, admin);   // v2.9.12: these older checks use the plain swing numbers (1R start, global gap, no planned partial); the new swing defaults have their own checks
     await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','swing',100,90) ON CONFLICT (k) DO NOTHING`);
     const P = (mark, sl) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl) }; };
     const G = () => call('/api/admin/profit-guard', 'GET', null, admin);
@@ -1577,7 +1580,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     await db.query(`INSERT INTO master_log(exec_id,bot,kind,symbol,side,ok,code,detail) VALUES('x1','YM ORACLE II','OPEN','BTCUSDT','BUY',true,'OK','filled'),('x2','YM ORACLE III','OPEN','ETHUSDT','SELL',true,'OK','filled')`);
     const rb = await EA('?bot=' + encodeURIComponent('YM ORACLE II')); const tb = await rb.text();
     assert.strictEqual(rb.status, 200); assert(/attachment; filename="ym-oracle-ii-/.test(rb.headers.get('content-disposition')), rb.headers.get('content-disposition'));
-    for (const sct of ['## SIGNALS (1 rows)', '## ORDERS (1 rows)', '## GUARD (1 rows)', '## SENTINEL (0 rows)', '## GUARD_TRADES', '## SENTINEL_TRADES', '## PATH', '## ALERTS (1 rows)']) assert(tb.includes(sct), sct + ' in ' + tb.slice(0, 400));
+    for (const sct of ['## SIGNALS (1 rows)', '## ORDERS (1 rows)', '## GUARD (1 rows)', '## SENTINEL (0 rows)', '## GUARD_TRADES', '## SENTINEL_TRADES', '## PACE', '## PATH', '## ALERTS (1 rows)']) assert(tb.includes(sct), sct + ' in ' + tb.slice(0, 400));
     assert(tb.includes('ea1') && !tb.includes('ea2') && tb.includes('guard note btc') && !tb.includes('guard note eth') && !tb.includes('too late') && tb.includes('line one | line two') && tb.includes('x1') && !tb.includes('x2'));
     const sigRow = tb.split('\n').find(l => l.startsWith('YM ORACLE II,ea1,')).split(','); assert(sigRow.includes('5') && sigRow.includes('-1') && sigRow.includes('120'), sigRow.join('|'));   // risk 5%, exit_r -1, 120 minutes open
     const ta = await (await EA('')).text(); assert(ta.includes('## SIGNALS (2 rows)') && ta.includes('guard note eth') && ta.includes('sentinel note eth') && ta.includes('# bot: all bots'));
@@ -1594,10 +1597,10 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     const GETG = () => call('/api/admin/profit-guard', 'GET', null, admin);
     const reset = async () => {
       await db.query('TRUNCATE profit_guard_log, pg_trades'); await db.query(`DELETE FROM meta WHERE k IN ('profit_guard','profit_guard_state','profit_guard_watch')`);
-      mu._test.pgState.clear(); mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 100 };
+      mu._test.pgState.clear(); mu._test.pgWatch.clear(); mu._test.pgClosing.length = 0; state.closedPnl.ADMINK = []; state.tickers = { BTCUSDT: 100 }; mu._test.swBarCache.clear();
       for (const kk of Object.keys(state.positions)) delete state.positions[kk]; mode = 'live'; halted = false;
       await POST({ mode: 'off', smart: { slice: { on: false }, rev: { on: false }, noise: { on: true, mult: 1, capR: 1.5 }, stall: { on: true, fastMin: 30, swingMin: 360, stepPts: 0.1, maxPts: 0.2 }, tune: { mode: 'suggest' } },
-        swing: { mode: 'inherit', ladder: [[2, 0.35], [4, 0.55], [8, 0.65]], scale: { on: false } }, fast: { mode: 'inherit', ladder: [[1.5, 0.45], [3, 0.6], [6, 0.7]], scale: { on: false } } });
+        swing: { mode: 'inherit', beR: 1, minGapPct: 0, ladder: [[2, 0.35], [4, 0.55], [8, 0.65]], scale: { on: false } }, fast: { mode: 'inherit', ladder: [[1.5, 0.45], [3, 0.6], [6, 0.7]], scale: { on: false } } });
     };
     const P = (mark, sl) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl) }; };
     const lastStop = () => Number(state.stops.filter(x => x.k === 'ADMINK').slice(-1)[0].b.stopLoss);
@@ -1646,6 +1649,246 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     assert(Math.abs(cf.swing.ladder[0][1] - 0.45) < 1e-9 && cf.smart.tune.lastAtN.swing === 35, JSON.stringify(cf.swing.ladder));
     assert.strictEqual((await db.query(`SELECT 1 FROM profit_guard_log WHERE event='tuned'`)).rowCount, 2);
     ok('profit guard smart: automatic tuning needs the confirm to switch on, acts at most once per 10 new live trades, and logs every change');
+    // v2.9.12 SWING MANAGER: breakeven after a CLOSED 4h candle held +1R, thesis exit after a closed 4h candle past -0.6R, shadow records once, live acts
+    {
+      const SWP = (mark, sl, ageH) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl), createdTime: String(Date.now() - ageH * 3600000) }; };
+      const H4 = 4 * 3600000, openNow = Math.floor(Date.now() / H4) * H4;
+      const feed = closeAt => { Stub.prototype.getKline = async () => { const rows = []; for (let k = 6; k >= 0; k--) { const t = openNow - k * H4, c = k === 0 ? closeAt : (k === 1 ? closeAt : 100); rows.push([String(t), '100', String(Math.max(c, 100) + 1), String(Math.min(c, 100) - 1), String(c), '10']); } return { retCode: 0, result: { list: rows.slice().reverse() } }; }; };
+      const lgs = async ev => (await db.query(`SELECT * FROM profit_guard_log WHERE event=$1 ORDER BY id`, [ev])).rows;
+      const SWM = b => call('/api/admin/swing-mgr', 'POST', b, admin);
+      await reset(); await db.query('TRUNCATE profit_guard_log'); await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','swing',100,90) ON CONFLICT (k) DO NOTHING`);
+      await POST({ mode: 'off' }); mu._test.swState.clear(); mu._test.swBarCache.clear();
+      assert.strictEqual((await SWM({ mode: 'live' })).s, 400, 'going live needs the confirm');
+      assert.strictEqual((await SWM({ mode: 'shadow' })).j.cfg.mode, 'shadow');
+      // shadow: a closed 4h candle at 1.2R -> would raise to breakeven, once, nothing changed
+      feed(112); SWP(113, 90, 30); const nS = state.stops.length;
+      await mu._test.swTick(); await mu._test.swTick();
+      assert.strictEqual(state.stops.length, nS, 'shadow touches nothing');
+      const wb = await lgs('would_breakeven'); assert.strictEqual(wb.length, 1, 'recorded once'); assert(Math.abs(Number(wb[0].new_sl) - 100.1) < 0.02, String(wb[0].new_sl));
+      // a wick (candle closed back under +1R) does not count
+      mu._test.swState.clear(); mu._test.swBarCache.clear(); await db.query('TRUNCATE profit_guard_log'); feed(105); SWP(113, 90, 30);
+      await SWM({ mode: 'live' , confirm: 'LIVE' }); await mu._test.swTick();
+      assert.strictEqual(state.stops.length, nS, 'closed under +1R: no breakeven even though the price now shows +1.3R');
+      // live: the closed candle held +1.2R -> the stop moves, logged, copy users follow
+      mu._test.swState.clear(); mu._test.swBarCache.clear(); feed(112); SWP(113, 90, 30); await mu._test.swTick();
+      assert(state.stops.length > nS && Math.abs(lastStop() - 100.1) < 0.02, 'live: stop to breakeven ' + lastStop());
+      assert.strictEqual((await lgs('sw_breakeven')).length, 1);
+      // thesis exit: a closed 4h candle at -0.7R closes the trade (reduce-only); a wick would not
+      mu._test.swState.clear(); mu._test.swBarCache.clear(); feed(93); SWP(94, 90, 30); const nSub = state.submits.length; await mu._test.swTick();
+      const ex = state.submits.slice(nSub).filter(x => x.body.reduceOnly === true && x.body.side === 'Sell'); assert.strictEqual(ex.length, 1, 'thesis exit closes the trade');
+      assert.strictEqual((await lgs('sw_thesis')).length, 1);
+      // time rule: 80 h old, peak never reached 0.5R -> stop tightened
+      await reset(); await db.query('TRUNCATE profit_guard_log'); await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','swing',100,90) ON CONFLICT (k) DO NOTHING`);
+      await POST({ mode: 'off' }); mu._test.swState.clear(); mu._test.swBarCache.clear(); feed(101); SWP(101, 90, 80); const nS3 = state.stops.length; await mu._test.swTick();
+      assert(state.stops.length > nS3 && lastStop() > 90, 'time rule tightens an old trade that went nowhere: ' + lastStop());
+      // fast trades are left alone
+      await db.query('TRUNCATE profit_guard_log'); await db.query(`UPDATE signals SET eng='fast' WHERE k='pgsig'`); mu._test.swState.clear(); mu._test.swBarCache.clear(); feed(93); SWP(94, 90, 30); const nSub2 = state.submits.length; await mu._test.swTick();
+      assert.strictEqual(state.submits.length, nSub2, 'the swing manager never touches a fast trade');
+      delete Stub.prototype.getKline; await SWM({ mode: 'shadow' }); await reset();
+      ok('swing manager: breakeven only after a closed 4h candle held +1R, thesis exit on a closed candle past -0.6R, time rule tightens an old stalled trade, shadow records once and touches nothing, fast trades untouched');
+    }
+    // v2.9.13 PACE MODEL: the Pace line on the entry alert, the tracker (checkpoints, proof, label), the admin report
+    {
+      // v2.9.15: the candle that is open now is flat, so this test no longer depends on the clock being just after a 4h boundary
+      const H4 = 4 * 3600000, openNow = Math.floor(Date.now() / H4) * H4;
+      Stub.prototype.getKline = async () => { const rows = []; for (let k = 8; k >= 0; k--) { const t = openNow - k * H4, c = 100; rows.push([String(t), '100', k === 0 ? '100.1' : '101', k === 0 ? '99.9' : '99', String(c), '10']); } return { retCode: 0, result: { list: rows.slice().reverse() } }; };
+      const PCP = (mark, ageMin) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: String(mark), stopLoss: '90', createdTime: String(Date.now() - ageMin * 60000) }; };
+      const PCG = () => call('/api/admin/pace', 'GET', null, admin);
+      await reset(); await db.query('TRUNCATE profit_guard_log, pace_trades'); await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','fast',100,90) ON CONFLICT (k) DO NOTHING`);
+      await POST({ mode: 'off' }); mu._test.pcState.clear(); mu._test.pcPre.clear(); mu._test.swBarCache.clear();
+      assert.strictEqual((await PCG()).j.cfg.mode, 'shadow'); ok('pace model: default is shadow');
+      // the line on the alert
+      const txt = e => '<b>BTCUSDT</b>\n<pre>Entry     $100.00\nStop      $' + e + '\nLeverage  2x\n4h Dev    -1.0%</pre>';
+      const wide = await mu._test.pcAlertText({ kind: 'entry', sym: 'BTCUSDT', text: txt('120.00').replace('<b>', '🔴 SHORT <b>') });
+      assert(/Pace +SLOW/.test(wide) && /<\/pre>$/.test(wide), wide); ok('pace: a 20% stop gets "Pace SLOW" added inside the alert block');
+      assert.strictEqual(await mu._test.pcAlertText({ kind: 'result', sym: 'BTCUSDT', text: 'x' }), 'x'); assert.strictEqual(await mu._test.pcAlertText({ kind: 'entry', sym: 'BTCUSDT', text: 'no numbers here' }), 'no numbers here');
+      assert.strictEqual(await mu._test.pcAlertText({ kind: 'entry', sym: 'BTCUSDT', text: wide }), wide, 'never added twice'); ok('pace: other messages, unreadable text and an alert that already has the line are left alone');
+      await call('/api/admin/pace', 'POST', { mode: 'off' }, admin); assert.strictEqual(await mu._test.pcAlertText({ kind: 'entry', sym: 'BTCUSDT', text: '🔴 SHORT ' + txt('120.00') }), '🔴 SHORT ' + txt('120.00')); await call('/api/admin/pace', 'POST', { mode: 'shadow' }, admin); ok('pace: switched off = no line');
+      // observed durations: ten similar closed trades turn the rough guess into a range with its sample size
+      await db.query('TRUNCATE pace_trades');
+      for (let i = 0; i < 10; i++) await db.query(`INSERT INTO pace_trades(k,symbol,side,entry_at,closed_at,features,klass,label,t10_min) VALUES($1,'XXXUSDT','Sell',now()-interval '1 day',now()-interval '1 day'+interval '4 hours',$2,'FAST','FAST',$3)`, ['cal' + i, JSON.stringify({ stopPct: 5, stopAtr: 2.5 }), 60 + i * 10]);
+      mu._test.getPcCal().at = 0; await mu._test.pcCalRefresh();
+      const cl = await mu._test.pcAlertText({ kind: 'entry', sym: 'BTCUSDT', text: '🔴 SHORT <pre>Entry     $100.00\nStop      $105.00</pre>' }); assert(/Like it +\+1R usually in .* h to .* h \(10 of 10 similar trades/.test(cl) && /usually done in ~4 h/.test(cl), cl);
+      const nocal = await mu._test.pcAlertText({ kind: 'entry', sym: 'BTCUSDT', text: '🔴 SHORT <pre>Entry     $100.00\nStop      $101.00</pre>' }); assert(/rough guess/.test(nocal), nocal); ok('pace: with 10 similar closed trades the alert quotes the observed range and sample size; with none it says "rough guess"');
+      await db.query('TRUNCATE pace_trades'); mu._test.getPcCal().at = 0;
+      // the tracker
+      PCP(103.5, 20); await mu._test.pcTick();
+      let row = (await db.query(`SELECT * FROM pace_trades`)).rows[0]; assert(row && row.symbol === 'BTCUSDT' && row.proof === 'fast' && Number(row.peak_r) >= 0.34, JSON.stringify(row));
+      assert(row.klass && row.features && Number(row.features.stopPct) === 10, JSON.stringify(row.features)); ok('pace: an open trade is recorded with its signal-time class and features; 0.35R inside 20 min is proof of FAST');
+      PCP(106, 45); mu._test.pcState.get('BTCUSDT|Buy').entryAt = Date.now() - 45 * 60000; await mu._test.pcTick(); const stp = mu._test.pcState.get('BTCUSDT|Buy'); assert(stp.cp[15] && stp.cp[30] && !stp.cp[60] && stp.t05 !== null, JSON.stringify(stp.cp)); ok('pace: checkpoints at 15 and 30 min are stored once, time to +0.5R is noted');
+      delete state.positions['ADMINK:BTCUSDT']; await mu._test.pcTick(); assert.strictEqual(mu._test.pcState.size, 1, 'one empty look does not close the record'); await mu._test.pcTick();
+      row = (await db.query(`SELECT * FROM pace_trades`)).rows[0]; assert(row.closed_at && row.label === 'NORMAL', JSON.stringify(row)); assert.strictEqual(mu._test.pcState.size, 0); ok('pace: when the trade closes it is labelled from what it did (reached +0.5R but not +1R inside 3 h: NORMAL)');
+      // a flat trade proves slow and, in alert mode, says so once
+      await db.query('TRUNCATE pace_trades'); mu._test.pcState.clear(); await call('/api/admin/pace', 'POST', { mode: 'alert' }, admin);
+      PCP(100.2, 50); await mu._test.pcTick(); await mu._test.pcTick();
+      assert.strictEqual(mu._test.pcState.get('BTCUSDT|Buy').proof.state, 'slow'); assert.strictEqual(mu._test.pcState.get('BTCUSDT|Buy').alerted, true); ok('pace: flat after 45+ min = proof of SLOW, alert mode notes it once');
+      // the report and the settings
+      const g = await PCG(); assert(g.j.success && Array.isArray(g.j.open) && g.j.open[0].proof === 'slow' && g.j.report && Array.isArray(g.j.report.history.byStop), JSON.stringify(g.j).slice(0, 300));
+      assert.strictEqual((await call('/api/admin/pace', 'POST', { mode: 'weird' }, admin)).j.cfg.mode, 'shadow', 'a bad mode falls back'); assert((await call('/api/admin/pace', 'GET', null, null)).s === 401 || (await call('/api/admin/pace', 'GET', null, null)).s === 403); ok('pace: report and settings work, a bad value is refused, admin only');
+      // history from the Sentinel's own records: one fast trade (stop 2%) and one that went nowhere (stop 12%)
+      await db.query('TRUNCATE sentinel_trades, trade_path'); const tEnd = Date.now() - 3600000;
+      for (const [sym, entry, isl, peaks] of [['AAAUSDT', 100, 98, [0, 0.4, 0.8, 1.2]], ['BBBUSDT', 100, 88, [0, 0.02, 0.05, 0.03]]]) {
+        await db.query(`INSERT INTO sentinel_trades(at,symbol,side,profile,mode,entry,initial_sl,peak_r) VALUES($1,$2,'Buy','fast','shadow',$3,$4,1)`, [new Date(tEnd), sym, entry, isl]);
+        const n = sym === 'AAAUSDT' ? 30 : 500;                                        // the slow one stays open 500 steps of 1 min
+        for (let i = 0; i < n; i++) await db.query(`INSERT INTO trade_path(at,symbol,side,peak_r) VALUES($1,$2,'Buy',$3)`, [new Date(tEnd - (n - i) * 60000), sym, sym === 'AAAUSDT' ? Math.min(1.2, i * 0.05) : Math.min(0.05, i * 0.0002)]);
+      }
+      mu._test.pcHist().at = 0; const hg = (await PCG()).j.report.history; assert.strictEqual(hg.n, 2, JSON.stringify(hg)); assert.strictEqual(hg.byStop[0].fast, 1, JSON.stringify(hg.byStop)); assert.strictEqual(hg.byStop[3].slow, 1, JSON.stringify(hg.byStop)); ok('pace: history from the Sentinel records splits past trades by stop distance (2% stop ran fast, 12% stop went nowhere)');
+      const lv = await call('/api/admin/live-trades', 'GET', null, admin); assert(lv.j.success); ok('pace: the live trades view still loads with the pace field');
+      delete Stub.prototype.getKline; mu._test.snCandlesClear(); mu._test.swBarCache.clear(); delete state.positions['ADMINK:BTCUSDT']; mu._test.pcState.clear(); await call('/api/admin/pace', 'POST', { mode: 'shadow' }, admin); await reset();
+    }
+    // v2.9.14 CROSS-CHECK: the loops that touch the same trade must not undo each other
+    {
+      const H4 = 4 * 3600000, openNow = Math.floor(Date.now() / H4) * H4;
+      const feedAt = closeAt => { Stub.prototype.getKline = async () => { const rows = []; for (let k = 6; k >= 0; k--) { const t = openNow - k * H4, c = k <= 1 ? closeAt : 100; rows.push([String(t), '100', String(Math.max(c, 100) + 1), String(Math.min(c, 100) - 1), String(c), '10']); } return { retCode: 0, result: { list: rows.slice().reverse() } }; }; };
+      const realGPI = Stub.prototype.getPositionInfo;
+      const freshAs = o => { Stub.prototype.getPositionInfo = async function (a) { const r = await realGPI.call(this, a); if (a && a.symbol && r.result.list[0] && parseFloat(r.result.list[0].size) > 0) r.result.list[0] = { ...r.result.list[0], ...o }; return r; }; };
+      const SWPOS = (mark, sl, ageH) => { state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: String(mark), stopLoss: String(sl), createdTime: String(Date.now() - ageH * 3600000) }; };
+      const lgs = async ev => (await db.query(`SELECT * FROM profit_guard_log WHERE event=$1 ORDER BY id`, [ev])).rows;
+      const sig = async () => { await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','swing',100,90) ON CONFLICT (k) DO UPDATE SET eng='swing'`); };
+      // A: another loop has just set a tighter stop: the Profit Guard leaves it alone; with a looser real stop it writes as before
+      await reset(); await db.query('TRUNCATE profit_guard_log'); await sig(); await POST({ mode: 'live' }, { confirm: 'LIVE' });
+      SWPOS(113, 90, 2); freshAs({ stopLoss: '111' }); let n0 = state.stops.length; await mu._test.pgTick();
+      assert.strictEqual(state.stops.length, n0, 'a tighter stop already on Bybit is never overwritten with a looser one'); assert.strictEqual((await lgs('skipped')).length, 1);
+      Stub.prototype.getPositionInfo = realGPI; mu._test.pgState.clear(); freshAs({ stopLoss: '90' }); await mu._test.pgTick(); assert(state.stops.length > n0, 'a looser real stop is raised as before');
+      Stub.prototype.getPositionInfo = realGPI; ok('cross-check: every stop write first reads the real stop on Bybit and never loosens it (Profit Guard)');
+      // B: the swing manager and the pace tracker only LOOK at a re-entry plan; the Profit Guard is the one that uses it up
+      await reset(); await db.query('TRUNCATE profit_guard_log, pace_trades'); await sig(); await POST({ mode: 'shadow' }); mu._test.swState.clear(); mu._test.pcState.clear(); mu._test.swBarCache.clear(); feedAt(100);
+      SWPOS(101, 90, 2); mu._test.pgPlanned.set('BTCUSDT|Buy', { sl: 90, eng: 'swing', bot: 'YM ORACLE I', at: Date.now(), score: null, src: 'winner' });
+      await mu._test.swTick(); await mu._test.pcTick(); await mu._test.snTick();
+      assert(mu._test.pgPlanned.has('BTCUSDT|Buy'), 'swing manager, pace tracker and Sentinel left the plan alone'); await mu._test.pgTick();
+      assert(!mu._test.pgPlanned.has('BTCUSDT|Buy') && mu._test.pgState.get('BTCUSDT|Buy').reentry === true, 'the Profit Guard used it'); ok('cross-check: only the Profit Guard uses up a re-entry plan (the other loops just look)');
+      // C: when the Profit Guard sees a trade is gone, the swing floor and the swing picture go with it
+      mu._test.swFloor.set('BTCUSDT|Buy', 99); mu._test.swState.set('BTCUSDT|Buy', { profile: 'swing', entry: 100 }); delete state.positions['ADMINK:BTCUSDT']; await mu._test.pgTick();
+      assert(!mu._test.swFloor.has('BTCUSDT|Buy') && !mu._test.swState.has('BTCUSDT|Buy')); ok('cross-check: a stale swing floor never outlives the trade (a new trade on the same coin is not clamped by it)');
+      // D: the swing exit closes what is REALLY left (a scale-out may have taken a slice) and nothing if it is already gone
+      await reset(); await db.query('TRUNCATE profit_guard_log'); await sig(); await POST({ mode: 'off' }); await call('/api/admin/swing-mgr', 'POST', { mode: 'live', confirm: 'LIVE' }, admin);
+      mu._test.swState.clear(); mu._test.swBarCache.clear(); feedAt(93); SWPOS(94, 90, 30); freshAs({ size: '0.04' }); let nSub = state.submits.length; await mu._test.swTick();
+      const ex = state.submits.slice(nSub).filter(x => x.body.reduceOnly === true && x.k === 'ADMINK'); assert.strictEqual(ex.length, 1); assert.strictEqual(ex[0].body.qty, '0.04', 'the real remaining size, not the size read at the start of the pass');
+      Stub.prototype.getPositionInfo = realGPI; mu._test.swState.clear(); await db.query('TRUNCATE profit_guard_log'); SWPOS(94, 90, 30); freshAs({ size: '0' }); nSub = state.submits.length; await mu._test.swTick(); assert.strictEqual(state.submits.length, nSub, 'already closed: nothing is sent'); Stub.prototype.getPositionInfo = realGPI;
+      ok('cross-check: the swing exit uses the real remaining size and sends nothing when the trade is already closed');
+      // E: the bot is told the tighter of the two stops (Profit Guard and swing manager)
+      await reset(); await POST({ mode: 'live' }, { confirm: 'LIVE' }); await call('/api/admin/swing-mgr', 'POST', { mode: 'shadow' }, admin);
+      mu._test.pgState.set('BTCUSDT|Buy', { profile: 'swing', curSl: 96, seenAt: Date.now(), peak: 100, initialSl: 90, entry: 100 }); mu._test.swState.set('BTCUSDT|Buy', { profile: 'swing', curSl: 99.5, seenAt: Date.now(), entry: 100 });
+      assert.strictEqual((await mu.recordBotEvent({ v: 1, bot: 'YM ORACLE I', ev: 'read', sym: 'BTCUSDT', side: 'BUY', urg: 0.1, rp: 10, st: 0, tr: 0, pf: 0, rm: 0 })).sl, 96, 'swing manager in shadow: only the Profit Guard\'s stop is reported');
+      await call('/api/admin/swing-mgr', 'POST', { mode: 'live', confirm: 'LIVE' }, admin); assert.strictEqual((await mu.recordBotEvent({ v: 1, bot: 'YM ORACLE I', ev: 'read', sym: 'BTCUSDT', side: 'BUY', urg: 0.1, rp: 10, st: 0, tr: 0, pf: 0, rm: 0 })).sl, 99.5);
+      mu._test.pgState.clear(); mu._test.swState.clear(); await call('/api/admin/swing-mgr', 'POST', { mode: 'shadow' }, admin); delete Stub.prototype.getKline; mu._test.snCandlesClear(); mu._test.swBarCache.clear(); delete state.positions['ADMINK:BTCUSDT'];
+      ok('cross-check: with both live, the bot is handed the tighter of the Profit Guard\'s and the swing manager\'s stop');
+      await reset();
+    }
+    // v2.9.15 SCALP LANE: lane separation, scalp sign-up, the shadow recorder (confirmed entry, target, Lab), and no overlap with the core engines
+    {
+      await reset();
+      const SCG = () => call('/api/admin/scalp', 'GET', null, admin), SCP = (b) => call('/api/admin/scalp', 'POST', b, admin);
+      state.equity.KEYSC = 5000; state.equity.KEYCORE2 = 600;
+      delete process.env.SCALP_SIGNUP_OPEN; const closed = await call('/api/admin/invites', 'POST', { count: 1, lane: 'scalp' }, admin); assert(closed.s === 400 && /closed/.test(closed.j.message), 'scalp invites are closed by default');
+      process.env.SCALP_SIGNUP_OPEN = '1';
+      const iv = (await call('/api/admin/invites', 'POST', { count: 2, lane: 'scalp' }, admin)).j;
+      assert(iv.success && iv.lane === 'scalp' && iv.codes.length === 2, JSON.stringify(iv));
+      const ivc = (await call('/api/admin/invites', 'POST', { count: 1 }, admin)).j.codes[0];
+      assert.strictEqual((await call('/api/auth/invite-info?code=' + iv.codes[0], 'GET')).j.lane, 'scalp'); assert.strictEqual((await call('/api/auth/invite-info?code=' + ivc, 'GET')).j.lane, 'core');
+      assert.strictEqual((await call('/api/auth/invite-info?code=NOPE', 'GET')).s, 400);
+      const mk = (code, o) => call('/api/auth/signup', 'POST', { username: 'scx' + Math.random().toString(36).slice(2, 7), password: 'scalp-pass-12345', inviteCode: code, apiKey: 'KEYSC', apiSecret: 'sec', ...o });
+      process.env.SCALP_SIGNUP_OPEN = '0'; const shut = await mk(iv.codes[0], { sizeUsd: 1000, riskAck: true }); assert(shut.s === 400 && /not open/.test(shut.j.message), 'an existing scalp invite cannot sign up while scalp is closed'); process.env.SCALP_SIGNUP_OPEN = '1';
+      assert.strictEqual((await mk(iv.codes[0], {})).s, 400, 'scalp sign-up needs an amount');
+      assert.strictEqual((await mk(iv.codes[0], { sizeUsd: 1000 })).s, 400, 'and the risk notice');
+      assert.strictEqual((await mk(iv.codes[0], { sizeUsd: 5, riskAck: true })).s, 400, 'and at least 10 USD');
+      const scU = await mk(iv.codes[0], { sizeUsd: 1000, riskAck: true, sizeMode: 'percent', sizePct: 10 }); assert(scU.j.success, JSON.stringify(scU.j));
+      const row = (await db.query(`SELECT username, lane, size_mode, size_usd, size_pct FROM users WHERE lane='scalp'`)).rows; assert(row.length === 1 && row[0].size_mode === 'fixed' && Number(row[0].size_usd) === 1000 && row[0].size_pct === null, JSON.stringify(row));
+      const cu = await mk(ivc, { apiKey: 'KEYCORE2' }); assert(cu.j.success); assert.strictEqual((await db.query(`SELECT lane FROM users WHERE key_hash IS NOT NULL ORDER BY id DESC LIMIT 1`)).rows[0].lane, 'core');
+      assert.strictEqual((await mk(iv.codes[0], { sizeUsd: 1000, riskAck: true })).s, 400, 'a used invite cannot be used again');
+      {
+        const lg = await call('/api/auth/login', 'POST', { username: row[0].username, password: 'scalp-pass-12345' }); assert(lg.j.success, JSON.stringify(lg.j));
+        const hh = { Authorization: 'Bearer ' + lg.j.token };
+        assert.strictEqual((await call('/api/me/limits', 'POST', { sizeMode: 'percent', sizePct: 10 }, hh)).s, 400, 'a scalp account cannot switch to percent');
+        assert.strictEqual((await call('/api/me/limits', 'POST', { sizeUsd: 5 }, hh)).s, 400);
+        const chg = await call('/api/me/limits', 'POST', { sizeUsd: 2500 }, hh); assert(chg.j.success, 'the amount can be changed any time: ' + JSON.stringify(chg.j));
+        assert.strictEqual((await call('/api/me/limits', 'POST', { sizeUsd: 20000 }, hh)).s, 400, 'above the scalp ceiling is refused');
+        const r2 = (await db.query(`SELECT size_mode, size_usd, size_pct FROM users WHERE lane='scalp'`)).rows[0]; assert(r2.size_mode === 'fixed' && Number(r2.size_usd) === 2500 && r2.size_pct === null, JSON.stringify(r2));
+        const adm = (await call('/api/admin/users', 'GET', null, admin)).j.users; assert(adm.some(x => x.lane === 'scalp') && adm.some(x => x.lane === 'core'));
+      }
+      ok('scalp lane: the invite decides the lane, scalp sign-up needs a fixed USD amount (min 10) and the risk notice, a core invite stays core');
+      // isolation: no core fan-out reaches the scalp user
+      const n0 = state.submits.length, st0 = state.stops.length, lv0 = (state.levs || []).length;
+      await mu.fanOutLeverage({ symbol: 'BTCUSDT', buyLeverage: 8, sellLeverage: 8 });
+      await mu.fanOutOrder({ category: 'linear', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.10', takeProfit: '70000', stopLoss: '60000' });
+      await mu.fanOutTradingStop({ symbol: 'BTCUSDT', positionIdx: 0, stopLoss: '61000' });
+      state.positions['KEYSC:BTCUSDT'] = { side: 'Buy', size: '1' };
+      await mu._test.fanOutPartialClose('BTCUSDT', 'Buy', 0.5, { qtyStep: '0.01', minQty: '0.01' });
+      assert(state.submits.length > n0 && state.stops.length > st0, 'core users were handled');
+      assert(!state.submits.slice(n0).some(x => x.k === 'KEYSC') && !state.stops.slice(st0).some(x => x.k === 'KEYSC') && !(state.levs || []).slice(lv0).some(x => x.k === 'KEYSC'), 'the scalp user was not touched by any core order, stop, leverage or partial close');
+      assert.strictEqual(state.positions['KEYSC:BTCUSDT'].size, '1');
+      delete state.positions['KEYSC:BTCUSDT'];
+      assert.strictEqual((await mu._test.tradableUsers({ forOpen: true, lane: 'scalp' })).length, 1);
+      ok('scalp lane: core orders, stops, leverage and partial closes never reach a scalp account, and the core lists exclude it');
+      await reset();
+      // settings: off or shadow only
+      assert.strictEqual((await SCP({ mode: 'live' })).s, 400);
+      const g0 = await SCG(); assert(g0.j.success && g0.j.cfg.mode === 'shadow' && g0.j.lanes.scalp.users === 1 && g0.j.lanes.core.users >= 2, JSON.stringify(g0.j.lanes));
+      assert.strictEqual((await SCP({ confirmPct: 99, leverage: 50, shadowUsd: 1000 })).j.cfg.confirmPct, 2); assert.strictEqual(mu._test.getScCfg().leverage, 10);
+      const sp = (await SCP({ riskPct: 99, maxLev: 99, trail: false, stallMin: 3 })).j.cfg; assert(sp.riskPct === 20 && sp.maxLev === 10 && sp.trail === false && sp.stallMin === 3, JSON.stringify(sp)); await SCP({ riskPct: 4, maxLev: 10, trail: true, stallMin: 5 });
+      await SCP({ confirmPct: 0.25, leverage: 5, mode: 'off' }); mu._test.scState.clear(); await mu._test.scTick(); assert.strictEqual(mu._test.scState.size, 0, 'off records nothing');
+      await SCP({ mode: 'shadow' });
+      // the recorder: a fresh position is registered, prices are recorded, nothing is ever ordered or stopped
+      const nSub = state.submits.length, nStop = state.stops.length;
+      const origTk = Stub.prototype.getTickers;
+      Stub.prototype.getTickers = async function () { return { retCode: 0, result: { list: [{ symbol: 'BTCUSDT', lastPrice: String(state.scPx || 100) }, { symbol: 'ETHUSDT', lastPrice: '50' }] } }; };
+      state.scPx = 100; state.positions['ADMINK:BTCUSDT'] = { side: 'Buy', size: '0.1', avgPrice: '100', markPrice: '100', stopLoss: '99', createdTime: String(Date.now() - 20000) };
+      mu._test.scState.clear(); mu._test.scSeen.clear(); await db.query('TRUNCATE scalp_trades'); mu._test.scRun.lastDisc = 0;
+      await mu._test.scTick();
+      assert.strictEqual(mu._test.scState.size, 1); const key = [...mu._test.scState.keys()][0]; const st = mu._test.scState.get(key);
+      assert(st.target >= 0.5 && st.target <= 1.5 && st.signalPx === 100, JSON.stringify({ t: st.target, p: st.signalPx }));
+      assert(st.lev >= 1 && st.lev <= 10 && Math.abs(st.lev * st.target - 4) < 0.5, 'leverage follows the stop: ' + st.lev + 'x for a ' + st.target + '% stop');
+      mu._test.scRun.lastDisc = 0; await mu._test.scTick(); assert.strictEqual(mu._test.scState.size, 1, 'the same call is registered once');
+      // a stale position (found late) is not registered
+      state.positions['ADMINK:ETHUSDT'] = { side: 'Sell', size: '1', avgPrice: '50', markPrice: '50', stopLoss: '51', createdTime: String(Date.now() - 600000) };
+      mu._test.scRun.lastDisc = 0; await mu._test.scTick(); assert.strictEqual(mu._test.scState.size, 1, 'old positions are ignored'); delete state.positions['ADMINK:ETHUSDT'];
+      // price confirms (+0.3%), then runs to the target; fake the clock by rewriting the recorded path
+      st.path = [[0, 100], [30, 100.1], [60, 100.3], [120, 100.7], [200, 101.2]]; st.lastAt = 0;
+      const live = await SCG(); assert(live.j.watching.length === 1 && live.j.watching[0].entered === true, JSON.stringify(live.j.watching));
+      st.signalAt = Date.now() - 51 * 60000; st.target = 0.8; st.baseTarget = 0.8; st.lev = 5; st.klass = 'FAST'; st.score = 70; st.feat = { spreadPct: 0.01, turnoverUsd: 9e7 };
+      await mu._test.scTick();
+      assert.strictEqual(mu._test.scState.size, 0, 'finished after the tracking window');
+      const tr = (await db.query(`SELECT * FROM scalp_trades`)).rows; assert.strictEqual(tr.length, 1);
+      assert(tr[0].entered && tr[0].exit === 'end' && Number(tr[0].gross_pct) === 0.897 && Number(tr[0].net_pct) === 0.737 && Number(tr[0].lev) === 5 && Number(tr[0].usd) === 36.85 && tr[0].klass === 'FAST' && Number(tr[0].inst_net) > 0 && tr[0].gate === null, JSON.stringify(tr[0]));
+      assert(tr[0].base_exit === 'target' && Number(tr[0].base_net) === 0.64 && Number(tr[0].base_usd) === 32, 'the plain v2.9.15 rules are replayed alongside: ' + tr[0].base_exit + ' ' + tr[0].base_net);
+      assert.strictEqual(state.submits.length, nSub, 'shadow lane sent no order'); assert.strictEqual(state.stops.length, nStop, 'shadow lane wrote no stop');
+      // restart safety: the same call is not recorded twice
+      mu._test.scSeen.clear(); mu._test.scRun.lastDisc = 0; state.positions['ADMINK:BTCUSDT'].createdTime = String(Number(key.split('|')[2]) * 1000); await mu._test.scTick();
+      assert.strictEqual(mu._test.scState.size, 0, 'a call already in the ledger is not registered again');
+      // a call that never confirms is kept (as not entered) so the evidence is complete
+      state.positions['ADMINK:BTCUSDT'] = { side: 'Sell', size: '0.1', avgPrice: '100', markPrice: '100', stopLoss: '101', createdTime: String(Date.now() - 5000) };
+      mu._test.scRun.lastDisc = 0; await mu._test.scTick(); const st2 = [...mu._test.scState.values()][0]; assert(st2 && st2.side === 'Sell');
+      st2.path = [[0, 100], [60, 100.2], [300, 100.4], [900, 100.6]]; st2.signalAt = Date.now() - 51 * 60000; await mu._test.scTick();
+      const v1 = await SCG(); assert(v1.j.calls === 2 && v1.j.notEntered === 1 && v1.j.summary.n === 1 && v1.j.smart.n === 1 && v1.j.base.n === 1 && v1.j.recent.length === 2 && v1.j.lanes.scalp, JSON.stringify({ c: v1.j.calls, ne: v1.j.notEntered }));
+      assert(v1.j.verdict && v1.j.verdict.ready === false && /1 of 50|only 1/.test(v1.j.verdict.why), JSON.stringify(v1.j.verdict));
+      // Lab replays the recorded paths over the grid; needs no orders
+      const lab = (await call('/api/admin/scalp?lab=1', 'GET', null, admin)).j.lab; assert(Array.isArray(lab) && lab.length === 108 && lab.every(x => x.robust === false), 'lab runs; with 2 calls nothing is called robust');
+      // v2.9.16: the target comes from the coin's own recorded history, leverage follows the stop, gates and the portfolio guard apply
+      {
+        await db.query('TRUNCATE scalp_trades'); mu._test.scGrp.clear(); mu._test.scState.clear(); mu._test.scSeen.clear();
+        // a recorded path every 5 s: climbs to the confirmation, runs to the peak, falls back (dense, because the target picker keeps every third point)
+        const histPath = (pk) => { const o = []; for (let t = 0; t <= 360; t += 5) { const v = t <= 60 ? 100 + 0.3 * t / 60 : t <= 180 ? 100.3 + (pk - 100.3) * (t - 60) / 120 : t <= 190 ? pk - (pk - 100.3) * 0.5 * (t - 180) / 10 : (pk + 100.3) / 2 - ((pk + 100.3) / 2 - 100.3) * (t - 190) / 170; o.push([t, Math.round(v * 1000) / 1000]); } return o; };
+        const hist = (i, pk) => [`h${i}`, 'BTCUSDT', 'Buy', 100, new Date(Date.now() - (i + 1) * 3600000), JSON.stringify(histPath(pk))];
+        for (let i = 0; i < 16; i++) await db.query(`INSERT INTO scalp_trades(k,symbol,side,signal_px,signal_at,entered,path) VALUES($1,$2,$3,$4,$5,true,$6)`, hist(i, 100.92));
+        const pl = await mu._test.scPlan('BTCUSDT'); assert(pl.tgtSrc === 'coin' && pl.target <= 0.6 && !pl.skip && pl.lev === Math.min(10, Math.floor(4 / pl.target * 10) / 10), 'a coin that only reaches ~0.6% gets a 0.6% target and leverage 4/0.6: ' + JSON.stringify(pl));
+        const pl2 = await mu._test.scPlan('NEWUSDT'); assert(pl2.tgtSrc !== 'coin' && pl2.target > 0, 'a coin with no history uses the all-coin history or the default: ' + JSON.stringify(pl2));
+        for (let i = 0; i < 16; i++) await db.query(`INSERT INTO scalp_trades(k,symbol,side,signal_px,signal_at,entered,path) VALUES($1,$2,$3,$4,$5,true,$6)`, [`l${i}`, 'LOSEUSDT', 'Buy', 100, new Date(Date.now() - (i + 1) * 3600000), JSON.stringify(histPath(99.0))]);
+        mu._test.scGrp.clear(); const pl3 = await mu._test.scPlan('LOSEUSDT'); assert(pl3.skip === true && /money/.test(pl3.why), 'a coin where nothing paid is flagged: ' + JSON.stringify(pl3));
+        // gates and guards: a wide spread is recorded but not counted; the crowd guard limits same-direction scalps
+        await db.query('TRUNCATE scalp_trades'); mu._test.scGrp.clear();
+        const mkSt = (n, side, feat) => ({ k: 'g' + n, symbol: 'ZZZUSDT', side, signalPx: 100, signalAt: Date.now() - 51 * 60000, klass: 'FAST', score: 70, target: 0.8, baseTarget: 0.8, lev: 5, plan: { tgtSrc: 'default', skip: false }, feat, cfg: { ...mu._test.getScCfg() }, path: [[0, 100], [30, 100.3], [60, 101.2], [900, 101.2]], lastAt: 0 });
+        for (let n = 0; n < 5; n++) { const st = mkSt(n, 'Buy', n === 0 ? { spreadPct: 0.4, turnoverUsd: 9e7 } : { spreadPct: 0.01, turnoverUsd: 9e7 }); st.signalAt = Date.now() - 51 * 60000 + n * 1000; await mu._test.scFinish(st); }
+        const gv = (await SCG()).j; assert(gv.guards.gated['wide spread'] === 1 && gv.guards.crowd === 1 && gv.guards.passed === 3 && gv.summary.n === 5 && gv.smart.n === 3, JSON.stringify(gv.guards) + ' ' + gv.summary.n + ' ' + gv.smart.n);
+        assert(gv.avgLev === 5 && gv.usdTotal > 0 && gv.usdBase > 0, 'totals');
+        // walk-forward suggestion is part of the Lab answer and says why when it has nothing to suggest
+        const lb = (await call('/api/admin/scalp?lab=1', 'GET', null, admin)).j; assert(lb.suggestion && typeof lb.suggestion.why === 'string' && lb.lab.length === 108, JSON.stringify(lb.suggestion));
+        await db.query('TRUNCATE scalp_trades'); mu._test.scGrp.clear();
+        ok('scalp lane v2.9.16: target from the coin\'s own history (a coin that only reaches ~0.6% gets a target of 0.6% or less, not the 0.8% default), leverage = risk / stop, a coin where nothing paid is flagged, wide-spread calls recorded but not counted, at most 3 open per direction, base vs smart replay stored, walk-forward suggestion returned');
+      }
+      ok('scalp lane (shadow): fresh calls recorded once, price path stored, confirmed entry -> +0.74% net / $37 on $1000 x5 with the trailing exit (the plain rules would have made $32), unconfirmed calls kept as not entered, no order or stop ever sent, Lab runs, verdict waits for 50 trades');
+      // does not disturb the engines: the core sentinel / profit guard / swing / pace loops see the same positions and still behave
+      await reset(); Stub.prototype.getTickers = origTk; mu._test.scState.clear(); await db.query('TRUNCATE scalp_trades');
+    }
     // ADAPT wiring: with candles available the loop reads the pair's own ATR and BTC's direction; with none it quietly uses the plain rules
     await reset();
     await db.query(`INSERT INTO signals(k,bot,symbol,side,eng,entry,sl) VALUES('pgsig','YM ORACLE I','BTCUSDT','BUY','swing',100,90) ON CONFLICT (k) DO NOTHING`);
@@ -1714,6 +1957,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
       await mu._test.pgTick(); assert.strictEqual(state.submits.slice(nS1).filter(x => x.k === 'ADMINK' && x.body.reduceOnly === true).length, 1, 'only one slice per trade');
       ok('bot reversal reading (live): needs the confirm, takes one reduce-only slice, once, and tells the bot the relay is handling it');
       // a middling reading only shrinks the stop room (no slice); no reading and a stale one change nothing
+      { const t1 = Date.now() - 61 * 60000, b1 = []; for (let k = 0; k < 60; k++) b1.push([String(t1 + k * 60000), '104', '106', '102', '104', '10']); Stub.prototype.getKline = async () => ({ retCode: 0, result: { list: b1.slice().reverse() } }); }   // v2.9.12: the swing pace is read from hourly candles, so this block needs a candle source of its own
       await reset(); mu._test.botReads.clear(); await POST({ mode: 'live' }, { confirm: 'LIVE' }); await POST({ smart: { curve: { on: true }, rev: { on: true } } }, { confirm: 'LIVE' });
       mu._test.pgState.clear(); P(112, 90); await mu._test.pgTick(); const plain = mu._test.pgState.get('BTCUSDT|Buy').adapt.curveMul;
       await rd({ urg: 0.55 }); mu._test.pgState.clear(); const nS2 = state.submits.length; await mu._test.pgTick(); const withRead = mu._test.pgState.get('BTCUSDT|Buy');
@@ -1725,6 +1969,14 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
       await call('/api/admin/guards-master', 'POST', { on: true }, admin);
       ok('bot reversal reading: a middling reading only shrinks the stop room, a stale one is ignored, and with the master switch off the bot is never told to hold');
       mu._test.botReads.clear();
+      delete Stub.prototype.getKline; mu._test.snCandlesClear && mu._test.snCandlesClear();
+      // v2.9.12: with the swing manager live, a swing trade's real stop is reported to the bot even when the Profit Guard is not live for it
+      await call('/api/admin/swing-mgr', 'POST', { mode: 'live', confirm: 'LIVE' }, admin); mu._test.pgState.clear();
+      mu._test.swState.set('BTCUSDT|Buy', { profile: 'swing', curSl: 97.5, seenAt: Date.now(), entry: 100 });
+      assert.strictEqual((await rd({ urg: 0.1 })).sl, 97.5, 'swing manager live: the real stop is handed to the bot');
+      mu._test.swState.get('BTCUSDT|Buy').seenAt = Date.now() - 300000; assert.strictEqual((await rd({ urg: 0.1 })).sl, undefined, 'a stale swing picture is not reported');
+      await call('/api/admin/swing-mgr', 'POST', { mode: 'shadow' }, admin); mu._test.swState.get('BTCUSDT|Buy').seenAt = Date.now(); assert.strictEqual((await rd({ urg: 0.1 })).sl, undefined, 'shadow: nothing is reported'); mu._test.swState.clear();
+      ok('swing manager (live): the bot is told the real stop on Bybit, tighter-only copy on its side; stale or shadow: nothing');
     }
     // master switch
     P(150, 90); mu._test.pgState.clear(); await mu._test.pgTick();

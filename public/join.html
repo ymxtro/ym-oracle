@@ -204,7 +204,13 @@ function renderSignup(){
         +'<div class="box red" style="margin-top:10px;margin-bottom:0">Keys with withdrawal permission are rejected.</div>')
     +'<div class="btns"><button class="btn" data-sunext="0">Back</button><button class="btn pri" style="flex:1" data-sunext="2">I made the key</button></div></div>';}
   if(s===2)h+='<div class="card"><b>3. Paste your '+(u.env==='demo'?'demo ':'')+'key</b><label class="l" for="su4">Bybit API key</label><input id="su4" data-su="key" autocomplete="off" value="'+esc(u.key)+'"><label class="l" for="su5">Bybit API secret</label><input id="su5" data-su="secret" type="password" autocomplete="off" value="'+esc(u.secret)+'"><p class="hint">We check the permissions with Bybit before saving. The secret is stored encrypted.</p><div class="btns"><button class="btn" data-sunext="1">Back</button><button class="btn pri" style="flex:1" data-sunext="3">Continue</button></div><div id="suMsg" class="msg" role="alert"></div></div>';
-  if(s===3){var pc=Number(u.pct)||0,ex=500*pc/100;
+  if(s===3&&u.lane==='scalp'){
+    h+='<div class="card"><b>4. Scalp account: set your amount per trade</b><p class="hint" style="margin-top:8px">Scalp trades are quick in and out, aimed at small moves, using a fixed amount of USD that you choose. You can change the amount any time in your account. Leverage is set by the system for scalp trades.</p>'
+    +'<label class="l" for="su7">Amount per trade (USD of your own money)</label><input id="su7" data-su="usd" type="number" min="10" placeholder="e.g. 1000" value="'+esc(u.usd||'')+'">'
+    +'<div class="box red" style="margin-top:10px"><b>Please read.</b> Scalping is higher risk. Fees and slippage take a large share of small moves, and the strategy is still being tested. Only use money you can afford to lose.</div>'
+    +'<label style="display:flex;gap:10px;align-items:flex-start;margin-top:12px;font-size:13px;color:var(--paper)"><input type="checkbox" id="suAck"'+(u.ack?' checked':'')+' style="margin-top:2px"> I understand scalp trading can lose money, including several trades in a row, and past results do not promise future ones.</label>'
+    +'<div class="btns"><button class="btn" data-sunext="2">Back</button><button class="btn go" style="flex:1" id="suGo">Check and create account</button></div><div id="suMsg" class="msg" role="alert"></div></div>';}
+  else if(s===3){var pc=Number(u.pct)||0,ex=500*pc/100;
     h+='<div class="card"><b>4. Choose how much each trade uses</b><p class="hint" style="margin-top:8px">Every trade uses a percent of <b>your own</b> balance. The leverage, stop loss and take profit come from each signal, exactly as the bot sends them.</p>'
     +'<div class="seg" role="group" aria-label="Quick picks" style="margin:10px 0">'+[5,10,20].map(function(p){return '<button type="button" data-supct="'+p+'" aria-pressed="'+(pc===p)+'">'+p+'%'+(p===20?' · standard':'')+'</button>'}).join('')+'</div>'
     +'<label class="l" for="su6">Or type your own percent (1 to 30)</label><input id="su6" data-su="pct" type="number" min="1" max="30" value="'+esc(u.pct)+'">'
@@ -220,12 +226,27 @@ function suNext(n){
   if(n===1&&S.suStep===0){
     if(!u.invite.trim()||!u.user.trim()){msg('suMsg','Enter your invite code and a username.','err');return}
     if(u.pass.length<10){msg('suMsg','Your password needs at least 10 characters.','err');return}
+    u.lane='core';   // the normal sign-up never waits for the server here; a scalp invite switches the last step when its answer arrives
+    call('/api/auth/invite-info?code='+encodeURIComponent(u.invite.trim()),'GET').then(function(r){
+      if(r&&r.success&&r.lane==='scalp'){u.lane='scalp';if(S.suStep===3)renderSignup()}
+    }).catch(function(){});
   }
   if(n===3&&S.suStep===2&&(!u.key.trim()||!u.secret.trim())){msg('suMsg','Paste both the API key and the secret.','err');return}
   S.suStep=n;renderSignup();
 }
 function doSignup(){
   var u=S.su,pc=Number(u.pct);
+  if(u.lane==='scalp'){
+    var usd=Number(u.usd);
+    if(!(usd>=10)){msg('suMsg','Enter an amount of at least 10 USD per trade.','err');return}
+    if(!u.ack){msg('suMsg','Please tick the box to confirm you understand the risk.','err');return}
+    msg('suMsg','Checking your key with Bybit…','warn');
+    call('/api/auth/signup','POST',{inviteCode:u.invite,username:u.user,password:u.pass,apiKey:u.key,apiSecret:u.secret,env:u.env||'live',sizeMode:'fixed',sizeUsd:usd,riskAck:true}).then(function(r){
+      if(!r.success){msg('suMsg',r.message||'Signup failed','err');return}
+      setTok(r.token);S.su={invite:'',user:'',pass:'',key:'',secret:'',env:'live',pct:'20',ack:false,confirmHigh:false};S.suStep=0;show();
+    });
+    return;
+  }
   if(!(pc>=1&&pc<=30)){msg('suMsg','Choose a percent between 1 and 30.','err');return}
   if(pc>20&&!u.confirmHigh){msg('suMsg','Please confirm you want more than 20% per trade.','err');return}
   if(!u.ack){msg('suMsg','Please tick the box to confirm you understand the risk.','err');return}
@@ -304,6 +325,7 @@ function openHtml(){
 function cockpitHtml(m){
   var f=S.form,L=m.limits,R=m.rails||{},mx=L.pctMax||STDX.max;
   var h='<div class="card cockpit" style="margin-top:12px"><div class="aph"><span class="lamp"></span><div><b>YOUR TRADE SIZE</b><span class="mist small">Every trade is sized from your own balance. Leverage and stops come from the signal.</span></div></div>';
+  if(m.lane==='scalp'&&!m.scalpLive)h+='<div class="box"><b>Scalp account.</b> Your account is registered and your key is checked, but scalp trading is still in its testing stage: no scalp trades are placed yet. You will be told here when it starts. You can set or change the amount per trade (USD) below at any time.</div>';
   if(m.notice)h+='<div class="box" id="noticeBox"><b>Change to your account.</b> '+esc(m.notice)+'<div class="btns" style="margin-top:8px"><button class="btn" data-act="dismissNotice">Got it</button></div></div>';
   h+='<label class="l">How should each trade be sized?</label><div class="seg" role="group" aria-label="Size mode">'+[['percent','% of my balance'],['fixed','Fixed amount']].map(function(o){return '<button data-sm="'+o[0]+'" aria-pressed="'+(f.sizeMode===o[0])+'">'+o[1]+'</button>'}).join('')+'</div>';
   if(f.sizeMode==='percent'){

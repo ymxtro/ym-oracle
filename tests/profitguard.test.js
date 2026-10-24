@@ -3,7 +3,7 @@ const assert = require('assert');
 const G = require(process.env.RELAY_DIR ? process.env.RELAY_DIR + '/profitguard.js' : '../profitguard.js');
 let n = 0; const ok = m => console.log('  ok', ++n, m);
 const cfg = G.normalize({ mode: 'live', smart: { curve: { on: false } } });   // the older checks below test the ladder alone; the curve has its own checks at the end
-const sw = cfg.swing, fast = cfg.fast;
+const sw = { ...cfg.swing, beR: 1, minGapPct: 0 }, fast = cfg.fast;   // v2.9.12: the older ladder-math checks use the plain 1R start and the global gap
 const L = (o) => G.decide({ side: 'Buy', entry: 100, initialSl: 90, curSl: 90, mark: 100, peak: 100, tick: 0.01, profile: sw, cfg, ...o });
 const S = (o) => G.decide({ side: 'Sell', entry: 100, initialSl: 110, curSl: 110, mark: 100, peak: 100, tick: 0.01, profile: sw, cfg, ...o });
 
@@ -13,9 +13,19 @@ assert.strictEqual(G.normalize(null).mode, 'off'); assert.strictEqual(G.normaliz
 assert.strictEqual(G.normalize({ mode: 'shadow' }).mode, 'shadow');
 ok('off by default; garbage falls back safely');
 const c2 = G.normalize({ pollSec: 1, minGapPct: 99, swing: { beR: 0, ladder: [[4, 0.5], [2, 0.8], [9, 0.3], ['x', 1], [1, 5]] } });
-assert.strictEqual(c2.pollSec, 5); assert.strictEqual(c2.minGapPct, 0.25); assert.strictEqual(c2.swing.beR, 1);
+assert.strictEqual(c2.pollSec, 5); assert.strictEqual(c2.minGapPct, 0.25); assert.strictEqual(c2.swing.beR, 1.5);
 assert.deepStrictEqual(c2.swing.ladder, [[2, 0.8], [4, 0.8], [9, 0.8]]);
 ok('limits enforced, ladder sorted, a higher rung never keeps less than a lower one');
+// v2.9.12 swing defaults
+assert.strictEqual(cfg.swing.minGapPct, 1.2); assert.strictEqual(cfg.fast.minGapPct, 0); assert.strictEqual(cfg.swing.scale.on, true); assert.deepStrictEqual(cfg.swing.scale.steps, [[1.75, 0.3]]);
+{
+  const base = { side: 'Buy', entry: 100, mark: 110, peak: 110, curSl: 95, initialSl: 95, tick: 0.01, cfg, smart: {} };
+  const dFast = G.decide({ ...base, profile: { ...cfg.fast, beR: 1, ladder: [[1, 0.99]] } }), dSwing = G.decide({ ...base, profile: { ...cfg.swing, beR: 1, ladder: [[1, 0.99]] } });
+  assert.strictEqual(dFast.action, 'raise'); assert.strictEqual(dSwing.action, 'raise');
+  assert(dFast.newSl > dSwing.newSl, 'a swing trade keeps at least 1.2% from the price, a fast trade only 0.25%: ' + dFast.newSl + ' vs ' + dSwing.newSl);
+  assert(110 - dSwing.newSl >= 110 * 0.012 - 0.011, 'swing gap is 1.2% of the price');
+}
+ok('swing profile: its own first-lock level, a 1.2% minimum gap (fast keeps 0.25%), one planned partial at 1.75R');
 
 // not yet
 assert.strictEqual(L({ peak: 100 }).action, 'none');
@@ -91,9 +101,9 @@ assert.strictEqual(G.normalize({ mode: 'live', fast: { mode: 'weird' } }).fast.m
 ok('modes: overall Off is a master; a profile follows it or has its own; garbage falls back to follow');
 
 // scale-out settings and maths
-assert.strictEqual(G.defaults().swing.scale.on, false);
+assert.strictEqual(G.defaults().swing.scale.on, true); assert.strictEqual(G.defaults().fast.scale.on, false);   // v2.9.12: swing takes one planned partial by default
 assert.deepStrictEqual(G.normalize({ swing: { scale: { on: true, steps: [[3, 0.25], [6, 0.25]] } } }).swing.scale, { on: true, steps: [[3, 0.25], [6, 0.25]] });
-assert.deepStrictEqual(G.normalize({ swing: { scale: { on: true, steps: [[3, 0.5], [6, 0.5]] } } }).swing.scale.steps, [[3, 0.25]], 'more than 70% off in total falls back: a runner always stays');
+assert.deepStrictEqual(G.normalize({ swing: { scale: { on: true, steps: [[3, 0.5], [6, 0.5]] } } }).swing.scale.steps, [[1.75, 0.3]], 'more than 70% off in total falls back: a runner always stays');
 assert.deepStrictEqual(G.normalize({ swing: { scale: { steps: [[3, 0.9], [0.1, 0.2]] } } }).swing.scale.steps, []);
 assert.strictEqual(G.scaleDue([[2, 0.25], [4, 0.25]], 1.9, []), -1); assert.strictEqual(G.scaleDue([[2, 0.25], [4, 0.25]], 2.5, []), 0);
 assert.strictEqual(G.scaleDue([[2, 0.25], [4, 0.25]], 5, [0]), 1); assert.strictEqual(G.scaleDue([[2, 0.25]], 9, [0]), -1);
