@@ -329,4 +329,34 @@ ok('tuning: waits for enough live trades, tightens when profit is handed back, l
   assert(G.curveKeep(cc, 1.5, rd.curveMul) > G.curveKeep(cc, 1.5, base.curveMul));
   ok('reversal reading: shrinks the stop room smoothly, so the stop keeps more of the peak, and never leaves the bounds');
 }
+
+// v2.9.19: picking the closed-PnL rows of ONE trade (a coin traded again must never get another trade's exit or PnL)
+{
+  const T0 = 1_000_000_000_000, row = (id, entry, exit, pnl, at) => ({ symbol: 'XUSDT', orderId: id, avgEntryPrice: String(entry), avgExitPrice: String(exit), closedPnl: String(pnl), updatedTime: String(at) });
+  const A = row('a', 100, 99, -10, T0 + 600000), B = row('b', 105, 104, 7, T0 + 7200000);
+  // a later trade on the same coin leaked in before: the first trade must keep only its own row
+  let p = G.pickCloseRows([B, A], { symbol: 'XUSDT', entry: 100, sinceMs: T0, untilMs: T0 + 900000 });
+  assert.deepStrictEqual(p.rows.map(x => x.orderId), ['a']); assert.strictEqual(parseFloat(p.last.avgExitPrice), 99);
+  ok('closed-PnL pick: only the trade\'s own row (a later trade on the same coin is not mixed in)');
+  // entry price keeps an older, same-window row of another trade out even with no upper limit
+  p = G.pickCloseRows([A, B], { symbol: 'XUSDT', entry: 105, sinceMs: T0 });
+  assert.deepStrictEqual(p.rows.map(x => x.orderId), ['b']);
+  ok('closed-PnL pick: the entry price tells two trades on one coin apart');
+  // a row already given to a finished trade is never handed out twice
+  p = G.pickCloseRows([A], { symbol: 'XUSDT', entry: 100, sinceMs: T0, used: new Set(['a']) });
+  assert.strictEqual(p, null); ok('closed-PnL pick: a claimed row is not reused (no stale copy)');
+  // rows that belong to other trades only: nothing, so the caller retries and finally stores no exit rather than a wrong one
+  assert.strictEqual(G.pickCloseRows([A], { symbol: 'XUSDT', entry: 105, sinceMs: T0 }), null);
+  ok('closed-PnL pick: only other trades\' rows -> nothing (honest empty, never a wrong exit)');
+  // partial closes of the same trade are all summed
+  const A2 = row('a2', 100, 98, -4, T0 + 300000);
+  p = G.pickCloseRows([A, A2], { symbol: 'XUSDT', entry: 100, sinceMs: T0, untilMs: T0 + 900000 });
+  assert.strictEqual(p.rows.length, 2); assert.strictEqual(p.rows.reduce((t, x) => t + Number(x.closedPnl), 0), -14); assert.strictEqual(p.last.orderId, 'a');
+  ok('closed-PnL pick: partial closes of one trade are all kept; the last one gives the exit');
+  // older rows without an entry price keep the previous behaviour; other coins and rows before the trade are ignored
+  const old = { symbol: 'XUSDT', avgExitPrice: '99', closedPnl: '-10', updatedTime: String(T0 + 1000) };
+  assert.strictEqual(G.pickCloseRows([old], { symbol: 'XUSDT', entry: 100, sinceMs: T0 }).rows.length, 1);
+  assert.strictEqual(G.pickCloseRows([{ ...old, symbol: 'YUSDT' }, { ...old, updatedTime: String(T0 - 3600000) }], { symbol: 'XUSDT', entry: 100, sinceMs: T0 }), null);
+  ok('closed-PnL pick: rows without an entry price still work; other coins and rows from before the trade are ignored');
+}
 console.log('PASS ' + n);

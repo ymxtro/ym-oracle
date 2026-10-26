@@ -39,7 +39,7 @@ const ORDER_FIELDS = ['category', 'symbol', 'isLeverage', 'side', 'orderType', '
   'timeInForce', 'positionIdx', 'takeProfit', 'stopLoss', 'tpTriggerBy', 'slTriggerBy', 'reduceOnly', 'closeOnTrigger', 'smpType', 'tpslMode', 'tpLimitPrice', 'slLimitPrice', 'tpOrderType', 'slOrderType'];
 const STOP_FIELDS = ['symbol', 'positionIdx', 'takeProfit', 'stopLoss', 'trailingStop', 'activePrice', 'tpTriggerBy', 'slTriggerBy', 'tpslMode', 'tpSize', 'slSize', 'tpLimitPrice', 'slLimitPrice', 'tpOrderType', 'slOrderType'];
 const NUMERIC_FIELDS = ['qty', 'price', 'triggerPrice', 'takeProfit', 'stopLoss', 'tpLimitPrice', 'slLimitPrice', 'tpSize', 'slSize', 'trailingStop', 'activePrice'];
-const SYMBOL_RE = /^[A-Z0-9]{2,20}USDT$/;
+const SYMBOL_RE = /^[A-Z0-9]{1,20}USDT$/;   // v2.9.19: was {2,20}, which refused one-letter tickers such as AUSDT (no ledger row, and copy-user orders for it were dropped)
 
 // ---------- pure helpers (unit-testable) ----------
 function sha1(s) { return crypto.createHash('sha1').update(String(s)).digest('hex'); }
@@ -371,6 +371,10 @@ function init(deps) {
   // v2.9.4: trades the relay has seen close on the exchange (stop, target, Profit Guard, anything). A bot that is still tracking the trade asks via its
   // 'read' event and gets the real exit back, so it books the REAL result instead of a later phantom stop. Memory only; key SYMBOL|Buy/Sell.
   const masterClosed = new Map();
+  // v2.9.19: closed-PnL rows already given to a finished trade (by Bybit order id), one set per scorecard, so the next trade on the same coin can never be handed the same row. Memory only; bounded.
+  const closeUsed = { pg: new Set(), sn: new Set() };
+  const CLOSE_TRIES = 15;     // v2.9.19: was 6; Bybit can take a while to publish a close, and a give-up stores the trade with no exit (ATH 25 Oct)
+  function claimClose(which, ids) { const s = closeUsed[which]; for (const i of ids || []) s.add(i); if (s.size > 600) for (const i of [...s].slice(0, s.size - 400)) s.delete(i); }
   const closedDbMiss = new Map();   // v2.9.11: 'SYMBOL|Side|ot' -> when the database last said "not closed", so a bot asking every minute costs at most one query a minute
   async function closedFromDb(rkey, otMs) {
     const ck = rkey + '|' + otMs, seen = closedDbMiss.get(ck);
@@ -1719,16 +1723,15 @@ function init(deps) {
   // A trade has closed: find Bybit's own exit, store the scorecard row, and (for a winner) start a re-entry watch.
   async function pgRecordClose(it) {
     const st = it.st, [symbol, side] = it.key.split('|'), long = side === 'Buy';
-    let exit = 0, pnl = null;
+    let exit = 0, pnl = null, usedIds = [];
     try {
-      const r = await restClient.getClosedPnL({ category: 'linear', symbol, limit: 10 });
-      const rows = ((r.result && r.result.list) || []).filter(x => x.symbol === symbol && Number(x.updatedTime || x.createdTime || 0) >= st.since - 60000);
-      // v2.9.11: the newest closing row of THIS trade. It used to also require the row to be within 3 minutes before we noticed the close, so a relay that woke from a sleep
-      // or restart (it noticed hours later) found no exit price at all: 5 of 19 trades on 21-22 Oct. Rows are already limited to those after the trade began; the upper bound keeps a LATER trade out.
-      const last = rows.filter(x => Number(x.updatedTime || x.createdTime || 0) <= it.at + 120000).sort((a, b) => Number(b.updatedTime || b.createdTime || 0) - Number(a.updatedTime || a.createdTime || 0))[0];
-      if (last && parseFloat(last.avgExitPrice) > 0) { exit = parseFloat(last.avgExitPrice); pnl = rows.reduce((t, x) => t + (Number(x.closedPnl) || 0), 0); }
+      const r = await restClient.getClosedPnL({ category: 'linear', symbol, limit: 50 });
+      // v2.9.19: only the rows of THIS trade (time window + entry price + not already claimed): see PG.pickCloseRows. The earlier version summed every row since the trade began, so a later trade on the same coin leaked in.
+      const pick = PG.pickCloseRows((r.result && r.result.list) || [], { symbol, entry: st.entry, sinceMs: st.since, untilMs: it.at + 120000, used: closeUsed.pg });
+      if (pick) { exit = parseFloat(pick.last.avgExitPrice); pnl = pick.rows.reduce((t, x) => t + (Number(x.closedPnl) || 0), 0); usedIds = pick.rows.map(x => String(x.orderId || '')).filter(Boolean); }
     } catch { /* retried below */ }
-    if (!(exit > 0) && it.tries < 6) { it.tries++; return false; }
+    if (!(exit > 0) && it.tries < CLOSE_TRIES) { it.tries++; return false; }
+    claimClose('pg', usedIds);
     const entry = st.entry, risk = st.initialSl > 0 ? Math.abs(entry - st.initialSl) : 0;
     const peakDist = long ? st.peak - entry : entry - st.peak, exitDist = exit > 0 ? (long ? exit - entry : entry - exit) : null;
     const peakPct = peakDist / entry * 100, exitPct = exitDist === null ? null : exitDist / entry * 100;
@@ -2066,19 +2069,21 @@ function init(deps) {
     catch { snBtc.at = Date.now() - 30000; }
     return snBtc.pct;
   }
-  async function snExitOf(symbol, sinceMs) {
+  async function snExitOf(symbol, sinceMs, entry, untilMs) {
     try {
-      const r = await restClient.getClosedPnL({ category: 'linear', symbol, limit: 10 });
-      // v2.9.11: newest row first by its own time (never trust the list order), the same pick the Profit Guard scorecard makes: on 21 Oct the two scorecards disagreed on the exit of the same trade (AVAX 0.06R vs 0.73R)
-      const rows = ((r.result && r.result.list) || []).filter(x => x.symbol === symbol && Number(x.updatedTime || x.createdTime || 0) >= sinceMs - 60000).sort((a, b) => Number(b.updatedTime || b.createdTime || 0) - Number(a.updatedTime || a.createdTime || 0));
-      if (rows.length && parseFloat(rows[0].avgExitPrice) > 0) return { exit: parseFloat(rows[0].avgExitPrice), pnl: rows.reduce((t, x) => t + (Number(x.closedPnl) || 0), 0) };
+      const r = await restClient.getClosedPnL({ category: 'linear', symbol, limit: 50 });
+      // v2.9.19: the same trade-matching the Profit Guard uses (time window, entry price, not already claimed). Before, this took the newest row since the entry with no upper limit and summed all
+      // later rows too, so on a coin traded again the exit and PnL could be another trade's.
+      const pick = PG.pickCloseRows((r.result && r.result.list) || [], { symbol, entry, sinceMs, untilMs, used: closeUsed.sn });
+      if (pick) return { exit: parseFloat(pick.last.avgExitPrice), pnl: pick.rows.reduce((t, x) => t + (Number(x.closedPnl) || 0), 0), ids: pick.rows.map(x => String(x.orderId || '')).filter(Boolean) };
     } catch { /* retried */ }
     return null;
   }
   async function snRecordClose(it) {
     const st = it.st, [symbol, side] = it.key.split('|'), long = side === 'Buy';
-    const ex = await snExitOf(symbol, st.entryAt || st.since);
-    if (!ex && it.tries < 6) { it.tries++; return false; }
+    const ex = await snExitOf(symbol, st.entryAt || st.since, st.entry, it.at + 120000);
+    if (!ex && it.tries < CLOSE_TRIES) { it.tries++; return false; }
+    if (ex) claimClose('sn', ex.ids);
     const risk = st.initialSl > 0 ? Math.abs(st.entry - st.initialSl) : 0;
     const rOf = px => (risk > 0 && px > 0 ? (long ? px - st.entry : st.entry - px) / risk : null);
     const peakR = risk > 0 ? (long ? st.peak - st.entry : st.entry - st.peak) / risk : null;

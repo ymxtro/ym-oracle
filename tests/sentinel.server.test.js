@@ -25,7 +25,9 @@ function build() {
     setTradingStop: async b => { rec.stops.push(b); return { retCode: 0, result: {} }; },
     getClosedPnL: async () => ({ retCode: 0, result: { list: rec.closedPnl } }),
   };
+  const closeUsed = { pg: new Set(), sn: new Set() };   // v2.9.19: the claimed closed-PnL rows (the real ones live in multiuser.js)
   const deps = {
+    closeUsed, CLOSE_TRIES: 15, claimClose: (w, ids) => { for (const i of ids || []) closeUsed[w].add(i); },
     SN, PG, snCfg: SN.normalize({ mode: 'shadow' }), pgCfg: PG.defaults(), snState: new Map(), pgState: new Map(), guardsMaster: true, restClient,
     q: async (text, params) => { rec.q.push({ text, params }); return { rows: [], rowCount: 0 }; },
     ready: Promise.resolve(), getMode: () => 'live', breakerIsTripped: () => false,
@@ -103,5 +105,24 @@ const tick = async (api) => { api.snRun.busy = false; await api.snTick(); };
   T = build(); T.st.bars = all.slice(0, 50); T.st.positions = [pos(100.3, 99)];   // candles and price agree: a steady drift up
   const l5 = T.remake('live'); await tick(l5); await tick(l5);
   assert.strictEqual(T.rec.stops.length, 0); ok('a calm trade near its entry: no stop is touched');
+
+  // v2.9.19: the same coin traded twice - the second trade must get ITS OWN exit and PnL, not the first one's closed-PnL row
+  T = build(); T.st.positions = [pos(99.85, 99)];
+  const rp = T.remake('shadow'); await tick(rp); await tick(rp);
+  const nowMs = Date.now();
+  T.rec.closedPnl.push({ symbol: 'ABCUSDT', orderId: 'old1', avgEntryPrice: '90', avgExitPrice: '95', closedPnl: '50', updatedTime: String(nowMs - 30000) });   // an earlier trade, entry 90
+  T.rec.closedPnl.push({ symbol: 'ABCUSDT', orderId: 'new1', avgEntryPrice: '100', avgExitPrice: '99', closedPnl: '-10', updatedTime: String(nowMs) });
+  T.st.positions = []; await tick(rp);
+  const sc2 = T.rec.q.find(x => /INSERT INTO sentinel_trades/.test(x.text));
+  assert(sc2, 'scorecard row'); assert.strictEqual(sc2.params[13], 99); assert.strictEqual(sc2.params[15], -10);
+  ok('repeat coin: the scorecard takes its own closed-PnL row (exit 99, PnL -10), not the earlier trade\'s (95, +50)');
+  T = build(); T.st.positions = [pos(99.85, 99)];
+  const rq = T.remake('shadow'); await tick(rq); await tick(rq);
+  T.rec.closedPnl.push({ symbol: 'ABCUSDT', orderId: 'old2', avgEntryPrice: '90', avgExitPrice: '95', closedPnl: '50', updatedTime: String(Date.now()) });
+  T.st.positions = [];
+  for (let i = 0; i < 16; i++) await tick(rq);
+  const sc3 = T.rec.q.find(x => /INSERT INTO sentinel_trades/.test(x.text));
+  assert(sc3 && sc3.params[13] === null && sc3.params[15] === null, 'no matching row -> no exit stored (not the other trade\'s)');
+  ok('repeat coin: when only another trade\'s row exists, no exit is stored after the retries (never a wrong one)');
   console.log('sentinel server block: ' + n + ' checks passed');
 })().catch(e => { console.error('FAIL:', e && e.stack || e); process.exit(1); });

@@ -29,6 +29,7 @@ function world(o) {
     },
     fanOutLeverage: () => { w.fan.lev++; }, fanOutTradingStop: () => { w.fan.stop++; },
     guardClamp: o.guardClamp,
+    maxStopPct: o.maxStopPct === undefined ? undefined : () => o.maxStopPct,
     report: r => w.reports.push(r),
   });
   w.run = b => ex.run(b);
@@ -127,6 +128,26 @@ const open = (x) => Object.assign({ kind: 'open', id: 'T0001', bot: 'YM ORACLE I
   ok('no trail asked = no trailing call');
   w = world(); await w.run(open()); assert.strictEqual(w.fan.lev, 1); assert.strictEqual(w.fan.stop, 1);
   ok('leverage and trailing stop are also copied to the users\' accounts (fire and forget)');
+
+  // ---- v2.9.17 stop-distance limit
+  w = world({ maxStopPct: 10 }); r = await w.run(open({ id: 'W0001', sl: '95' }));   // price 100, stop 95 = 5% away
+  assert.strictEqual(r.body.code, 'OK'); assert.strictEqual(w.orders.length, 1);
+  ok('stop-distance limit: a stop 5% away is inside a 10% limit and trades as before');
+  w = world({ maxStopPct: 10 }); r = await w.run(open({ id: 'W0002', sl: '74', leverage: 2 }));   // 26% away, like BMT
+  assert.strictEqual(r.body.ok, false); assert.strictEqual(r.body.code, 'WIDE'); assert(/26\.0% from the price/.test(r.body.detail) && /52% of the margin/.test(r.body.detail), r.body.detail);
+  assert.strictEqual(w.orders.length, 0); assert.strictEqual(w.leverage.length, 0, 'nothing is changed on Bybit'); assert.strictEqual(w.stops.length, 0); assert.strictEqual(w.fan.lev, 0, 'users are not told either');
+  assert.strictEqual(w.reports.length, 1); assert.strictEqual(w.reports[0].code, 'WIDE'); assert.strictEqual(w.reports[0].ok, false);
+  ok('stop-distance limit: a stop 26% away is refused (WIDE) before leverage, order, trailing stop or user copies; the dashboard hears about it');
+  w = world({ maxStopPct: 10 }); r = await w.run(open({ id: 'W0003', side: 'SELL', sl: '112' }));   // a short with the stop 12% above
+  assert.strictEqual(r.body.code, 'WIDE'); ok('stop-distance limit: works for shorts (stop above the price)');
+  w = world({ maxStopPct: 0 }); r = await w.run(open({ id: 'W0004', sl: '60' })); assert.strictEqual(r.body.code, 'OK');
+  w = world(); r = await w.run(open({ id: 'W0005', sl: '60' })); assert.strictEqual(r.body.code, 'OK');
+  ok('stop-distance limit: 0 = off, and a relay wired without it behaves exactly as before');
+  w = world({ maxStopPct: 10 }); r = await w.run(open({ id: 'W0006', sl: '', tp: '' })); assert.strictEqual(r.body.code, 'OK');
+  ok('stop-distance limit: a trade with no stop is not judged by it (nothing to measure)');
+  w = world({ maxStopPct: 10 }); w.positions.SOLUSDT = { side: 'Buy', size: '1' }; r = await w.run({ kind: 'close', id: 'W0007', side: 'BUY', symbol: 'SOLUSDT' }); assert.strictEqual(r.body.code, 'OK');
+  w = world({ maxStopPct: 10 }); w.positions.SOLUSDT = { side: 'Buy', size: '1' }; r = await w.run({ kind: 'sltp', id: 'W0008', side: 'BUY', symbol: 'SOLUSDT', sl: '60' }); assert.strictEqual(r.body.ok, true);
+  ok('stop-distance limit: closes and stop updates are never blocked by it');
 
   // ---- close
   w = world(); w.positions.SOLUSDT = { side: 'Buy', size: '1.5' };

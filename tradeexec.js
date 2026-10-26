@@ -236,6 +236,14 @@ function create(deps) {
     const h = unwrap(held, 'could not check the open positions');
     if (h) fail('HELD', 'already in a ' + h.side + ' position on ' + cmd.symbol);
     const rules = unwrap(inst, 'could not read the instrument rules for ' + cmd.symbol);
+    // v2.9.17 STOP-DISTANCE LIMIT: a stop very far from the price (BMT: 26% away, so about half the margin at risk at the minimum 2x leverage)
+    // is refused BEFORE anything is changed on Bybit, and because it never reaches processOrder the copy users skip it too.
+    // Fails open: if the limit or the price cannot be read, the trade carries on exactly as before.
+    const wideCap = d.maxStopPct ? Number(d.maxStopPct()) : 0;
+    if (wideCap > 0 && cmd.sl && px.status === 'fulfilled' && px.value > 0) {
+      const away = Math.abs(px.value - Number(cmd.sl)) / px.value * 100;
+      if (away > wideCap) fail('WIDE', 'skipped: the stop is ' + away.toFixed(1) + '% from the price, over the ' + wideCap + '% limit (about ' + (away * cmd.leverage).toFixed(0) + '% of the margin would be at risk at ' + cmd.leverage + 'x)');
+    }
     let lev = cmd.leverage;
     if (rules.maxLeverage >= 1 && lev > Math.floor(rules.maxLeverage)) lev = Math.floor(rules.maxLeverage);   // clamp to the pair's cap
     t = d.now(); await setLeverage(cmd.symbol, lev, cmd.masterOnly); T.lev = d.now() - t;

@@ -1083,7 +1083,7 @@ const EXEC_CODE_TEXT = {
   OK: 'Done', DUP: 'Already placed', NOCHG: 'Already at that value', PAPER: 'Paper mode, nothing sent', NOPOS: 'Nothing open to change',
   BAL: 'Not enough free balance', MINQ: "Below Bybit's minimum size", PAIR: 'Pair not on Bybit', LEV: 'Bybit rejected the leverage',
   NET: "Couldn't reach Bybit", BYBIT: 'Bybit refused it', BAD: 'Command malformed', PRICE: 'Price did not match',
-  HELD: 'Already holding this pair', HALT: 'Trading is halted', SIDE: 'Position is on the other side',
+  HELD: 'Already holding this pair', HALT: 'Trading is halted', SIDE: 'Position is on the other side', WIDE: 'Skipped: the stop is too far from the price',
   NOTRL: 'Opened, but the trailing stop was not set', SCALED: 'Opened smaller than asked', LEVCLMP: 'Opened at lower leverage'
 };
 // Every result code belongs to exactly ONE severity (tools/verify_sync.py checks that every code the manager can send is listed here):
@@ -1092,7 +1092,7 @@ const EXEC_CODE_TEXT = {
 //   warn  -- amber: it happened, or was safely skipped, but not exactly as planned.
 //   fail  -- red: the order did not go through.
 const EXEC_QUIET_CODES = new Set(['OK', 'DUP', 'NOCHG', 'PAPER', 'NOPOS']);
-const EXEC_WARN_CODES = new Set(['NOTRL', 'SCALED', 'LEVCLMP', 'HELD', 'HALT', 'SIDE']);
+const EXEC_WARN_CODES = new Set(['NOTRL', 'SCALED', 'LEVCLMP', 'HELD', 'HALT', 'SIDE', 'WIDE']);
 const EXEC_FAIL_CODES = new Set(['BAL', 'MINQ', 'PAIR', 'LEV', 'NET', 'BYBIT', 'BAD', 'PRICE']);
 function execSeverity(r) {
   if (EXEC_QUIET_CODES.has(r.code)) return 'quiet';
@@ -1111,6 +1111,7 @@ const EXEC_ALERT_TEXT = {
   BAL: 'not enough free balance on the master account', MINQ: "the size was under Bybit's minimum", PAIR: 'the pair is not on Bybit',
   LEV: 'Bybit rejected the leverage', NET: "the relay could not reach Bybit", BYBIT: 'Bybit refused the order', BAD: 'the command was malformed',
   HELD: 'the master account already holds this pair', SIDE: 'the open position is on the other side',
+  WIDE: 'the trade was SKIPPED on purpose: its stop is too far from the price (limit ' + (process.env.MAX_STOP_PCT === undefined ? 10 : Number(process.env.MAX_STOP_PCT)) + '%)',
   NOTRL: 'it opened but the trailing stop was NOT set',
 };
 
@@ -1346,11 +1347,14 @@ process.on('unhandledRejection', reason => crashGuard.onRejection(reason));
 // check, instrument rules, leverage, quantity, order, wait for the position, trailing stop). See tradeexec.js. The manager path
 // (/api/order etc.) is unchanged and keeps working, so bots can be moved over one at a time.
 // A 200 answer is final for that id (ok:true/false + a code); a 5xx or a timeout means "ask again with the same id" (safe: ids are idempotent).
+// v2.9.17: refuse a trade whose stop is further than this many percent of the price from the price (0 = off). Default 10. Set MAX_STOP_PCT on Render to change it.
+const MAX_STOP_PCT = (() => { const raw = process.env.MAX_STOP_PCT; if (raw === undefined || raw === '') return 10; const n = Number(raw); return Number.isFinite(n) && n >= 0 && n <= 50 ? n : 10; })();
 const tradeExec = require('./tradeexec').create({
   rest: () => restClient,
   mode: () => TRADE_MODE,
   halted: () => breakerIsTripped(),
   placeOrder: (body, o) => processOrder(body, o),
+  maxStopPct: () => MAX_STOP_PCT,
   fanOutLeverage: b => multiuser.fanOutLeverage(b),
   fanOutTradingStop: b => multiuser.fanOutTradingStop(b),
   guardClamp: b => (multiuser.guardClamp ? multiuser.guardClamp(b) : b),   // Profit Guard: a looser stop from a bot is held at the guard's floor
@@ -1385,6 +1389,7 @@ Promise.race([reconcileControl(), new Promise(r => setTimeout(r, 8000))]).catch(
   console.log(`YM Oracle relay running on port ${PORT}`);
   const rt = setInterval(() => reconcileMasterPositions().catch(() => {}), 60000); if (rt.unref) rt.unref();
   setTimeout(() => reconcileMasterPositions().catch(() => {}), 15000).unref();
+  console.log(`MAX_STOP_PCT=${MAX_STOP_PCT}${MAX_STOP_PCT === 0 ? ' (stop-distance limit is OFF)' : '% (trades with a stop further from the price than this are skipped)'}`);
   console.log(`TRADE_MODE=${TRADE_MODE}${TRADE_MODE === 'paper' ? '  (no real orders will be submitted)' : ''}`);
   console.log(`Bybit endpoint: ${BYBIT_BASE_URL ? `EXPLICIT OVERRIDE (${BYBIT_BASE_URL})` : IS_DEMO ? 'DEMO TRADING (api-demo.bybit.com)' : IS_TESTNET ? 'TESTNET' : 'LIVE MAINNET'}`);
 }));

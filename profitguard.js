@@ -451,4 +451,21 @@ function reentryShouldPause(lastRs, rc) {
   return sum <= -rc.pauseR;
 }
 
-module.exports = { reentryGate, reentryPlan, reentryShouldPause, roundTick, revOf, sliceOf, curveKeep, curveOf, adaptOf, updatePull, noiseOf, stallExtra, suggestTuning, DEFAULT_SMART, PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };
+// v2.9.19: pick the Bybit closed-PnL rows that belong to ONE trade. Before, both scorecards took "the newest rows for this coin since the trade began", so a coin traded
+// again within hours could be given an earlier or later trade's exit and PnL (found on MEGA, AVAX, ETHFI, CRV, MUBARAK: wrong totals in the ledger). A row now has to
+// (1) fall in the trade's time window, (2) have an average entry price within tol of THIS trade's entry, and (3) not be already claimed by another trade (used = a Set of order ids).
+// Returns { rows, last } or null. If the rows carry no entry price at all, only the time window and the claimed check apply (older data, unchanged behaviour).
+function pickCloseRows(list, o) {
+  o = o || {};
+  const t = x => Number(x.updatedTime || x.createdTime || 0), id = x => String(x.orderId || '');
+  const tol = o.tol > 0 ? o.tol : 0.01;
+  let rows = (list || []).filter(x => x && x.symbol === o.symbol && t(x) >= (Number(o.sinceMs) || 0) - 60000 && (!(o.untilMs > 0) || t(x) <= o.untilMs) && !(o.used && id(x) && o.used.has(id(x))));
+  if (o.entry > 0 && rows.some(x => parseFloat(x.avgEntryPrice) > 0)) rows = rows.filter(x => { const e = parseFloat(x.avgEntryPrice); return e > 0 && Math.abs(e - o.entry) / o.entry <= tol; });
+  rows = rows.filter(x => parseFloat(x.avgExitPrice) > 0 || Number.isFinite(Number(x.closedPnl)));
+  if (!rows.length) return null;
+  const last = rows.slice().sort((a, b) => t(b) - t(a))[0];
+  if (!(parseFloat(last.avgExitPrice) > 0)) return null;
+  return { rows, last };
+}
+
+module.exports = { pickCloseRows, reentryGate, reentryPlan, reentryShouldPause, roundTick, revOf, sliceOf, curveKeep, curveOf, adaptOf, updatePull, noiseOf, stallExtra, suggestTuning, DEFAULT_SMART, PMODES, effMode, scaleDue, sliceQty, reentryStep, MODES, defaults, normalize, isSwingBot, profileOf, updatePeak, decide, clampStop };

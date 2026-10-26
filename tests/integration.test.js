@@ -132,6 +132,9 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
   assert.strictEqual(sec.totpCode('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', 59000), '287082'); // RFC 6238 test vector
   ok('TOTP matches the RFC 6238 test vector');
   assert(T.sanitizeOrder({ symbol: 'BTCUSDT', side: 'Buy', qty: '0.1', evil: 'x', apiKey: 'steal' }) && !('evil' in T.sanitizeOrder({ symbol: 'BTCUSDT', side: 'Buy', qty: '0.1', evil: 'x' })));
+  assert(T.sanitizeOrder({ symbol: 'AUSDT', side: 'Sell', qty: '10' }), 'a one-letter ticker (AUSDT) is a valid coin');   // v2.9.19: it used to be refused, so copy users never got it
+  assert.strictEqual(T.sanitizeOrder({ symbol: 'USDT', side: 'Sell', qty: '10' }), null, 'no coin name at all is still refused');
+  ok('one-letter tickers (AUSDT) pass the symbol check, so copy-user orders for them are no longer dropped; an empty coin name is still refused');
   for (const bad of [{ symbol: 'BTCUSDT', side: 'Buy', qty: '-1' }, { symbol: 'btc;drop', side: 'Buy', qty: '1' }, { symbol: 'BTCUSDT', side: 'Hold', qty: '1' }, { symbol: 'BTCUSDT', side: 'Buy', qty: 'abc' }, { symbol: 'BTCUSDT', side: 'Buy', qty: '1', orderType: 'Conditional' }, null, 'x'])
     assert.strictEqual(T.sanitizeOrder(bad), null, JSON.stringify(bad));
   assert.strictEqual(T.sanitizeLeverage({ symbol: 'BTCUSDT', buyLeverage: 50, sellLeverage: 50 }, 10).buyLeverage, '10');
@@ -1112,6 +1115,10 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
     await db.query('DELETE FROM signals');
     // events are idempotent on the bot's key and tolerate arriving out of order
     const openEv = { ev: 'open', k: 'BTCUSDT-1000', sym: 'BTCUSDT', side: 'BUY', eng: 'fast', t: 1000, entry: 65000, sl: 64000, tp: 67000, lev: 10, m: 100, relay: 'SENT', why: '', rid: 'ok1' };
+    assert.strictEqual((await ev({ ev: 'open', k: 'AUSDT-1000', sym: 'AUSDT', side: 'SELL', eng: 'fast', t: 1000, entry: 0.0878, sl: 0.0927, tp: 0.08, lev: 3, m: 100, relay: 'SENT', why: '', rid: 'okA' })).status, 200);
+    assert((await sigRows()).some(r => r.symbol === 'AUSDT'), 'the one-letter ticker AUSDT is recorded in the signal ledger');
+    ok('signal ledger: AUSDT (one-letter ticker) is recorded');
+    await db.query(`DELETE FROM signals WHERE symbol='AUSDT'`);
     assert.strictEqual((await ev(openEv)).status, 200); assert.strictEqual((await ev(openEv)).status, 200); assert.strictEqual((await ev({ ...openEv, entry: 1 })).status, 200);
     let rows = await sigRows(); assert(rows.length === 1 && Number(rows[0].entry) === 65000 && rows[0].relay_flag === 'SENT' && rows[0].rid === 'ok1', 'a retransmit never makes a second row or changes the first');
     await ev({ ev: 'relay', k: 'BTCUSDT-1000', sym: 'BTCUSDT', side: 'BUY', eng: 'fast', t: 1001, rid: 'ok1', ok: true, code: 'OK', secs: 4 });
@@ -1376,7 +1383,7 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
       const tr = (await db.query(`SELECT * FROM pg_trades WHERE symbol='BTCUSDT' ORDER BY id DESC LIMIT 1`)).rows[0];
       assert(tr && tr.profile === 'swing' && tr.mode === 'live' && Number(tr.peak_pct) === 50 && Number(tr.exit_pct) === 30 && Number(tr.giveback_pct) === 20 && Number(tr.peak_r) === 5 && Number(tr.exit_r) === 3, JSON.stringify(tr));
       assert.strictEqual((await db.query(`SELECT 1 FROM pg_trades WHERE symbol='ETHUSDT'`)).rows.length, 0, 'it waits for Bybit\'s record first');
-      for (let i = 0; i < 7; i++) await mu._test.pgTick();
+      for (let i = 0; i < 16; i++) await mu._test.pgTick();   // v2.9.19: 15 retries before giving up (was 6)
       const eth = (await db.query(`SELECT * FROM pg_trades WHERE symbol='ETHUSDT'`)).rows[0]; assert(eth && eth.exit_price === null && eth.mode === 'shadow', 'an exit Bybit has not reported is kept as unknown, not guessed');
       assert.strictEqual(mu._test.pgClosing.length, 0);
       const sc = (await call('/api/admin/profit-guard', 'GET', null, admin)).j.scorecard;
