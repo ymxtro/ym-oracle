@@ -45,14 +45,16 @@ function sanitizeConfig(raw) {
 
 function create(opts = {}) {
   const cfg = { ...DEF, ...(opts.config || {}) };
-  const enabled = opts.enabled !== undefined ? !!opts.enabled : String(process.env.V3_LIVE || '').toLowerCase() === 'on';
+  // `allowed` = V3_LIVE=on on the server (the one-time permission). `armed` = allowed AND not switched off from the Ecosystem page. Open trades are managed whenever the lane is allowed, armed or not.
+  const allowed = opts.enabled !== undefined ? !!opts.enabled : String(process.env.V3_LIVE || '').toLowerCase() === 'on';
   const now = opts.now || (() => Date.now()), log = opts.log || (() => {}), store = opts.store || null;
   const d = opts.deps || {};   // equity(), positions(), dayPnl(), closedPnl(symbol, since), tick(symbol), exec(body), mode()
-  const st = { live: [], history: [], decisions: [], peak: 0, paused: false, lastError: null, health: { stage: 0, checked: 0 }, lastSummaryDay: '', lastEquity: null, lastDayPnl: null };
+  const st = { live: [], history: [], decisions: [], peak: 0, paused: false, lastError: null, health: { stage: 0, checked: 0 }, lastSummaryDay: '', armChoice: null, lastEquity: null, lastDayPnl: null };
   let loaded = false, busy = false; const placing = new Set();
 
-  async function load() { if (loaded) return; loaded = true; try { const s = store && await store.load(); if (s) Object.assign(st, { live: s.live || [], history: s.history || [], peak: s.peak || 0, paused: !!s.paused, health: s.health || { stage: 0, checked: 0 }, lastSummaryDay: s.lastSummaryDay || '' }); } catch { /* fresh */ } }
-  async function save() { try { if (store) await store.save({ live: st.live, history: st.history.slice(-cfg.KEEP), peak: st.peak, paused: st.paused, health: st.health, lastSummaryDay: st.lastSummaryDay }); } catch { /* memory still has it */ } }
+  async function load() { if (loaded) return; loaded = true; try { const s = store && await store.load(); if (s) Object.assign(st, { live: s.live || [], history: s.history || [], peak: s.peak || 0, paused: !!s.paused, health: s.health || { stage: 0, checked: 0 }, lastSummaryDay: s.lastSummaryDay || '', armChoice: s.armChoice === false ? false : s.armChoice === true ? true : null }); } catch { /* fresh */ } }
+  async function save() { try { if (store) await store.save({ live: st.live, history: st.history.slice(-cfg.KEEP), peak: st.peak, paused: st.paused, health: st.health, lastSummaryDay: st.lastSummaryDay, armChoice: st.armChoice }); } catch { /* memory still has it */ } }
+  const isArmed = () => allowed && st.armChoice !== false;
   const alert = text => { try { if (d.alert) d.alert(text); } catch { /* an alert never blocks trading */ } };
   const hm = m => { st.health.by = st.health.by || {}; return st.health.by[m] || (st.health.by[m] = { stage: 0, checked: 0 }); };   // health is judged per module: one rule falling behind never shrinks or stops another
   const factor = m => (hm(m).stage === 1 ? 0.5 : 1);
@@ -140,7 +142,7 @@ function create(opts = {}) {
       if (!v.go) { note(call, 'skip', v.reason); continue; }
       const sz = v.sz, tickSize = await Promise.resolve(d.tick ? d.tick(call.symbol) : null).catch(() => null);
       const extra = { margin: r2(sz.margin), lev: sz.lev, riskUsd: r2(sz.riskUsd), stopPct: r2(sz.stopPct) };
-      if (!enabled) { note(call, 'dry-run', 'would place: margin $' + r2(sz.margin) + ' at ' + sz.lev + 'x, risking $' + r2(sz.riskUsd) + ' (not armed: set V3_LIVE=on)', extra); continue; }
+      if (!isArmed()) { note(call, 'dry-run', 'would place: margin $' + r2(sz.margin) + ' at ' + sz.lev + 'x, risking $' + r2(sz.riskUsd) + (allowed ? ' (switched to dry run on the Ecosystem page)' : ' (not armed: set V3_LIVE=on)'), extra); continue; }
       const id = ('v3' + call.id.toString(36) + Math.floor(call.entryBar / BAR_MS).toString(36)).slice(0, 20);
       const body = { kind: 'open', id, side: call.dir > 0 ? 'BUY' : 'SELL', symbol: call.symbol, usdMargin: Number(sz.margin.toFixed(2)), leverage: sz.lev,
         ...(call.tgt != null ? { tp: tickSize ? roundTick(call.tgt, tickSize) : String(call.tgt) } : {}), sl: tickSize ? roundTick(call.stop, tickSize) : String(call.stop), bot: 'v3' };
@@ -157,7 +159,7 @@ function create(opts = {}) {
   // After every 4h bar (armed only): move the exchange-side stop of each trailing trade to where the tests' trailing rule says it should be now.
   // The stop only ever moves in the trade's favour; a refused update is retried at the next bar and never closes anything.
   async function onBar(data) {
-    if (!enabled) return;
+    if (!allowed) return;
     try {
       await load();
       const by = new Map(((data && data.items) || []).map(i => [i.symbol, i])), asOf = (data && data.bar) || now();
@@ -179,7 +181,7 @@ function create(opts = {}) {
 
   // Every minute (armed only): notice closed trades, close timed-out ones.
   async function tick() {
-    if (!enabled || busy) return; busy = true;
+    if (!allowed || busy) return; busy = true;
     try {
       await load();
       const open = st.live.filter(x => x.status === 'open'); if (!open.length) return;
@@ -208,7 +210,7 @@ function create(opts = {}) {
   // One Telegram summary a day (08:00 Lagos = 07:00 UTC): equity and drawdown, today's P&L, open exposure, live results, and every shadow rule against its control.
   function dailyText() {
     const open = st.live.filter(x => x.status === 'open'), done = st.history.filter(h => Number.isFinite(h.R)), mean = done.length ? done.reduce((t, h) => t + h.R, 0) / done.length : null;
-    const sh = d.shadowSummary ? d.shadowSummary() : null, lines = ['📊 V3 daily summary' + (enabled ? '' : ' (not armed: dry run)')];
+    const sh = d.shadowSummary ? d.shadowSummary() : null, lines = ['📊 V3 daily summary' + (isArmed() ? '' : ' (not armed: dry run)')];
     if (st.lastEquity) lines.push('Equity $' + r2(st.lastEquity) + ' (peak $' + r2(st.peak) + ', ' + r2((st.lastEquity / st.peak - 1) * 100) + '% from peak); today ' + (st.lastDayPnl === null || st.lastDayPnl === undefined ? 'unknown' : (st.lastDayPnl >= 0 ? '+' : '') + r2(st.lastDayPnl) + ' USDT'));
     lines.push('Open V3 trades: ' + open.length + ', risk $' + r2(open.reduce((t, x) => t + x.riskUsd, 0)) + '. Closed live trades: ' + done.length + (mean === null ? '' : ', average ' + (Math.round(mean * 1000) / 1000) + 'R'));
     lines.push('Health: ' + (st.health.stage === 0 ? 'full size' : st.health.stage === 1 ? 'HALF size (behind random coins)' : 'SWITCHED OFF') + (st.paused ? '; PAUSED by you' : ''));
@@ -222,17 +224,25 @@ function create(opts = {}) {
     st.lastSummaryDay = day; await save(); alert(dailyText()); return true;
   }
 
+  // Arm or disarm from the Ecosystem page. Arming needs V3_LIVE=on on the server (the permission); disarming is always allowed. The choice survives restarts.
+  async function setArmed(on) {
+    await load();
+    if (on && !allowed) return { ok: false, message: 'Arming is locked: set V3_LIVE=on in the Render environment once, then redeploy.' };
+    const was = isArmed(); st.armChoice = !!on; await save();
+    if (isArmed() !== was) alert(isArmed() ? '🟢 V3 server lane ARMED from the Ecosystem page: new calls will place real trades.' : '⚪ V3 server lane switched to DRY RUN from the Ecosystem page. Open trades keep their stops and are still managed.');
+    return { ok: true, armed: isArmed() };
+  }
   async function setPaused(on) { await load(); st.paused = !!on; await save(); return st.paused; }
   async function resumeAndResetPeak() { await load(); st.paused = false; st.health = { stage: 0, checked: st.health.checked, by: Object.fromEntries(Object.entries(st.health.by || {}).map(([k, v]) => [k, { stage: 0, checked: v.checked }])) }; try { const eq = await d.equity(); if (eq > 0) st.peak = eq; } catch { /* keep */ } await save(); return { peak: st.peak }; }
 
   function summary() {
     const done = st.history.filter(h => Number.isFinite(h.R)), mean = done.length ? done.reduce((t, h) => t + h.R, 0) / done.length : null;
-    return { armed: enabled, otherLanesHolding: st.others || [], ownDayPnlUsd: r2(ownDayPnl()), health: st.health.stage === 0 ? 'full size' : st.health.stage === 1 ? 'half size: behind random coins' : 'switched off: behind random coins twice', tradeMode: d.mode ? d.mode() : null, modules: cfg.MODULES, paused: st.paused, peakEquity: r2(st.peak), lastError: st.lastError,
+    return { armed: isArmed(), canArm: allowed, otherLanesHolding: st.others || [], ownDayPnlUsd: r2(ownDayPnl()), health: st.health.stage === 0 ? 'full size' : st.health.stage === 1 ? 'half size: behind random coins' : 'switched off: behind random coins twice', tradeMode: d.mode ? d.mode() : null, modules: cfg.MODULES, paused: st.paused, peakEquity: r2(st.peak), lastError: st.lastError,
       limits: { riskPerTradePct: cfg.RISK_PCT, maxOpen: cfg.MAX_OPEN, maxOpenRiskPct: cfg.MAX_OPEN_RISK_PCT, maxOneDirectionRiskPct: cfg.MAX_DIR_RISK_PCT, maxStopPct: cfg.MAX_STOP_PCT, leverageRule: 'floor(' + cfg.LEV_BUDGET + ' / stop %), 1x to ' + cfg.MAX_LEV + 'x', maxMarginPct: cfg.MAX_MARGIN_PCT, dailyLossPct: cfg.DAILY_LOSS_PCT, drawdownPausePct: cfg.DD_PAUSE_PCT, holdBars: cfg.HOLD_BARS + ' bars for combo, 84 for trend (trailing stop)' },
       openTrades: st.live.filter(x => x.status === 'open').map(x => ({ module: x.module, trailing: !!x.trail, trailMoves: x.trailMoves || 0, trailNote: x.trailNote || '', symbol: x.symbol, dir: x.dir > 0 ? 'long' : 'short', margin: r2(x.margin), lev: x.lev, riskUsd: r2(x.riskUsd), stop: x.stop, target: x.tgt, openedAt: new Date(x.openedAt).toISOString() })),
       closedTrades: done.length, meanR: mean === null ? null : Math.round(mean * 1000) / 1000, recentClosed: st.history.slice(-10).map(h => ({ symbol: h.symbol, dir: h.dir > 0 ? 'long' : 'short', R: h.R === undefined ? null : h.R, pnlUsd: h.pnlUsd === undefined ? null : h.pnlUsd })),
       recentDecisions: st.decisions.slice(-20).map(x => ({ ...x, at: new Date(x.at).toISOString() })) };
   }
-  return { onNewCalls, onBar, owns, warm, tick, dailyTick, dailyText, checkHealth, decide, summary, setPaused, resumeAndResetPeak, cfg, state: st, get enabled() { return enabled; } };
+  return { onNewCalls, onBar, owns, warm, tick, dailyTick, dailyText, checkHealth, decide, summary, setPaused, setArmed, resumeAndResetPeak, cfg, state: st, get enabled() { return isArmed(); }, get allowed() { return allowed; } };
 }
 module.exports = { create, sanitizeConfig, LIMITS, size, roundTick, decimalsOf, DEF };

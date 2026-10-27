@@ -96,6 +96,19 @@
   #gate input{margin-top:10px}
   #msg{margin:0 0 10px}
   #msg .card{border:1px solid #6b5320;color:var(--pending)}
+
+  .btns .btn{padding:8px 12px}
+  .btn.warnb{color:var(--pending);border-color:#6b5320}
+  .ctl{display:grid;gap:8px;margin-top:10px}
+  .ctl .btns{display:flex;gap:8px;flex-wrap:wrap}
+  .confirm{background:var(--inset);border-radius:12px;padding:12px;display:grid;gap:8px}
+  .confirm input{max-width:200px}
+  .chip.fired{color:#fff;background:var(--long);border-color:var(--long);font-weight:700}
+  .chip.close{color:var(--pending);border-color:#6b5320}
+  .chip.watch{color:var(--mist)}
+  .st{display:flex;align-items:center;gap:8px;font-size:15px;font-weight:600}
+  .st .dot{width:9px;height:9px;border-radius:50%;background:currentColor;display:inline-block}
+  #ctlMsg{font-size:12px;min-height:16px}
 </style>
 </head>
 <body>
@@ -125,25 +138,25 @@
   </nav>
   <div class="main">
    <div class="ah">
-    <div class="brand"><span class="logo mlogo">YM</span><div><h1>Ecosystem</h1><div class="mist small">The server lane, what it watches, and how each rule is doing &middot; <span id="stamp">loading</span></div></div></div>
+    <div class="brand"><span class="logo mlogo">YM</span><div><h1>Ecosystem</h1><div class="mist small">Server lane &middot; <span id="stamp">loading</span> &middot; next scan <span id="nextScan">-</span></div></div></div>
     <div class="btns" style="align-items:center"><span class="pill dry" id="armPill"><span class="dot" style="width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block"></span><span id="armTxt">DRY RUN</span></span><button class="btn" id="refresh">Refresh</button></div>
    </div>
    <div id="msg"></div>
    <div class="tiles" id="tiles"></div>
    <div class="g2">
     <div class="stack">
+     <div class="card"><div class="ch"><h2>Watchlist: closest to firing</h2></div><div class="note"><b>Fired</b>: the rule was met at the last 4h close. <b>Close</b>: one step away. <b>Watch</b>: building. Decisions are made at each 4h close only.</div><div id="wl" class="scroll"></div></div>
      <div class="card"><div class="ch"><h2>Open server trades</h2></div><div id="open" class="scroll"></div></div>
-     <div class="card"><div class="ch"><h2>Trend watch</h2><span class="small mist">swing rule</span></div><div class="note">Coins in the top or bottom 10% of 14-day momentum and how far each is from breaking its 50-day high or low. Broken means a call at the next bar.</div><div id="trend" class="scroll"></div></div>
-     <div class="card"><div class="ch"><h2>Recent decisions</h2></div><div class="note">Why each call was taken, only simulated, or refused.</div><div id="dec" class="scroll"></div></div>
-     <div class="card"><div class="ch"><h2>Rules against random coins</h2></div><div class="note">A rule earns a live slot only with 100+ closed calls, a positive edge over random coins, and a positive result after funding.</div><div id="mods" class="scroll"></div></div>
+     <div class="card"><div class="ch"><h2>Recent decisions</h2></div><div id="dec" class="scroll"></div></div>
+     <div class="card"><div class="ch"><h2>Rule results</h2></div><div class="note">Each rule against random coins taken at the same moment. A rule earns real money only after 100+ closed calls with a positive edge.</div><div id="mods" class="scroll"></div><details style="margin-top:10px"><summary>Comparison rules (never traded)</summary><div id="mods2" class="scroll"></div></details></div>
     </div>
     <div class="stack">
-     <div class="card"><div class="ch"><h2>Market</h2></div><div id="market"></div></div>
-     <div class="card"><div class="ch"><h2>Server lane</h2></div><div id="live"></div></div>
-     <div class="card"><div class="ch"><h2>Bot shortlists</h2><span class="small mist">fast and swing</span></div><div id="bots" class="scroll"></div></div>
-     <div class="card"><details><summary>Combo watch: closest to a trigger</summary><div id="watch" class="scroll"></div></details></div>
-     <div class="card"><details><summary><span id="allT">All coins watched (0)</span></summary><div id="all" class="scroll"></div></details></div>
-     <div class="card"><details><summary>Limit-order shadow (off unless LIMIT_SHADOW=on)</summary><div id="lim"></div></details></div>
+     <div class="card"><div class="ch"><h2>Controls</h2></div><div id="status"></div>
+      <div class="ctl"><div class="btns"><button class="btn" id="pauseBtn">Pause new trades</button><button class="btn pri" id="armBtn">Arm live trading</button><button class="btn warnb" id="resetBtn" hidden>Clear drawdown / health pause</button></div>
+      <div class="confirm" id="armBox" hidden><div class="small mist">This lets the server place real trades on your master account. Type <b>ARM</b> to confirm.</div><input id="armWord" type="text" placeholder="ARM" autocomplete="off" aria-label="Type ARM"><div class="btns"><button class="btn pri" id="armGo">Arm now</button><button class="btn" id="armNo">Cancel</button></div></div>
+      <div id="ctlMsg" class="mist"></div></div></div>
+     <div class="card"><div class="ch"><h2>Limits</h2></div><div id="live"></div></div>
+     <div class="card"><div class="ch"><h2>Bot watchlists</h2><span class="small mist">ESP32 pending and shortlist</span></div><div id="bots" class="scroll"></div></div>
     </div>
    </div>
   </div>
@@ -152,61 +165,91 @@
 <script>
 function pw(){try{return localStorage.getItem('ym_dash_pw')||''}catch(e){return ''}}
 function tok(){try{return sessionStorage.getItem('ym_admin_token')||''}catch(e){return ''}}
-var needAuth=false;
+var needAuth=false,LAST=null;
+function hdrs(){var h={'Content-Type':'application/json'}; if(pw())h['X-Dashboard-Password']=pw(); if(tok())h['Authorization']='Bearer '+tok(); return h}
 async function api(p){
-  var h={}; if(pw())h['X-Dashboard-Password']=pw(); if(tok())h['Authorization']='Bearer '+tok();
-  var r=await fetch(p,{headers:h});
+  var r=await fetch(p,{headers:hdrs()});
   if(r.status===401){needAuth=true;throw new Error('sign in')}
   if(!r.ok) throw new Error(p+' answered '+r.status);
   return r.json();
 }
+async function post(p,b){var r=await fetch(p,{method:'POST',headers:hdrs(),body:JSON.stringify(b||{})});var j={};try{j=await r.json()}catch(e){} if(r.status===401){needAuth=true} return {ok:r.ok,s:r.status,j:j}}
 function el(t,txt,cls){var e=document.createElement(t);if(txt!==undefined&&txt!==null)e.textContent=txt;if(cls)e.className=cls;return e}
 function line(box,rows){box.textContent='';rows.forEach(function(r){var d=el('div',null,'line');d.appendChild(el('span',r[0],'mist'));d.appendChild(el('span',r[1]===null||r[1]===undefined?'n/a':String(r[1]),r[2]));box.appendChild(d)})}
 function table(box,head,rows,empty){box.textContent='';if(!rows.length){box.appendChild(el('div',empty,'empty'));return}
   var t=el('table'),tr=el('tr');head.forEach(function(h){tr.appendChild(el('th',h))});t.appendChild(tr);
-  rows.forEach(function(r){var x=el('tr');r.forEach(function(c){var v=c&&typeof c==='object'?c:{t:c};x.appendChild(el('td',v.t===null||v.t===undefined?'n/a':String(v.t),v.c))});t.appendChild(x)});box.appendChild(t)}
+  rows.forEach(function(r){var x=el('tr');r.forEach(function(c){var v=c&&typeof c==='object'?c:{t:c};var td=el('td',v.t===null||v.t===undefined?'n/a':String(v.t),v.c);if(v.chip){td.textContent='';td.appendChild(el('span',v.t,'chip '+v.chip))}x.appendChild(td)});t.appendChild(x)});box.appendChild(t)}
 function sign(n){return n===null||n===undefined?'':(n>0?'ok':n<0?'bad':'')}
 function fmtT(s){try{return new Date(s).toLocaleString([], {day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})}catch(e){return s}}
 function side(s){return {t:s,c:s==='long'?'ok':s==='short'?'bad':''}}
 function tile(k,v,s,c){var d=el('div',null,'stat');d.appendChild(el('div',k,'k'));d.appendChild(el('div',v,'v '+(c||'')));if(s)d.appendChild(el('div',s,'s'));return d}
+function num(v){var n=Number(v);return isFinite(n)?(Math.abs(n)>=1?n.toFixed(2).replace(/\.?0+$/,''):String(+n.toPrecision(4))):v}
+function money(x){return '$'+(Math.round(x*100)/100)}
+// pairs closest to firing, from the trend rule and the combo rule: fired first, then close, then watch
+function watchRows(fm){
+  var out=[],tw=(fm.watching&&fm.watching.trend&&fm.watching.trend.list)||[],cw=(fm.watching&&fm.watching.list)||[];
+  tw.forEach(function(x){
+    var rank=x.broken?0:x.toBreakPct<=4?1:x.toBreakPct<=10?2:9; if(rank===9)return;
+    var need=x.broken?'closed beyond its 50-day '+(x.side==='long'?'high':'low')+' ('+num(x.level)+')':(x.side==='long'?'close above ':'close below ')+num(x.level)+' ('+x.toBreakPct+'% to go)';
+    out.push({k:rank*1000+(x.broken?0:x.toBreakPct),coin:x.symbol,side:x.side,rule:'trend',rank:rank,need:need})});
+  cw.forEach(function(x){
+    if(x.met<2)return; var rank=x.met===x.of?0:1;
+    out.push({k:rank*1000+(x.met===x.of?0:5),coin:x.symbol,side:x.side,rule:'combo',rank:rank,need:x.met===x.of?'all 3 conditions met':'needs '+x.missing.join(', ')})});
+  out.sort(function(a,b){return a.k-b.k});return out.slice(0,12);
+}
+function nextScan(){var BAR=4*3600e3,n=Math.floor(Date.now()/BAR)*BAR+BAR+90e3;return new Date(n).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}
 async function load(){
   var msg=document.getElementById('msg');msg.textContent='';
-  var v3,fm,ls,bl={lists:[]};
-  try{[v3,fm,ls]=await Promise.all([api('/api/v3live'),api('/api/fundmom'),api('/api/limit-shadow')]);try{bl=await api('/api/bot-shortlists')}catch(e){}}
+  var v3,fm,bl={lists:[]};
+  try{[v3,fm]=await Promise.all([api('/api/v3live'),api('/api/fundmom')]);try{bl=await api('/api/bot-shortlists')}catch(e){}}
   catch(e){
     if(needAuth){document.getElementById('app').hidden=true;document.getElementById('gate').hidden=false;return}
     document.getElementById('app').hidden=false;var c=el('div',null,'card');c.textContent=String(e.message||e)+' (if the admin authenticator is on, sign in at /admin first, then reload this page)';msg.appendChild(c);return}
+  LAST={v3:v3,fm:fm};
   document.getElementById('gate').hidden=true;document.getElementById('app').hidden=false;
-  var m=fm.market,lm=v3.limits||{},ot=v3.openTrades||[];
-  var pill=document.getElementById('armPill');pill.className='pill '+(v3.paused?'paused':v3.armed?'live':'dry');document.getElementById('armTxt').textContent=v3.paused?'PAUSED':v3.armed?'LIVE':'DRY RUN';
+  var m=fm.market,lm=v3.limits||{},ot=v3.openTrades||[],eq=Number(v3.peakEquity)||0;
+  var state=v3.paused?'PAUSED':v3.armed?'LIVE':'DRY RUN';
+  var pill=document.getElementById('armPill');pill.className='pill '+(v3.paused?'paused':v3.armed?'live':'dry');document.getElementById('armTxt').textContent=state;
+  document.getElementById('nextScan').textContent=nextScan();
   var tl=document.getElementById('tiles');tl.textContent='';
-  tl.appendChild(tile('Market',m?m.state:'n/a',m?m.universe+' coins measured':'waiting for the next 4h bar',m?(m.state==='SHOCK'?'bad':m.state==='RISING'?'ok':m.state==='FALLING'?'warn':''):''));
-  tl.appendChild(tile('Server lane',v3.armed?'Live':'Dry run',(v3.modules||[]).join(' + '),v3.armed?'warn':'ok'));
-  tl.appendChild(tile('Open trades',ot.length+' / '+(lm.maxOpen===undefined?'n/a':lm.maxOpen),(v3.otherLanesHolding&&v3.otherLanesHolding.length)?v3.otherLanesHolding.length+' held by other lanes':'none held by other lanes'));
-  tl.appendChild(tile('Today, this lane',(v3.ownDayPnlUsd>0?'+':'')+v3.ownDayPnlUsd+' USDT','its own trades only',sign(v3.ownDayPnlUsd)));
-  tl.appendChild(tile('Closed trades',String(v3.closedTrades),v3.meanR===null||v3.meanR===undefined?'no result yet':'mean '+v3.meanR+'R',sign(v3.meanR)));
-  if(m) line(document.getElementById('market'),[['State',m.state,m.state==='SHOCK'?'bad':m.state==='RISING'?'ok':m.state==='FALLING'?'warn':''],['Coins up, 24h / 3d / 14d',m.breadth24hPct+'% / '+m.breadth3dPct+'% / '+m.breadth14dPct+'%'],['Positive funding',m.fundingPositivePct+'%'],['BTC 24h / 3d / 14d',m.btc24hPct+'% / '+m.btc3dPct+'% / '+m.btc14dPct+'%'],['Coins measured',m.universe]]);
-  else document.getElementById('market').appendChild(el('div','No bar processed yet. It waits for the next 4-hour bar.','empty'));
-  line(document.getElementById('live'),[['Armed',v3.armed?'YES (trading)':'no: dry run only',v3.armed?'warn':'ok'],['Account mode',v3.tradeMode],['Paused',v3.paused?'yes':'no',v3.paused?'bad':''],['Health',v3.health,v3.health==='full size'?'ok':'warn'],['Peak equity',v3.peakEquity],['Risk per trade',lm.riskPerTradePct+'% of equity'],['Open trades, total risk',(lm.maxOpen)+' max, '+lm.maxOpenRiskPct+'%'],['One direction, max',lm.maxOneDirectionRiskPct+'%'],['Leverage',lm.leverageRule],['Daily loss stop',lm.dailyLossPct+'%'],['Held by other lanes',(v3.otherLanesHolding&&v3.otherLanesHolding.length)?v3.otherLanesHolding.join(', '):'none (as of the last 4h bar)'],['Last error',v3.lastError||'none',v3.lastError?'bad':'ok']]);
-  table(document.getElementById('open'),['Rule','Coin','Side','Margin','Lev','Risk $','Stop now','Target','Stop moves','Opened'],ot.map(function(t){return [t.module,t.symbol,side(t.dir),t.margin,t.lev+'x',t.riskUsd,t.stop,t.target===null||t.target===undefined?'trailing':t.target,t.trailing?(t.trailMoves+(t.trailNote?' (last update refused: '+t.trailNote+')':'')):'-',fmtT(t.openedAt)]}),'No open server trades.');
-  var tw=(fm.watching&&fm.watching.trend&&fm.watching.trend.list)||[];
-  table(document.getElementById('trend'),['Coin','Side','Momentum rank','14d %','Level to break','To go %'],tw.slice(0,20).map(function(x){return [x.symbol,side(x.side),x.momentumRankPct,x.return14dPct,x.level,{t:x.broken?'broken':x.toBreakPct,c:x.broken?'ok':x.toBreakPct<2?'warn':'mist'}]}),'No coin is in the top or bottom 10% of momentum yet.');
-  table(document.getElementById('dec'),['Time','Rule','Coin','Side','Verdict','Reason'],(v3.recentDecisions||[]).slice().reverse().slice(0,40).map(function(x){return [fmtT(x.at),x.module,x.symbol,side(x.dir),{t:x.verdict,c:/open|placed|taken|dry/i.test(x.verdict||'')?'ok':/fail/i.test(x.verdict||'')?'bad':'warn'},x.reason||'']}),'No decisions yet.');
-  var mods=fm.modules||{};
-  table(document.getElementById('mods'),['Rule','Closed','Open','Win %','Mean R','After funding','Random R','Edge','Status'],Object.keys(mods).map(function(k){var x=mods[k];return [k,x.closedCalls,x.open,x.winPct,{t:x.meanR,c:sign(x.meanR)},{t:x.meanRAfterFunding,c:sign(x.meanRAfterFunding)},x.controlMeanR,{t:x.edgeVsControl,c:sign(x.edgeVsControl)},{t:x.health,c:/BEHIND/.test(x.health)?'bad':/ok/.test(x.health)?'ok':'mist'}]}),'Nothing yet.');
-  var rows=[];(bl.lists||[]).forEach(function(l){l.items.forEach(function(x){rows.push([l.bot,x.kind||l.kind,x.symbol,side(x.side),x.score,x.note,l.ageMin+' min ago'])})});
-  table(document.getElementById('bots'),['Bot','Engine','Coin','Side','Score','Note','Posted'],rows,'No bot has posted a shortlist yet (bots on v2.9.22 or newer post one about every 6 minutes).');
-  var w=(fm.watching&&fm.watching.list)||[];
-  table(document.getElementById('watch'),['Coin','Side','Met','Missing','Momentum','Funding','14d %','3d %'],w.slice(0,20).map(function(x){return [x.symbol,side(x.side),{t:x.met+'/'+x.of,c:x.met===x.of?'ok':x.met===2?'warn':'mist'},x.missing.join(', '),x.momentumRankPct,x.fundingRankPct,x.return14dPct,x.return3dPct]}),'Nothing yet.');
-  var al=(fm.watching&&fm.watching.all)||[];document.getElementById('allT').textContent='All coins watched ('+al.length+')';
-  table(document.getElementById('all'),['#','Coin','Turnover rank','Side','Met','Momentum','Funding','14d %','3d %','ATR 4h %'],al.map(function(x,i){return [i+1,x.symbol,x.turnoverRank,side(x.side),{t:x.met+'/3',c:x.met===3?'ok':x.met===2?'warn':'mist'},x.momentumRankPct,x.fundingRankPct,x.return14dPct,x.return3dPct,x.atr4hPct]}),'Nothing yet. It fills after the next 4-hour bar.');
-  var lb=document.getElementById('lim');lb.textContent='';
-  if(ls&&typeof ls==='object'){var lr=Object.keys(ls).filter(function(k){return typeof ls[k]!=='object'}).map(function(k){return [k,ls[k]]});if(lr.length)line(lb,lr);else lb.appendChild(el('div','Collecting. Set LIMIT_SHADOW=on to start.','empty'))}
+  tl.appendChild(tile('Market',m?m.state:'n/a',m?m.breadth24hPct+'% of coins up today · BTC '+(m.btc24hPct>0?'+':'')+m.btc24hPct+'%':'waiting for the first 4h scan',m?(m.state==='SHOCK'?'bad':m.state==='RISING'?'ok':m.state==='FALLING'?'warn':''):''));
+  tl.appendChild(tile('Server lane',state==='LIVE'?'Live':state==='PAUSED'?'Paused':'Dry run',(v3.modules||[]).join(' + ')+' rules',state==='LIVE'?'warn':state==='PAUSED'?'bad':'ok'));
+  tl.appendChild(tile('Open trades',ot.length+' / '+(lm.maxOpen===undefined?'n/a':lm.maxOpen),(v3.otherLanesHolding&&v3.otherLanesHolding.length)?v3.otherLanesHolding.length+' coins held by the bots':'no coins held by the bots'));
+  tl.appendChild(tile('Results',v3.closedTrades+' closed',(v3.closedTrades&&v3.meanR!==null&&v3.meanR!==undefined?'mean '+v3.meanR+'R · ':'')+'today '+(v3.ownDayPnlUsd>0?'+':'')+v3.ownDayPnlUsd+' USDT',sign(v3.meanR)));
+  // controls
+  var st=document.getElementById('status');st.textContent='';var sd=el('div',null,'st '+(v3.paused?'bad':v3.armed?'warn':'ok'));sd.appendChild(el('span',null,'dot'));sd.appendChild(el('span',v3.paused?'Paused: no new trades':v3.armed?'Live: new calls place real trades':'Dry run: calls are only simulated'));st.appendChild(sd);
+  st.appendChild(el('div',v3.armed?'Open trades keep their exchange stops either way.':(v3.canArm?'Nothing is sent to Bybit until you arm it.':'Arming is locked. Add V3_LIVE=on in the Render environment once, then redeploy.'),'note'));
+  var pb=document.getElementById('pauseBtn');pb.textContent=v3.paused?'Resume new trades':'Pause new trades';pb.dataset.on=v3.paused?'0':'1';
+  var ab=document.getElementById('armBtn');ab.textContent=v3.armed?'Switch to dry run':'Arm live trading';ab.className='btn '+(v3.armed?'':'pri');ab.disabled=!v3.armed&&!v3.canArm;ab.dataset.arm=v3.armed?'0':'1';
+  var rd=(v3.recentDecisions||[]).slice(-3).some(function(x){return /drawdown pause|health monitor/.test(x.reason||'')});document.getElementById('resetBtn').hidden=!(rd||(v3.health&&v3.health!=='full size'));
+  // limits
+  line(document.getElementById('live'),[['Risk per trade',lm.riskPerTradePct+'%'+(eq?' (about '+money(eq*lm.riskPerTradePct/100)+')':'')],['Open trades, total risk','up to '+lm.maxOpen+', '+lm.maxOpenRiskPct+'%'+(eq?' (about '+money(eq*lm.maxOpenRiskPct/100)+')':'')],['Daily loss stop',lm.dailyLossPct+'%'+(eq?' (about '+money(eq*lm.dailyLossPct/100)+')':''),''],['Leverage','floor(13 / stop %), 1x to 10x'],['Health',v3.health,v3.health==='full size'?'ok':'warn'],['Last error',v3.lastError||'none',v3.lastError?'bad':'ok']]);
+  // watchlist
+  var wl=watchRows(fm);
+  table(document.getElementById('wl'),['Coin','Side','Rule','Status','What it needs'],wl.map(function(x){return [x.coin,side(x.side),x.rule,{t:x.rank===0?'FIRED':x.rank===1?'CLOSE':'WATCH',chip:x.rank===0?'fired':x.rank===1?'close':'watch'},x.need]}),m?'Nothing is close to firing right now.':'Fills in after the first 4h scan.');
+  table(document.getElementById('open'),['Rule','Coin','Side','Margin','Lev','Risk $','Stop now','Target','Opened'],ot.map(function(t){return [t.module,t.symbol,side(t.dir),t.margin,t.lev+'x',t.riskUsd,t.stop,t.target===null||t.target===undefined?'trailing':t.target,fmtT(t.openedAt)]}),'No open server trades.');
+  table(document.getElementById('dec'),['Time','Rule','Coin','Side','Result','Why'],(v3.recentDecisions||[]).slice().reverse().slice(0,8).map(function(x){return [fmtT(x.at),x.module,x.symbol,side(x.dir),{t:x.verdict,c:/open|placed|taken|dry/i.test(x.verdict||'')?'ok':/fail/i.test(x.verdict||'')?'bad':'warn'},x.reason||'']}),'No calls yet. They appear at the 4h scans.');
+  var mods=fm.modules||{},live=v3.modules||[],hd=['Rule','Closed','Open','Win %','Mean R','After funding','Edge','Status'];
+  function mrow(k){var x=mods[k];return [k,x.closedCalls,x.open,x.winPct,{t:x.meanR,c:sign(x.meanR)},{t:x.meanRAfterFunding,c:sign(x.meanRAfterFunding)},{t:x.edgeVsControl,c:sign(x.edgeVsControl)},{t:x.health,c:/BEHIND/.test(x.health)?'bad':/ok/.test(x.health)?'ok':'mist'}]}
+  table(document.getElementById('mods'),hd,Object.keys(mods).filter(function(k){return live.indexOf(k)>-1}).map(mrow),'Nothing yet.');
+  table(document.getElementById('mods2'),hd,Object.keys(mods).filter(function(k){return live.indexOf(k)<0}).map(mrow),'Nothing yet.');
+  var rows=[];(bl.lists||[]).forEach(function(l){l.items.forEach(function(x){rows.push([l.bot.replace('YM ORACLE ','Bot '),x.kind||l.kind,x.symbol,side(x.side),x.score,x.note,l.ageMin+' min ago'])})});
+  table(document.getElementById('bots'),['Bot','Engine','Coin','Side','Score','Note','Posted'],rows,'No bot has posted yet. Bots on firmware v2.9.22 or newer post about every 6 minutes.');
   document.getElementById('stamp').textContent='updated '+new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
 }
+function ctlMsg(t,bad){var e=document.getElementById('ctlMsg');e.textContent=t||'';e.className=bad?'bad':'mist'}
 document.getElementById('refresh').onclick=load;
+document.getElementById('pauseBtn').onclick=async function(){var on=this.dataset.on==='1';var r=await post('/api/v3live/pause',{on:on});ctlMsg(r.ok?(on?'Paused. Open trades keep their stops.':'Resumed.'):'Could not change it ('+r.s+').',!r.ok);load()};
+document.getElementById('armBtn').onclick=async function(){
+  if(this.dataset.arm==='1'){document.getElementById('armBox').hidden=false;document.getElementById('armWord').value='';document.getElementById('armWord').focus();return}
+  var r=await post('/api/v3live/arm',{on:false});ctlMsg(r.ok?'Switched to dry run. Open trades are still managed.':(r.j.message||'Could not change it.'),!r.ok);load()};
+document.getElementById('armNo').onclick=function(){document.getElementById('armBox').hidden=true;ctlMsg('')};
+document.getElementById('armGo').onclick=async function(){var w=document.getElementById('armWord').value;var r=await post('/api/v3live/arm',{on:true,confirm:w});
+  if(r.ok){document.getElementById('armBox').hidden=true;ctlMsg('Armed. New calls will place real trades.')}else ctlMsg(r.j.message||'Could not arm it.',true);load()};
+document.getElementById('armWord').addEventListener('keydown',function(e){if(e.key==='Enter')document.getElementById('armGo').click()});
+document.getElementById('resetBtn').onclick=async function(){var r=await post('/api/v3live/resume',{});ctlMsg(r.ok?'Cleared. Equity peak reset to now.':'Could not clear it.',!r.ok);load()};
 document.getElementById('pwBtn').onclick=function(){var v=document.getElementById('pw').value;try{localStorage.setItem('ym_dash_pw',v)}catch(e){}needAuth=false;load()};
 document.getElementById('pw').addEventListener('keydown',function(e){if(e.key==='Enter')document.getElementById('pwBtn').click()});
-load();setInterval(function(){if(!document.hidden&&!needAuth)load()},60000);
+load();setInterval(function(){if(!document.hidden&&!needAuth&&document.getElementById('armBox').hidden)load()},60000);
 </script>
 </body></html>

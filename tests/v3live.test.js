@@ -166,6 +166,22 @@ function mk(over = {}) {
       ctl.t = 100; await hmx.onNewCalls([tcall({ symbol: 'BBBUSDT', id: 32 })], { items: [item({ symbol: 'BBBUSDT' })] }); assert.strictEqual(hmx.state.health.by.combo.stage, 2);
       assert.strictEqual(hmx.placed.length, 2, 'trend keeps trading while combo is switched off'); assert(hmx.placed.every(x => x.usdMargin > 0));
       await hmx.onNewCalls([call({ symbol: 'CCCUSDT', id: 33 })], { items: [item({ symbol: 'CCCUSDT' })] }); assert(/switched off by the health monitor: combo/.test(hmx.summary().recentDecisions.slice(-1)[0].reason)); }
+    // arm / disarm from the page: arming needs the server permission, disarming is always possible, open trades stay managed, the choice survives a restart
+    { const msgs = []; let saved = null; const store = { load: async () => saved, save: async x => { saved = JSON.parse(JSON.stringify(x)); } };
+      const am = mk({ deps: { trailState: FM.trailState, alert: x => msgs.push(x) } }); am.cfg.RISK_PCT = 0.5;
+      assert.strictEqual(am.summary().armed, true); assert.strictEqual(am.summary().canArm, true);
+      await am.onNewCalls([tcall({ symbol: 'LIVEUSDT', id: 41 })], { items: [item({ symbol: 'LIVEUSDT' })] }); assert.strictEqual(am.placed.length, 1);
+      const r1 = await am.setArmed(false); assert.strictEqual(r1.armed, false); assert.strictEqual(am.summary().armed, false); assert(msgs.some(x => /DRY RUN/.test(x)));
+      await am.onNewCalls([tcall({ symbol: 'DRYUSDT', id: 42 })], { items: [item({ symbol: 'DRYUSDT' })] }); assert.strictEqual(am.placed.length, 1, 'disarmed: no new real order'); assert.strictEqual(am.summary().recentDecisions.slice(-1)[0].verdict, 'dry-run');
+      const bar0 = (k, h, l, c) => ({ t: T0 + k * H4, o: c, h, l, c });
+      await am.onBar({ bar: T0 + H4, items: [{ symbol: 'LIVEUSDT', cs: [bar0(0, 103, 99, 102)] }] }); assert.strictEqual(am.placed.length, 2, 'disarmed: the open trade is still trailed'); assert.strictEqual(am.placed[1].kind, 'sltp');
+      const r2 = await am.setArmed(true); assert.strictEqual(r2.armed, true); assert(msgs.some(x => /ARMED/.test(x)));
+      // locked when the server permission is missing
+      const lm = mk({ enabled: false }); const r3 = await lm.setArmed(true); assert.strictEqual(r3.ok, false); assert(/V3_LIVE=on/.test(r3.message)); assert.strictEqual(lm.summary().armed, false); assert.strictEqual(lm.summary().canArm, false);
+      // persisted: disarmed stays disarmed after a restart
+      const pm = V.create({ enabled: true, now: () => T0 + 130000, store, deps: { equity: async () => 10000, dayPnl: async () => 0, tick: async () => '0.01', positions: async () => [], exec: async () => ({ body: { ok: true, code: 'OK' } }) } });
+      await pm.setArmed(false); const pm2 = V.create({ enabled: true, now: () => T0 + 140000, store, deps: { equity: async () => 10000, dayPnl: async () => 0, tick: async () => '0.01', positions: async () => [], exec: async () => ({ body: { ok: true, code: 'OK' } }) } });
+      await pm2.warm(); assert.strictEqual(pm2.summary().armed, false); }
     ok('trend trades: no target, exchange stop trails the best price by 1.5 ATR after +1 ATR (moved each bar, only in the trade\'s favour, shorts mirrored), a refused update is retried, nothing sent when not armed, 84-bar limit'); }
   console.log('v3live: all ' + n + ' checks passed');
 })().catch(e => { console.error(e); process.exit(1); });

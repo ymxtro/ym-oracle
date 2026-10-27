@@ -8,10 +8,15 @@ What runs, and what each switch does. Nothing here changes how the ESP32 bots tr
 | Funding + momentum shadow (`fundmom.js`) | ON (places no orders) | `FUNDMOM=off` stops it | `/api/fundmom` |
 | V3 live layer (`v3live.js`) | OFF = dry run only (writes what it would do) | `V3_LIVE=on` arms it | `/api/v3live` |
 
+## Controls (Ecosystem page, "Controls" card)
+- **Arm live trading / Switch to dry run:** arming asks you to type `ARM`. It only works once `V3_LIVE=on` is set in the Render environment (the one-time permission); without it the button is locked and says why. Switching to dry run is one click and is always allowed. The choice is saved and survives restarts. Open trades keep their exchange stops and are still managed (trailing stops, 14-day close) whether armed or not.
+- **Pause / Resume new trades:** stops or restarts new server trades at once.
+- **Clear drawdown / health pause:** appears only when the drawdown pause or the health monitor has stopped a rule; it resets the equity peak and the health stage.
+
 ## Arming the live layer
 1. Leave `V3_LIVE` unset first. After the next 4h candle, read `/api/v3live`: `recentDecisions` shows each call, the margin, leverage and risk it would use, or why it skipped.
 2. Use a DEMO key first (`BYBIT_DEMO=true` or `TRADE_MODE=paper`) and let it place at least 100 trades.
-3. Only then set `V3_LIVE=on` on a live key. Start small: it risks 0.5% of equity per trade.
+3. Only then set `V3_LIVE=on` on the server and press **Arm live trading** on the Ecosystem page. Start small: it risks 0.5% of equity per trade.
 4. `V3_MODULES=trend,combo` (default). `trendbtc`, `fundtrend` and `mom` are shadow only. To run only the swing rule: `V3_MODULES=trend`.
 
 ## Rules it enforces (all printed in /api/v3live "limits")

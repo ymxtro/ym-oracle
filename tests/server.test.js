@@ -92,6 +92,11 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
     assert(eco.status === 200 && /text\/html/.test(eco.headers.get('content-type')) && /\/api\/v3live/.test(t) && /\/api\/fundmom/.test(t), 'ecosystem page served ' + eco.status + ' ' + eco.headers.get('content-type') + ' ' + t.length);
     const v = await fetch('http://127.0.0.1:' + P1 + '/api/v3live'); assert([200, 401].includes(v.status));
     ok('/ecosystem page is served, and its data routes exist behind the dashboard sign-in'); }
+  { const noPw = await A.post('/api/v3live/arm', { on: true, confirm: 'ARM' }, {}); assert.strictEqual(noPw.s, 401, 'arm needs the dashboard sign-in');
+    const noWord = await A.post('/api/v3live/arm', { on: true }, DASH); assert.strictEqual(noWord.s, 400, 'arming needs the typed word');
+    const locked = await A.post('/api/v3live/arm', { on: true, confirm: 'arm' }, DASH); assert.strictEqual(locked.s, 409, 'arming is locked without V3_LIVE=on: ' + JSON.stringify(locked)); assert(/V3_LIVE=on/.test(locked.j.message));
+    const off = await A.post('/api/v3live/arm', { on: false }, DASH); assert.strictEqual(off.s, 200); assert.strictEqual(off.j.armed, false);
+    ok('/api/v3live/arm: needs the dashboard sign-in, the typed word ARM, and V3_LIVE=on on the server; disarming is always allowed'); }
   { const pr = await A.post('/api/bot-shortlist', { bot: 'bot1', kind: 'swing', items: [{ symbol: 'sol<usdt>', side: 'short', score: 4.123456, note: 'x'.repeat(200) }, { symbol: '' }, { symbol: 'ETHUSDT', side: 'long', kind: 'fast' }] }, {});
     assert(pr.s === 200 && pr.j.count === 2, 'shortlist accepted, junk dropped ' + JSON.stringify(pr));
     assert((await A.post('/api/bot-shortlist', { bot: 'bot1' }, {})).s === 400, 'malformed shortlist refused');

@@ -1387,6 +1387,12 @@ app.get('/ecosystem', (req, res) => { res.set('Cache-Control', 'no-store'); res.
 app.get('/api/limit-shadow', requireDashboardAuth, (req, res) => { res.status(200).json(limitShadow.summary()); });
 app.get('/api/v3live', requireDashboardAuth, (req, res) => { res.status(200).json(v3Live.summary()); });
 app.post('/api/v3live/pause', requireDashboardAuth, async (req, res) => { const on = !(req.body && (req.body.on === false || req.body.on === 'false')); res.status(200).json({ success: true, paused: await v3Live.setPaused(on) }); });
+app.post('/api/v3live/arm', requireDashboardAuth, async (req, res) => {   // v2.9.23: arm / disarm the server lane from the Ecosystem page (arming needs V3_LIVE=on and the typed word ARM)
+  const b = req.body || {}, on = b.on === true || b.on === 'true';
+  if (on && String(b.confirm || '').trim().toUpperCase() !== 'ARM') return res.status(400).json({ success: false, message: 'Type ARM to confirm.' });
+  const r = await v3Live.setArmed(on);
+  return res.status(r.ok ? 200 : 409).json({ success: r.ok, ...r });
+});
 app.post('/api/v3live/resume', requireDashboardAuth, async (req, res) => { const r = await v3Live.resumeAndResetPeak(); res.status(200).json({ success: true, paused: false, ...r }); });
 app.get('/api/fundmom', requireDashboardAuth, (req, res) => { res.status(200).json(fundMom.summary()); });
 app.get('/api/status', requireDashboardAuth, (req, res) => {
@@ -1485,7 +1491,7 @@ Promise.race([reconcileControl(), new Promise(r => setTimeout(r, 8000))]).catch(
   setTimeout(() => reconcileMasterPositions().catch(() => {}), 15000).unref();
   { const dt = setInterval(() => v3Live.dailyTick().catch(() => {}), 5 * 60000); if (dt.unref) dt.unref(); }   // v2.9.21: one Telegram summary a day, armed or not
   v3Live.warm().catch(() => {});   // v2.9.23: load the lane's open trades at start so the guards leave them alone from the first poll
-  if (v3Live.enabled) { const vt = setInterval(() => v3Live.tick().catch(() => {}), 60000); if (vt.unref) vt.unref(); }   // v2.9.21 live layer: only when V3_LIVE=on
+  if (v3Live.allowed) { const vt = setInterval(() => v3Live.tick().catch(() => {}), 60000); if (vt.unref) vt.unref(); }   // v2.9.21 live layer: only when V3_LIVE=on
   if (fundMom.enabled) { const ft = setInterval(() => fundMom.tick().catch(() => {}), 60000); if (ft.unref) ft.unref(); setTimeout(() => fundMom.tick().catch(() => {}), 20000).unref(); }   // v2.9.21 shadow, no orders
   console.log(`MAX_STOP_PCT=${MAX_STOP_PCT}${MAX_STOP_PCT === 0 ? ' (stop-distance limit is OFF)' : '% (trades with a stop further from the price than this are skipped)'}`);
   console.log(`LOSS_CAP_MARGIN_PCT=${LOSS_CAP_MARGIN_PCT}${LOSS_CAP_MARGIN_PCT === 0 ? ' (loss cap is OFF)' : '% (leverage is lowered so a stop-out costs at most this share of the margin)'}`);
