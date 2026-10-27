@@ -240,12 +240,20 @@ function create(deps) {
     // is refused BEFORE anything is changed on Bybit, and because it never reaches processOrder the copy users skip it too.
     // Fails open: if the limit or the price cannot be read, the trade carries on exactly as before.
     const wideCap = d.maxStopPct ? Number(d.maxStopPct()) : 0;
-    if (wideCap > 0 && cmd.sl && px.status === 'fulfilled' && px.value > 0) {
+    if (wideCap > 0 && cmd.bot !== 'v3' && cmd.sl && px.status === 'fulfilled' && px.value > 0) {
       const away = Math.abs(px.value - Number(cmd.sl)) / px.value * 100;
       if (away > wideCap) fail('WIDE', 'skipped: the stop is ' + away.toFixed(1) + '% from the price, over the ' + wideCap + '% limit (about ' + (away * cmd.leverage).toFixed(0) + '% of the margin would be at risk at ' + cmd.leverage + 'x)');
     }
     let lev = cmd.leverage;
     if (rules.maxLeverage >= 1 && lev > Math.floor(rules.maxLeverage)) lev = Math.floor(rules.maxLeverage);   // clamp to the pair's cap
+    // v2.9.21 LOSS CAP: leverage is lowered so that a stop-out costs at most LOSS_CAP_MARGIN_PCT of the margin (stop distance x leverage <= cap). The margin stays the same, so the position
+    // gets smaller, never larger. Applies to every bot (fast and swing) because it sits here, after the bot has chosen its leverage. Fails open: no stop or no price = unchanged.
+    let capNote = '';
+    const lossCap = d.lossCapPct ? Number(d.lossCapPct()) : 0;
+    if (lossCap > 0 && cmd.sl && px.status === 'fulfilled' && px.value > 0) {
+      const away = Math.abs(px.value - Number(cmd.sl)) / px.value * 100;
+      if (away > 0) { const maxLev = Math.max(1, Math.floor(lossCap / away)); if (lev > maxLev) { capNote = 'loss cap: stop ' + away.toFixed(1) + '% away, so at most ' + maxLev + 'x keeps a stop-out under ' + lossCap + '% of the margin'; lev = maxLev; } }
+    }
     t = d.now(); await setLeverage(cmd.symbol, lev, cmd.masterOnly); T.lev = d.now() - t;
     const price = unwrap(px, 'could not read the price for ' + cmd.symbol);
     const qty = calcQty(margin * lev, lev, price, rules);
@@ -258,7 +266,7 @@ function create(deps) {
     if (c.code === 'OK' && (scaled || lev !== cmd.leverage)) {   // opened, but not exactly as asked: say so
       const notes = [];
       if (scaled) notes.push('margin $' + cmd.usdMargin.toFixed(2) + '->$' + margin.toFixed(2) + ' (only $' + available.toFixed(2) + ' free)');
-      if (lev !== cmd.leverage) notes.push('leverage ' + cmd.leverage + 'x->' + lev + 'x (pair cap)');
+      if (lev !== cmd.leverage) notes.push('leverage ' + cmd.leverage + 'x->' + lev + 'x (' + (capNote || 'pair cap') + ')');
       c = { ok: true, code: scaled ? 'SCALED' : 'LEVCLMP', detail: notes.join('; ') };
     }
     if (cmd.trailPct > 0 && !c.paper) {

@@ -888,6 +888,9 @@ function init(deps) {
     return { open: list.find(p => parseFloat(p.size) > 0) || null, leverage: lev > 0 ? lev : null };
   }
   async function getOpenPosition(client, symbol) { return (await getPositionState(client, symbol)).open; }
+  // The master positions Profit Guard, Sentinel, the swing manager, the profit controller and the call scanner may manage: everything EXCEPT the server lane's own trades (v3 `trend`/`combo`),
+  // which run on their own exit rules (a trailing stop). The manual close-all and exposure views still see every position.
+  async function listManagedPositions() { const l = await listOpenPositions(restClient); return typeof deps.laneOwned === 'function' ? l.filter(p => { try { return !deps.laneOwned(p.symbol, p.side); } catch { return true; } }) : l; }
   async function listOpenPositions(client) {
     const out = [];
     let cursor;
@@ -1858,7 +1861,7 @@ function init(deps) {
     pgRun.busy = true;
     try {
       await ready;
-      const positions = await listOpenPositions(restClient);
+      const positions = await listManagedPositions();
       const seen = new Set();
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
@@ -2122,7 +2125,7 @@ function init(deps) {
     swRun.busy = true;
     try {
       await ready;
-      const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
+      const positions = await listManagedPositions(), seen = new Set(), now = Date.now();
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
         const symbol = p.symbol, side = p.side, key = symbol + '|' + side, long = side === 'Buy'; seen.add(key);
@@ -2334,7 +2337,7 @@ function init(deps) {
       // 1. find new calls the master has just opened (every 10 s)
       if (now - scRun.lastDisc >= 10000) {
         scRun.lastDisc = now;
-        const positions = await listOpenPositions(restClient);
+        const positions = await listManagedPositions();
         for (const p of positions) {
           if (p.side !== 'Buy' && p.side !== 'Sell') continue;
           const entry = parseFloat(p.avgPrice), created = Number(p.createdTime) > 0 ? Number(p.createdTime) : now;
@@ -2419,7 +2422,7 @@ function init(deps) {
     pcRun.busy = true;
     try {
       await ready;
-      const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
+      const positions = await listManagedPositions(), seen = new Set(), now = Date.now();
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
         const symbol = p.symbol, side = p.side, key = symbol + '|' + side, long = side === 'Buy'; seen.add(key);
@@ -2515,7 +2518,7 @@ function init(deps) {
     const pathRows = [];
     try {
       await ready;
-      const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
+      const positions = await listManagedPositions(), seen = new Set(), now = Date.now();
       let snGone = false;
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;

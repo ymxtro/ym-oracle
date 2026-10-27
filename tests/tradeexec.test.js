@@ -30,6 +30,7 @@ function world(o) {
     fanOutLeverage: () => { w.fan.lev++; }, fanOutTradingStop: () => { w.fan.stop++; },
     guardClamp: o.guardClamp,
     maxStopPct: o.maxStopPct === undefined ? undefined : () => o.maxStopPct,
+    lossCapPct: o.lossCapPct === undefined ? undefined : () => o.lossCapPct,
     report: r => w.reports.push(r),
   });
   w.run = b => ex.run(b);
@@ -138,8 +139,22 @@ const open = (x) => Object.assign({ kind: 'open', id: 'T0001', bot: 'YM ORACLE I
   assert.strictEqual(w.orders.length, 0); assert.strictEqual(w.leverage.length, 0, 'nothing is changed on Bybit'); assert.strictEqual(w.stops.length, 0); assert.strictEqual(w.fan.lev, 0, 'users are not told either');
   assert.strictEqual(w.reports.length, 1); assert.strictEqual(w.reports[0].code, 'WIDE'); assert.strictEqual(w.reports[0].ok, false);
   ok('stop-distance limit: a stop 26% away is refused (WIDE) before leverage, order, trailing stop or user copies; the dashboard hears about it');
+  // v2.9.21 loss cap: leverage is lowered so stop distance x leverage stays inside the cap; the margin is unchanged so the position shrinks
+  w = world({ lossCapPct: 13 }); r = await w.run(open({ id: 'L0001', sl: '96', leverage: 10 }));   // stop 4% away: 10x would lose 40% of the margin, 13/4 -> 3x
+  assert.strictEqual(r.body.ok, true); assert.strictEqual(r.body.code, 'LEVCLMP'); assert.strictEqual(w.leverage[0].buyLeverage, '3'); assert(/loss cap: stop 4\.0% away, so at most 3x/.test(r.body.detail), r.body.detail);
+  assert(Number(w.orders[0].qty) <= 20 * 3 / 100 + 1e-9, 'position not smaller: ' + w.orders[0].qty);
+  w = world({ lossCapPct: 13 }); r = await w.run(open({ id: 'L0002', sl: '99', leverage: 5 })); assert.strictEqual(r.body.code, 'OK'); assert.strictEqual(w.leverage[0].buyLeverage, '5');
+  w = world({ lossCapPct: 13 }); r = await w.run(open({ id: 'L0003', sl: '80', leverage: 8 })); assert.strictEqual(w.leverage[0].buyLeverage, '1');   // 20% stop: floor(13/20)=0 -> never below 1x
+  w = world({ lossCapPct: 13 }); r = await w.run(open({ id: 'L0004', side: 'SELL', sl: '104', leverage: 10 })); assert.strictEqual(w.leverage[0].buyLeverage, '3');
+  w = world({ lossCapPct: 0 }); r = await w.run(open({ id: 'L0005', sl: '96', leverage: 10 })); assert.strictEqual(w.leverage[0].buyLeverage, '10');
+  w = world({ lossCapPct: 13 }); r = await w.run(open({ id: 'L0006', sl: '', leverage: 10 })); assert.strictEqual(w.leverage[0].buyLeverage, '10');
+  ok('loss cap: leverage is lowered so a stop-out costs at most 13% of the margin (longs and shorts), never below 1x, off when 0, and untouched when there is no stop');
   w = world({ maxStopPct: 10 }); r = await w.run(open({ id: 'W0003', side: 'SELL', sl: '112' }));   // a short with the stop 12% above
   assert.strictEqual(r.body.code, 'WIDE'); ok('stop-distance limit: works for shorts (stop above the price)');
+  w = world({ maxStopPct: 10 }); r = await w.run(open({ id: 'W0009', sl: '88', bot: 'v3', masterOnly: true }));   // 12% away: the server lane has its own 15% limit and is not held to the bots' 10%
+  assert.strictEqual(r.body.ok, true, JSON.stringify(r.body)); assert.strictEqual(w.orders.length, 1);
+  w = world({ maxStopPct: 10 }); r = await w.run(open({ id: 'W0010', sl: '88', bot: 'YM ORACLE I' })); assert.strictEqual(r.body.code, 'WIDE');
+  ok('stop-distance limit: the server lane (bot v3) may use stops up to its own 15% limit; every other bot is still held to the relay limit');
   w = world({ maxStopPct: 0 }); r = await w.run(open({ id: 'W0004', sl: '60' })); assert.strictEqual(r.body.code, 'OK');
   w = world(); r = await w.run(open({ id: 'W0005', sl: '60' })); assert.strictEqual(r.body.code, 'OK');
   ok('stop-distance limit: 0 = off, and a relay wired without it behaves exactly as before');

@@ -88,6 +88,16 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
   const root = await A.get('/');
   assert(root.j.status === 'ok' && /YM Oracle/.test(root.j.message), 'branding on the root route');
   ok('server boots against the fake exchange and identifies itself as the YM Oracle relay');
+  { const eco = await fetch('http://127.0.0.1:' + P1 + '/ecosystem'); const t = await eco.text();
+    assert(eco.status === 200 && /text\/html/.test(eco.headers.get('content-type')) && /\/api\/v3live/.test(t) && /\/api\/fundmom/.test(t), 'ecosystem page served ' + eco.status + ' ' + eco.headers.get('content-type') + ' ' + t.length);
+    const v = await fetch('http://127.0.0.1:' + P1 + '/api/v3live'); assert([200, 401].includes(v.status));
+    ok('/ecosystem page is served, and its data routes exist behind the dashboard sign-in'); }
+  { const pr = await A.post('/api/bot-shortlist', { bot: 'bot1', kind: 'swing', items: [{ symbol: 'sol<usdt>', side: 'short', score: 4.123456, note: 'x'.repeat(200) }, { symbol: '' }, { symbol: 'ETHUSDT', side: 'long', kind: 'fast' }] }, {});
+    assert(pr.s === 200 && pr.j.count === 2, 'shortlist accepted, junk dropped ' + JSON.stringify(pr));
+    assert((await A.post('/api/bot-shortlist', { bot: 'bot1' }, {})).s === 400, 'malformed shortlist refused');
+    const gl = await A.get('/api/bot-shortlists', DASH); const l0 = gl.j.lists[0];
+    assert(gl.s === 200 && l0.bot === 'bot1' && l0.kind === 'swing' && l0.items[0].symbol === 'SOLUSDT' && l0.items[0].side === 'short' && l0.items[0].score === 4.12 && l0.items[0].note.length === 80 && l0.items[0].kind === 'swing' && l0.items[1].kind === 'fast', JSON.stringify(gl.j));
+    ok('bot shortlists: bots can post what they watch (sanitized, capped), the dashboard reads them; nothing trades on it'); }
 
   // 1. a retried order is processed once
   const r1 = await A.post('/api/order', order('ym-AAA1'));
