@@ -198,14 +198,31 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
   await mu.fanOutLeverage({ symbol: 'BTCUSDT', buyLeverage: 50, sellLeverage: 50 });
   assert(state.levs.length === 2 && state.levs.every(l => l.b.buyLeverage === '10'));
   ok('leverage forwarded to users but capped at MAX_USER_LEVERAGE');
-  await mu.fanOutOrder({ category: 'linear', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.10', takeProfit: '70000', stopLoss: '60000', evil: 'injected', apiKey: 'steal' });
+  await mu.fanOutOrder({ category: 'linear', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.10', takeProfit: '70000', stopLoss: '64500', evil: 'injected', apiKey: 'steal' });
   const sA = state.submits.find(s => s.k === 'KEYA'), sB = state.submits.find(s => s.k === 'KEYB');
   assert.strictEqual(sA.body.qty, '0.01'); assert.strictEqual(sB.body.qty, '0.01'); // alice 20% of $500 = $100 -> 0.0153 -> 0.01; bob 30% of $200 = $60 -> 0.0092, rounded up to the 0.01 minimum
   assert(!('evil' in sA.body) && !('apiKey' in sA.body)); assert(sA.body.orderLinkId.length <= 36);
   ok('users sized by their own equity; unknown/injected fields never reach their orders');
+  {   // v2.9.20 loss cap on copy accounts: a 2% stop at 10x would lose 20% of the margin -> leverage lowered to 6x on their account BEFORE the order
+    delete state.positions['KEYA:BTCUSDT']; delete state.positions['KEYB:BTCUSDT'];
+    const l1 = state.levs.length, s1 = state.submits.length;
+    await mu.fanOutOrder({ category: 'linear', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.10', takeProfit: '70000', stopLoss: '63700', orderLinkId: 'ym-CAPA1' });
+    const lvC = state.levs.slice(l1); assert(lvC.length >= 1 && lvC.every(x => x.b.buyLeverage === '6' && x.b.sellLeverage === '6'), 'leverage lowered to 6x: ' + JSON.stringify(lvC.map(x => x.b)));
+    assert(state.submits.length > s1, 'the capped trade is still placed');
+    delete state.positions['KEYA:BTCUSDT']; delete state.positions['KEYB:BTCUSDT'];
+    const s2 = state.submits.length, l2 = state.levs.length;
+    await mu.fanOutOrder({ category: 'linear', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.10', takeProfit: '70000', stopLoss: '50000', orderLinkId: 'ym-CAPW2' });
+    assert.strictEqual(state.submits.length, s2, 'a stop 23% away is skipped for every copy account'); assert.strictEqual(state.levs.length, l2);
+    delete state.positions['KEYA:BTCUSDT']; delete state.positions['KEYB:BTCUSDT'];
+    const s3 = state.submits.length;
+    await mu.fanOutOrder({ category: 'linear', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.10', takeProfit: '70000', orderLinkId: 'ym-CAPN3' });
+    assert(state.submits.length > s3, 'no stop given -> nothing to measure, traded as before (fail open)');
+    delete state.positions['KEYA:BTCUSDT']; delete state.positions['KEYB:BTCUSDT'];
+    ok('loss cap on copy accounts: leverage lowered before the order, far stops skipped, missing stop fails open');
+  }
   const before = state.submits.length;
   delete state.positions['KEYA:BTCUSDT']; delete state.positions['KEYB:BTCUSDT'];
-  await mu.fanOutOrder({ category: 'linear', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.10', takeProfit: '70000', stopLoss: '60000' });
+  await mu.fanOutOrder({ category: 'linear', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.10', takeProfit: '70000', stopLoss: '64500' });
   assert.strictEqual(state.submits.length, before);
   ok('retransmitted signal does not double-trade');
   await mu.fanOutOrder({ symbol: 'BTCUSDT; DROP', side: 'Buy', qty: '1' }); assert.strictEqual(state.submits.length, before);
@@ -232,6 +249,19 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
   assert(state.stops.length === 1 && state.stops[0].k === 'KEYB' && !('hax' in state.stops[0].b));
   await mu.fanOutTradingStop({ symbol: 'BTCUSDT', positionIdx: 0 }); assert.strictEqual(state.stops.length, 1);
   ok('stop updates: only users holding the pair, fields whitelisted, empty updates ignored');
+  {   // v2.9.20: a copy account keeps a tighter stop it already has
+    state.positions['KEYB:BTCUSDT'] = { side: 'Buy', size: '0.02', stopLoss: '62000' };
+    const n0 = state.stops.length;
+    await mu.fanOutTradingStop({ symbol: 'BTCUSDT', stopLoss: '61000', positionIdx: 0 }); assert.strictEqual(state.stops.length, n0, 'a looser stop is not sent');
+    await mu.fanOutTradingStop({ symbol: 'BTCUSDT', stopLoss: '61000', takeProfit: '70000', positionIdx: 0 });
+    assert(state.stops.length === n0 + 1 && !('stopLoss' in state.stops[n0].b) && state.stops[n0].b.takeProfit === '70000', 'the TP goes through, the looser stop is dropped');
+    await mu.fanOutTradingStop({ symbol: 'BTCUSDT', stopLoss: '62500', positionIdx: 0 }); assert(state.stops.length === n0 + 2 && state.stops[n0 + 1].b.stopLoss === '62500', 'a tighter stop is sent');
+    state.positions['KEYB:BTCUSDT'] = { side: 'Sell', size: '0.02', stopLoss: '68000' };
+    await mu.fanOutTradingStop({ symbol: 'BTCUSDT', stopLoss: '69000', positionIdx: 0 }); assert.strictEqual(state.stops.length, n0 + 2, 'short: a higher stop is looser and is not sent');
+    await mu.fanOutTradingStop({ symbol: 'BTCUSDT', stopLoss: '67000', positionIdx: 0 }); assert.strictEqual(state.stops.length, n0 + 3, 'short: a lower stop is tighter and is sent');
+    state.positions['KEYB:BTCUSDT'] = { side: 'Buy', size: '0.02' }; state.stops.length = 1;
+    ok('copy accounts never get a looser stop than they have (long and short); TP still goes through; no stop on the account = sent');
+  }
 
   // ---------- master plan: autopilot vs manual ----------
   for (const kk of Object.keys(state.positions)) delete state.positions[kk];
@@ -1817,11 +1847,11 @@ let n = 0; const ok = (m) => console.log('  ok', ++n, m);
       // isolation: no core fan-out reaches the scalp user
       const n0 = state.submits.length, st0 = state.stops.length, lv0 = (state.levs || []).length;
       await mu.fanOutLeverage({ symbol: 'BTCUSDT', buyLeverage: 8, sellLeverage: 8 });
-      await mu.fanOutOrder({ category: 'linear', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.10', takeProfit: '70000', stopLoss: '60000' });
-      await mu.fanOutTradingStop({ symbol: 'BTCUSDT', positionIdx: 0, stopLoss: '61000' });
+      await mu.fanOutOrder({ category: 'linear', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.10', takeProfit: '70000', stopLoss: '99' });
+      await mu.fanOutTradingStop({ symbol: 'BTCUSDT', positionIdx: 0, stopLoss: '99.5' });
       state.positions['KEYSC:BTCUSDT'] = { side: 'Buy', size: '1' };
       await mu._test.fanOutPartialClose('BTCUSDT', 'Buy', 0.5, { qtyStep: '0.01', minQty: '0.01' });
-      assert(state.submits.length > n0 && state.stops.length > st0, 'core users were handled');
+      assert(state.submits.length > n0 && state.stops.length > st0, 'core users were handled ' + (state.submits.length - n0) + '/' + (state.stops.length - st0));
       assert(!state.submits.slice(n0).some(x => x.k === 'KEYSC') && !state.stops.slice(st0).some(x => x.k === 'KEYSC') && !(state.levs || []).slice(lv0).some(x => x.k === 'KEYSC'), 'the scalp user was not touched by any core order, stop, leverage or partial close');
       assert.strictEqual(state.positions['KEYSC:BTCUSDT'].size, '1');
       delete state.positions['KEYSC:BTCUSDT'];

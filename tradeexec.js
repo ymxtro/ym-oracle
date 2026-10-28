@@ -209,7 +209,7 @@ function create(deps) {
   async function placeAndConfirm(payload, symbol, wantHeldSide, T, masterOnly) {
     T.orderTried = true;
     let c;
-    try { c = classify(await withTimeout(Promise.resolve().then(() => d.placeOrder(payload, { masterOnly: !!masterOnly })), ORDER_TIMEOUT_MS, 'order')); }
+    try { c = classify(await withTimeout(Promise.resolve().then(() => d.placeOrder(payload, { masterOnly: !!masterOnly, capDone: true })), ORDER_TIMEOUT_MS, 'order')); }
     catch (e) { c = { ok: false, code: 'NET', detail: 'order call failed: ' + clip(e.message, 80) }; }
     if (!c.ok && c.code === 'NET') {
       const h = await getHeld(symbol).then(x => ({ x }), () => null);
@@ -240,7 +240,7 @@ function create(deps) {
     // is refused BEFORE anything is changed on Bybit, and because it never reaches processOrder the copy users skip it too.
     // Fails open: if the limit or the price cannot be read, the trade carries on exactly as before.
     const wideCap = d.maxStopPct ? Number(d.maxStopPct()) : 0;
-    if (wideCap > 0 && cmd.bot !== 'v3' && cmd.sl && px.status === 'fulfilled' && px.value > 0) {
+    if (wideCap > 0 && cmd.sl && px.status === 'fulfilled' && px.value > 0) {
       const away = Math.abs(px.value - Number(cmd.sl)) / px.value * 100;
       if (away > wideCap) fail('WIDE', 'skipped: the stop is ' + away.toFixed(1) + '% from the price, over the ' + wideCap + '% limit (about ' + (away * cmd.leverage).toFixed(0) + '% of the margin would be at risk at ' + cmd.leverage + 'x)');
     }

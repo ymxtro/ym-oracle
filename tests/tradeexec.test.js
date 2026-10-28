@@ -151,10 +151,6 @@ const open = (x) => Object.assign({ kind: 'open', id: 'T0001', bot: 'YM ORACLE I
   ok('loss cap: leverage is lowered so a stop-out costs at most 13% of the margin (longs and shorts), never below 1x, off when 0, and untouched when there is no stop');
   w = world({ maxStopPct: 10 }); r = await w.run(open({ id: 'W0003', side: 'SELL', sl: '112' }));   // a short with the stop 12% above
   assert.strictEqual(r.body.code, 'WIDE'); ok('stop-distance limit: works for shorts (stop above the price)');
-  w = world({ maxStopPct: 10 }); r = await w.run(open({ id: 'W0009', sl: '88', bot: 'v3', masterOnly: true }));   // 12% away: the server lane has its own 15% limit and is not held to the bots' 10%
-  assert.strictEqual(r.body.ok, true, JSON.stringify(r.body)); assert.strictEqual(w.orders.length, 1);
-  w = world({ maxStopPct: 10 }); r = await w.run(open({ id: 'W0010', sl: '88', bot: 'YM ORACLE I' })); assert.strictEqual(r.body.code, 'WIDE');
-  ok('stop-distance limit: the server lane (bot v3) may use stops up to its own 15% limit; every other bot is still held to the relay limit');
   w = world({ maxStopPct: 0 }); r = await w.run(open({ id: 'W0004', sl: '60' })); assert.strictEqual(r.body.code, 'OK');
   w = world(); r = await w.run(open({ id: 'W0005', sl: '60' })); assert.strictEqual(r.body.code, 'OK');
   ok('stop-distance limit: 0 = off, and a relay wired without it behaves exactly as before');
@@ -201,9 +197,9 @@ const open = (x) => Object.assign({ kind: 'open', id: 'T0001', bot: 'YM ORACLE I
   // ---- v2.9.8: a master-only trade (the relay's own re-entry) never touches users
   w = world(); r = await w.run(open({ id: 'MO0001', masterOnly: true, trailPct: 1.5 }));
   assert.strictEqual(r.body.ok, true); assert.strictEqual(w.fan.lev, 0, 'no leverage change on users\' accounts'); assert.strictEqual(w.fan.stop, 0, 'no stop copied to users');
-  assert.deepStrictEqual(w.optsSeen, [{ masterOnly: true }], 'the order pipeline is told to skip copies and plan sizing');
+  assert.deepStrictEqual(w.optsSeen, [{ masterOnly: true, capDone: true }], 'the order pipeline is told to skip copies and plan sizing');
   w = world(); await w.run(open({ id: 'MO0002' }));
-  assert.strictEqual(w.fan.lev, 1); assert.strictEqual(w.fan.stop, 1); assert.deepStrictEqual(w.optsSeen, [{ masterOnly: false }], 'a normal bot trade still fans out');
+  assert.strictEqual(w.fan.lev, 1); assert.strictEqual(w.fan.stop, 1); assert.deepStrictEqual(w.optsSeen, [{ masterOnly: false, capDone: true }], 'a normal bot trade still fans out');
   ok('masterOnly: leverage, stops and the order skip every user account; a normal trade is unchanged');
 
   console.log('\nALL ' + n + ' TRADE EXECUTION CHECKS PASSED');

@@ -1,0 +1,22 @@
+const assert = require('assert');
+const L = require(process.env.RELAY_DIR ? process.env.RELAY_DIR + '/losscap.js' : '../losscap.js');
+let n = 0; const ok = m => console.log('  ok', ++n, m);
+assert.deepStrictEqual(L.settings({}), { lossCapPct: 13, maxStopPct: 15 }); ok('defaults 13 / 15');
+assert.deepStrictEqual(L.settings({ LOSS_CAP_MARGIN_PCT: '0', MAX_STOP_PCT: '0' }), { lossCapPct: 0, maxStopPct: 0 }); ok('0 turns both off');
+assert.strictEqual(L.settings({ MAX_STOP_PCT: 'abc' }).maxStopPct, 15); ok('junk falls back');
+const S = { lossCapPct: 13, maxStopPct: 15 };
+let r = L.evaluate({ lev: 10, price: 100, stop: 98, ...S });
+assert(r.capped && r.lev === 6 && r.maxLev === 6 && !r.refuse); ok('2% stop at 10x -> 6x (2% x 6 = 12% <= 13%)');
+r = L.evaluate({ lev: 5, price: 100, stop: 98, ...S }); assert(!r.capped && r.lev === 5); ok('already safe: unchanged');
+r = L.evaluate({ lev: 10, price: 100, stop: 80, ...S }); assert(r.refuse && /limit 15/.test(r.note)); ok('stop 20% away -> refused');
+r = L.evaluate({ lev: 10, price: 100, stop: 85, ...S }); assert(!r.refuse && r.capped && r.lev === 1); ok('stop 15% away is allowed, leverage floors at 1x');
+r = L.evaluate({ lev: 10, price: 100, stop: 110, ...S }); assert(r.capped && r.lev === 1); ok('short side (stop above price) works');
+for (const bad of [{ price: 0, stop: 98 }, { price: 100, stop: 0 }, { price: NaN, stop: 98 }, { price: 100, stop: 100 }]) { r = L.evaluate({ lev: 10, ...bad, ...S }); assert(!r.capped && !r.refuse && r.lev === 10); }
+ok('missing/odd price or stop -> does nothing (fail open)');
+r = L.evaluate({ lev: 10, price: 100, stop: 98, lossCapPct: 0, maxStopPct: 0 }); assert(!r.capped && !r.refuse); ok('both off -> does nothing');
+r = L.evaluate({ lev: 0, price: 100, stop: 98, ...S }); assert(!r.capped && r.lev === 0); ok('unknown leverage -> no cap, stop check still runs');
+assert.strictEqual(L.scaleQty(10, 10, 6, 0.1, 0.1), 6); ok('qty scales with leverage');
+assert.strictEqual(L.scaleQty(1, 10, 3, 0.1, 0.1), 0.3); ok('rounds to step (float-safe)');
+assert.strictEqual(L.scaleQty(0.2, 10, 1, 0.1, 0.1), 0.1); ok('never below the minimum');
+assert.strictEqual(L.scaleQty(5, 6, 10, 0.1, 0.1), 5); ok('never scales up');
+console.log(n + ' checks passed');

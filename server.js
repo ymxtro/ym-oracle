@@ -4,6 +4,7 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const { RestClientV5 } = require('bybit-api');
+const lossCapLib = require('./losscap');
 
 const { safeEqual, makeLimiter } = require('./security');
 
@@ -300,73 +301,6 @@ const alertEnvChats = () => ({ groupChat: ALERT_TELEGRAM_CHAT_ID, dmChat: proces
 // KEY_ENCRYPTION_SECRET are set on Render -- with neither set, every call below is a harmless no-op and this
 // relay behaves exactly as the single-account version did. Adds /join (user signup), /admin and /api/me*,
 // /api/auth*, /api/admin* routes, and copies each bot signal into every active user's own Bybit account.
-// v2.9.20: LIMIT-ORDER SHADOW. Watches real opens and logs what a post-only limit would have done. Places no orders. Off unless LIMIT_SHADOW=on.
-const limitShadow = require('./limitshadow').create({
-  log: (...a) => console.log(...a),
-  getTicker: async symbol => { const r = await restClient.getTickers({ category: 'linear', symbol }); const t = r && r.result && r.result.list && r.result.list[0]; return t ? { bid: t.bid1Price, ask: t.ask1Price, last: t.lastPrice } : null; },
-});
-// v2.9.21: a tiny database table for the shadow modules' own state (kept apart from the trading tables). No DATABASE_URL = memory only.
-function makeShadowStore(key) {
-  if (!process.env.DATABASE_URL) return null;
-  let pool = null;
-  const q = async (sql, p) => { if (!pool) { const { Pool } = require('pg'); pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 1, ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false } }); pool.on('error', () => {}); await pool.query('CREATE TABLE IF NOT EXISTS shadow_state (k TEXT PRIMARY KEY, v TEXT)'); } return pool.query(sql, p); };
-  return { load: async () => { const r = await q('SELECT v FROM shadow_state WHERE k=$1', [key]); return r.rows[0] ? JSON.parse(r.rows[0].v) : null; },
-           save: async obj => { await q('INSERT INTO shadow_state (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v', [key, JSON.stringify(obj)]); } };
-}
-// v2.9.21: V3 LIVE LAYER. Turns the funding+momentum shadow module's chosen calls into real MASTER-account trades through the relay's own trade executor, with risk gates.
-// OFF unless V3_LIVE=on (until then it only writes down what it would do). TRADE_MODE=paper still sends nothing to Bybit. Read it at /api/v3live.
-const v3Live = require('./v3live').create({
-  log: (...a) => console.log(...a),
-  config: (() => {   // V3_CFG='{"RISK_PCT":0.25,"MAX_OPEN":3}' overrides the defaults (known keys, sane limits only); V3_MODULES=trend,combo picks the live rules (combo, fundtrend, mom, trend, trendbtc)
-    let raw = {}; try { raw = process.env.V3_CFG ? JSON.parse(process.env.V3_CFG) : {}; } catch { console.warn('[v3live] V3_CFG is not valid JSON: ignored'); }
-    if (process.env.V3_MODULES) raw.MODULES = process.env.V3_MODULES.split(',').map(x => x.trim()).filter(Boolean);
-    const z = require('./v3live').sanitizeConfig(raw); if (z.ignored.length) console.warn('[v3live] ignored settings: ' + z.ignored.join(', ')); return z.cfg;
-  })(),
-  store: makeShadowStore('v3live'),
-  deps: {
-    mode: () => TRADE_MODE,
-    alert: text => sendOfflineAlertTelegram(text, 'ops'),
-    windowStats: (m, n) => fundMom.window(m, n),
-    trailState: (call, cs, asOf) => require('./fundmom').trailState(call, cs, asOf),
-    shadowSummary: () => fundMom.summary(),
-    exec: b => tradeExec.run({ ...b, masterOnly: true }),
-    equity: async () => { const r = await restClient.getWalletBalance({ accountType: 'UNIFIED' }); if (!r || r.retCode !== 0) throw new Error('balance: ' + (r && r.retMsg)); const e = parseFloat(r.result.list[0].totalEquity); if (!(e > 0)) throw new Error('no equity'); return e; },
-    positions: async () => { const out = []; let cursor; for (let i = 0; i < 5; i++) { const r = await restClient.getPositionInfo({ category: 'linear', settleCoin: 'USDT', limit: 200, ...(cursor ? { cursor } : {}) }); if (!r || r.retCode !== 0) throw new Error('positions: ' + (r && r.retMsg)); for (const p of r.result.list || []) if (parseFloat(p.size) > 0) out.push({ symbol: p.symbol, side: p.side }); cursor = r.result.nextPageCursor; if (!cursor) break; } return out; },
-    dayPnl: async () => { const d0 = new Date(); d0.setUTCHours(0, 0, 0, 0); let sum = 0, cursor; for (let i = 0; i < 6; i++) { const r = await restClient.getClosedPnL({ category: 'linear', startTime: d0.getTime(), limit: 100, ...(cursor ? { cursor } : {}) }); if (!r || r.retCode !== 0) throw new Error('closed pnl: ' + (r && r.retMsg)); for (const x of r.result.list || []) sum += parseFloat(x.closedPnl) || 0; cursor = r.result.nextPageCursor; if (!cursor) break; } return sum; },
-    closedPnl: async (symbol, since) => { const r = await restClient.getClosedPnL({ category: 'linear', symbol, startTime: since, limit: 50 }); if (!r || r.retCode !== 0) throw new Error('closed pnl'); return (r.result.list || []).reduce((t, x) => t + (parseFloat(x.closedPnl) || 0), 0); },
-    tick: async symbol => { const r = await restClient.getInstrumentsInfo({ category: 'linear', symbol }); const it = r && r.result && r.result.list && r.result.list[0]; return it && it.priceFilter ? it.priceFilter.tickSize : null; },
-  },
-});
-// v2.9.21: FUNDING + MOMENTUM SHADOW. Every 4h bar it logs what five rules (combo, fundtrend, mom, trend, trendbtc) WOULD have traded, with a random-coin control for each, and scores them in R.
-// It places no orders and reads only public Bybit data. ON by default; set FUNDMOM=off to stop it. Read it at /api/fundmom. State is kept in the database when there is one.
-const fundMom = require('./fundmom').create({
-  log: (...a) => console.log(...a),
-  store: makeShadowStore('fundmom'),
-  onNewCalls: (calls, data) => v3Live.onNewCalls(calls, data),
-  onBar: data => v3Live.onBar(data),
-  fetchUniverse: async (cfg, bar) => {
-    const pub = new RestClientV5(BYBIT_BASE_URL && !/api-demo\./i.test(BYBIT_BASE_URL) ? { baseUrl: BYBIT_BASE_URL } : {});   // public mainnet data, no keys
-    const STABLE = require('./fundmom').STABLE;
-    const tk = await pub.getTickers({ category: 'linear' });
-    const list = ((tk && tk.result && tk.result.list) || []).filter(t => /USDT$/.test(t.symbol) && !STABLE.test(t.symbol) && Number(t.turnover24h) > 0 && Number.isFinite(Number(t.fundingRate)))
-      .sort((a, b) => Number(b.turnover24h) - Number(a.turnover24h)).slice(0, cfg.UNIVERSE);
-    const items = [];
-    for (let i = 0; i < list.length; i += cfg.CONC) {
-      const chunk = list.slice(i, i + cfg.CONC);
-      const got = await Promise.all(chunk.map(async t => {
-        try {
-          const r = await pub.getKline({ category: 'linear', symbol: t.symbol, interval: '240', limit: cfg.KLINES });
-          const rows = ((r && r.result && r.result.list) || []).map(x => ({ t: Number(x[0]), o: Number(x[1]), h: Number(x[2]), l: Number(x[3]), c: Number(x[4]) })).sort((a, b) => a.t - b.t);
-          const cur = rows.find(x => x.t === bar) || null, cs = rows.filter(x => x.t < bar);
-          return cs.length > 0 && cs[cs.length - 1].t === bar - 4 * 3600 * 1000 ? { symbol: t.symbol, funding: Number(t.fundingRate), turnover: Number(t.turnover24h), last: Number(t.lastPrice), bid: Number(t.bid1Price), ask: Number(t.ask1Price), cs, cur } : null;
-        } catch { return null; }
-      }));
-      for (const g of got) if (g) items.push(g);
-      await new Promise(r => setTimeout(r, 250));
-    }
-    return { items };
-  },
-});
 const multiuser = require('./multiuser').init({
   app,
   restClient: restClientProxy,
@@ -375,7 +309,6 @@ const multiuser = require('./multiuser').init({
   requireDashboardAuth,
   getSecurityInfo: () => ({ deviceKeySet: !!DEVICE_API_KEY, deviceKeyMode: DEVICE_KEY_MODE, deviceKeyMisses }),
   execTrade: b => tradeExec.run({ ...b, masterOnly: true }),   // v2.9.8: the relay's own re-entry orders (master account only)
-  laneOwned: (symbol, side) => v3Live.owns(symbol, side),   // v2.9.23: the server lane's own trades are not managed by Profit Guard / Sentinel / swing manager / re-entry
   getFleet: () => ({ last: fleetStatus, info: fleetInfo, offlineMs: HEARTBEAT_OFFLINE_THRESHOLD_MS }),
   sendAlert: (text) => sendOfflineAlertTelegram(text),
   deliverAlert: (text, opts) => deliverTradeAlert(text, opts),
@@ -651,7 +584,47 @@ async function submitMasterOrder(body) {
   }
 }
 
+
+// ---- LOSS CAP + STOP LIMIT ON THE MANAGER ROUTE (v2.9.20) ------------------------------------------------------------
+// The manager sends set-leverage and then the order. The leverage it asked for is remembered here; when the order arrives its stop
+// distance is known, so leverage is lowered (and the quantity scaled with it) until a stop-out costs at most LOSS_CAP_MARGIN_PCT of
+// the margin. A stop further than MAX_STOP_PCT is refused with a normal "no" the manager reports. Any missing piece = trade as asked.
+const lastAskedLev = new Map();   // symbol -> { lev, at }
+const instCache = new Map();      // symbol -> { at, step, min }
+const withT = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+async function masterInst(symbol) {
+  const c = instCache.get(symbol); if (c && Date.now() - c.at < 3600000) return c;
+  const r = await withT(restClient.getInstrumentsInfo({ category: 'linear', symbol }), 3000);
+  const lot = r && r.result && r.result.list && r.result.list[0] && r.result.list[0].lotSizeFilter || {};
+  const v = { at: Date.now(), step: parseFloat(lot.qtyStep) || 0, min: parseFloat(lot.minOrderQty) || 0 }; instCache.set(symbol, v); return v;
+}
+async function applyMasterLossCap(body) {
+  if (TRADE_MODE === 'paper' || (LOSS_CAP_MARGIN_PCT <= 0 && MAX_STOP_PCT <= 0)) return { body };
+  const sl = Number(body.stopLoss); if (!(sl > 0) || !body.symbol) return { body };
+  try {
+    const t = await withT(restClient.getTickers({ category: 'linear', symbol: body.symbol }), 3000);
+    const price = Number(t && t.result && t.result.list && t.result.list[0] && t.result.list[0].lastPrice);
+    const asked = lastAskedLev.get(body.symbol); const lev0 = asked && Date.now() - asked.at < 600000 ? asked.lev : 0;
+    const ev = lossCapLib.evaluate({ lev: lev0, price, stop: sl, lossCapPct: LOSS_CAP_MARGIN_PCT, maxStopPct: MAX_STOP_PCT });
+    if (ev.refuse) return { body, refused: { retCode: 100001, retMsg: 'Skipped on purpose: ' + ev.note } };
+    if (!ev.capped) return { body };
+    const r = await withT(restClient.setLeverage({ category: 'linear', symbol: body.symbol, buyLeverage: String(ev.lev), sellLeverage: String(ev.lev) }), 4000);
+    if (!(r.retCode === 0 || r.retCode === 110043)) { console.warn('[loss-cap] could not lower leverage (' + r.retMsg + '): trading as asked'); return { body }; }
+    lastAskedLev.set(body.symbol, { lev: ev.lev, at: Date.now() });
+    let inst = { step: 0, min: 0 }; try { inst = await masterInst(body.symbol); } catch (_) { /* rounding falls back to the original precision */ }
+    const qty = lossCapLib.scaleQty(body.qty, lev0, ev.lev, inst.step, inst.min);
+    console.log('[loss-cap] ' + body.symbol + ': ' + ev.note + '; qty ' + body.qty + ' -> ' + qty);
+    return { body: { ...body, qty: String(qty) }, leverage: ev.lev };
+  } catch (e) { console.warn('[loss-cap] skipped (' + e.message + '): trading as asked'); return { body }; }
+}
+
 async function processOrder(body, opts) {
+  let capLev = 0;
+  if (!body.reduceOnly && !(opts && opts.capDone)) {   // capDone: the server-side trade route already applied the cap
+    const cap = await applyMasterLossCap(body);
+    if (cap.refused) return cap.refused;
+    body = cap.body; capLev = cap.leverage || 0;
+  }
   const masterOnly = !!(opts && opts.masterOnly);   // v2.9.8: a relay-originated re-entry trades the master account only: no copies, no plan sizing
   // Copy this signal to every active user's account. Fire-and-forget: the ESP32 must never wait on (or be
   // broken by) other people's accounts, and one user's failure never touches the master order below.
@@ -669,9 +642,8 @@ async function processOrder(body, opts) {
   const isOpen = !body.reduceOnly;
   const landed = TRADE_MODE === 'paper' || response.retCode === 0 || response.retCode === 110072;
   if (isOpen && landed) {
-    try { limitShadow.observe(body); } catch { /* a shadow never touches a trade */ }
     logMasterOpen({ orderLinkId: cleanLink(body.orderLinkId), symbol: body.symbol, side: body.side, qty: body.qty,
-      takeProfit: body.takeProfit, stopLoss: body.stopLoss, source: response.retCode === 110072 ? 'order-dup' : 'order' });
+      takeProfit: body.takeProfit, stopLoss: body.stopLoss, leverage: capLev || (lastAskedLev.get(body.symbol) || {}).lev || null, source: response.retCode === 110072 ? 'order-dup' : 'order' });
   }
   return response;
 }
@@ -715,22 +687,6 @@ app.post('/api/bot-event', requireDevice, async (req, res) => {
   }
 });
 
-// Bot shortlists (what each bot is watching). Memory only, small, sanitized: the bots may post {bot, kind:'fast'|'swing', items:[{symbol, side, score, note}]}.
-// Nothing trades on this; it feeds the /ecosystem page so fast and swing shortlists are visible in one place.
-const botLists = new Map();
-app.post('/api/bot-shortlist', requireDevice, (req, res) => {
-  const b = req.body || {}, bot = String(b.bot || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24), kind = b.kind === 'swing' ? 'swing' : 'fast';
-  if (!bot || !Array.isArray(b.items)) return res.status(400).json({ success: false, message: 'need bot and items[]' });
-  const items = b.items.slice(0, 48).map(x => ({ symbol: String((x && x.symbol) || '').replace(/[^A-Z0-9]/gi, '').toUpperCase().slice(0, 20), side: /^s/i.test(String((x && x.side) || '')) ? 'short' : 'long',
-    score: Number.isFinite(Number(x && x.score)) ? Math.round(Number(x.score) * 100) / 100 : null, note: String((x && x.note) || '').slice(0, 80), kind: (x && x.kind) === 'swing' ? 'swing' : (x && x.kind) === 'fast' ? 'fast' : kind })).filter(x => x.symbol);
-  if (!botLists.has(bot) && botLists.size >= 8) return res.status(400).json({ success: false, message: 'too many bots' });
-  botLists.set(bot, { bot, kind, items, at: Date.now() });
-  return res.status(200).json({ success: true, count: items.length });
-});
-app.get('/api/bot-shortlists', requireDashboardAuth, (req, res) => {
-  res.status(200).json({ lists: [...botLists.values()].map(l => ({ ...l, ageMin: Math.round((Date.now() - l.at) / 60000), at: new Date(l.at).toISOString() })) });
-});
-
 // 6. Configure Trailing Stops / Position Stop Lines
 app.post('/api/trading-stop', requireDevice, async (req, res) => {
   if (breakerIsTripped()) {
@@ -755,6 +711,7 @@ app.post('/api/trading-stop', requireDevice, async (req, res) => {
 app.post('/api/set-leverage', requireDevice, async (req, res) => {
   try {
     const { category, symbol, buyLeverage, sellLeverage } = req.body;
+    { const lv = Number(buyLeverage); if (symbol && lv > 0) lastAskedLev.set(symbol, { lev: lv, at: Date.now() }); }
     multiuser.fanOutLeverage(req.body).catch(e => console.error('[multiuser] fanOutLeverage:', e.message));
 
     let response;
@@ -1196,7 +1153,7 @@ const EXEC_ALERT_TEXT = {
   BAL: 'not enough free balance on the master account', MINQ: "the size was under Bybit's minimum", PAIR: 'the pair is not on Bybit',
   LEV: 'Bybit rejected the leverage', NET: "the relay could not reach Bybit", BYBIT: 'Bybit refused the order', BAD: 'the command was malformed',
   HELD: 'the master account already holds this pair', SIDE: 'the open position is on the other side',
-  WIDE: 'the trade was SKIPPED on purpose: its stop is too far from the price (limit ' + (process.env.MAX_STOP_PCT === undefined ? 10 : Number(process.env.MAX_STOP_PCT)) + '%)',
+  WIDE: 'the trade was SKIPPED on purpose: its stop is too far from the price (limit ' + lossCapLib.settings().maxStopPct + '%)',
   NOTRL: 'it opened but the trailing stop was NOT set',
 };
 
@@ -1383,18 +1340,6 @@ app.get('/api/health', (req, res) => {
   res.status(200).json({ ok: true, now: Date.now() });
 });
 
-app.get('/ecosystem', (req, res) => { res.set('Cache-Control', 'no-store'); res.sendFile(path.join(__dirname, 'public', 'ecosystem.html')); });   // the page itself holds nothing: every number comes from the authenticated /api routes
-app.get('/api/limit-shadow', requireDashboardAuth, (req, res) => { res.status(200).json(limitShadow.summary()); });
-app.get('/api/v3live', requireDashboardAuth, (req, res) => { res.status(200).json(v3Live.summary()); });
-app.post('/api/v3live/pause', requireDashboardAuth, async (req, res) => { const on = !(req.body && (req.body.on === false || req.body.on === 'false')); res.status(200).json({ success: true, paused: await v3Live.setPaused(on) }); });
-app.post('/api/v3live/arm', requireDashboardAuth, async (req, res) => {   // v2.9.23: arm / disarm the server lane from the Ecosystem page (arming needs V3_LIVE=on and the typed word ARM)
-  const b = req.body || {}, on = b.on === true || b.on === 'true';
-  if (on && String(b.confirm || '').trim().toUpperCase() !== 'ARM') return res.status(400).json({ success: false, message: 'Type ARM to confirm.' });
-  const r = await v3Live.setArmed(on);
-  return res.status(r.ok ? 200 : 409).json({ success: r.ok, ...r });
-});
-app.post('/api/v3live/resume', requireDashboardAuth, async (req, res) => { const r = await v3Live.resumeAndResetPeak(); res.status(200).json({ success: true, paused: false, ...r }); });
-app.get('/api/fundmom', requireDashboardAuth, (req, res) => { res.status(200).json(fundMom.summary()); });
 app.get('/api/status', requireDashboardAuth, (req, res) => {
   res.status(200).json({ mode: TRADE_MODE, testnet: IS_TESTNET, demo: IS_DEMO, masterEnv: masterEnvName(), breaker: breakerStatus() });
 });
@@ -1444,17 +1389,17 @@ process.on('unhandledRejection', reason => crashGuard.onRejection(reason));
 // check, instrument rules, leverage, quantity, order, wait for the position, trailing stop). See tradeexec.js. The manager path
 // (/api/order etc.) is unchanged and keeps working, so bots can be moved over one at a time.
 // A 200 answer is final for that id (ok:true/false + a code); a 5xx or a timeout means "ask again with the same id" (safe: ids are idempotent).
-// v2.9.17: refuse a trade whose stop is further than this many percent of the price from the price (0 = off). Default 10. Set MAX_STOP_PCT on Render to change it.
-const MAX_STOP_PCT = (() => { const raw = process.env.MAX_STOP_PCT; if (raw === undefined || raw === '') return 10; const n = Number(raw); return Number.isFinite(n) && n >= 0 && n <= 50 ? n : 10; })();
+// v2.9.17: refuse a trade whose stop is further than this many percent of the price from the price (0 = off). Default 15 (v2.9.20). Set MAX_STOP_PCT on Render to change it.
+const MAX_STOP_PCT = lossCapLib.settings().maxStopPct;   // default 15 (v2.9.20); 0 = off
 // v2.9.21 LOSS CAP: the most a stop-out may cost, as a % of the trade's margin. Leverage is lowered to fit (stop distance % x leverage <= this). 13 leaves room under a 15% limit for fees and slippage. 0 turns it off.
-const LOSS_CAP_MARGIN_PCT = process.env.LOSS_CAP_MARGIN_PCT !== undefined && process.env.LOSS_CAP_MARGIN_PCT !== '' ? Math.max(0, Number(process.env.LOSS_CAP_MARGIN_PCT) || 0) : 13;
+const LOSS_CAP_MARGIN_PCT = lossCapLib.settings().lossCapPct;   // default 13; 0 = off
 const tradeExec = require('./tradeexec').create({
   rest: () => restClient,
   mode: () => TRADE_MODE,
   halted: () => breakerIsTripped(),
   placeOrder: (body, o) => processOrder(body, o),
+  lossCapPct: () => LOSS_CAP_MARGIN_PCT,   // v2.9.20: leverage is lowered so a stop-out costs at most this % of the margin (0 = off)
   maxStopPct: () => MAX_STOP_PCT,
-  lossCapPct: () => LOSS_CAP_MARGIN_PCT,   // v2.9.21: leverage is lowered so a stop-out costs at most this % of the margin (0 = off)
   fanOutLeverage: b => multiuser.fanOutLeverage(b),
   fanOutTradingStop: b => multiuser.fanOutTradingStop(b),
   guardClamp: b => (multiuser.guardClamp ? multiuser.guardClamp(b) : b),   // Profit Guard: a looser stop from a bot is held at the guard's floor
@@ -1489,10 +1434,6 @@ Promise.race([reconcileControl(), new Promise(r => setTimeout(r, 8000))]).catch(
   console.log(`YM Oracle relay running on port ${PORT}`);
   const rt = setInterval(() => reconcileMasterPositions().catch(() => {}), 60000); if (rt.unref) rt.unref();
   setTimeout(() => reconcileMasterPositions().catch(() => {}), 15000).unref();
-  { const dt = setInterval(() => v3Live.dailyTick().catch(() => {}), 5 * 60000); if (dt.unref) dt.unref(); }   // v2.9.21: one Telegram summary a day, armed or not
-  v3Live.warm().catch(() => {});   // v2.9.23: load the lane's open trades at start so the guards leave them alone from the first poll
-  if (v3Live.allowed) { const vt = setInterval(() => v3Live.tick().catch(() => {}), 60000); if (vt.unref) vt.unref(); }   // v2.9.21 live layer: only when V3_LIVE=on
-  if (fundMom.enabled) { const ft = setInterval(() => fundMom.tick().catch(() => {}), 60000); if (ft.unref) ft.unref(); setTimeout(() => fundMom.tick().catch(() => {}), 20000).unref(); }   // v2.9.21 shadow, no orders
   console.log(`MAX_STOP_PCT=${MAX_STOP_PCT}${MAX_STOP_PCT === 0 ? ' (stop-distance limit is OFF)' : '% (trades with a stop further from the price than this are skipped)'}`);
   console.log(`LOSS_CAP_MARGIN_PCT=${LOSS_CAP_MARGIN_PCT}${LOSS_CAP_MARGIN_PCT === 0 ? ' (loss cap is OFF)' : '% (leverage is lowered so a stop-out costs at most this share of the margin)'}`);
   console.log(`TRADE_MODE=${TRADE_MODE}${TRADE_MODE === 'paper' ? '  (no real orders will be submitted)' : ''}`);

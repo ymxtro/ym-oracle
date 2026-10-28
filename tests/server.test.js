@@ -50,7 +50,7 @@ const fakeSrv = http.createServer((req, res) => {
     if (fake.sizing && u.pathname === '/v5/market/tickers') return send({ retCode: 0, result: { list: [{ lastPrice: '65000' }] } });
     if (u.pathname === '/v5/position/closed-pnl') return send({ retCode: 0, result: { list: [], nextPageCursor: '' } });
     if (u.pathname === '/v5/position/trading-stop') return send({ retCode: 0, result: {} });
-    if (u.pathname === '/v5/position/set-leverage') return send({ retCode: 0, result: {} });
+    if (u.pathname === '/v5/position/set-leverage') { fake.levCalls = fake.levCalls || []; fake.levCalls.push(JSON.parse(body || '{}')); return send({ retCode: 0, result: {} }); }
     return send({ retCode: 0, result: { list: [] } });
   });
 });
@@ -88,21 +88,6 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
   const root = await A.get('/');
   assert(root.j.status === 'ok' && /YM Oracle/.test(root.j.message), 'branding on the root route');
   ok('server boots against the fake exchange and identifies itself as the YM Oracle relay');
-  { const eco = await fetch('http://127.0.0.1:' + P1 + '/ecosystem'); const t = await eco.text();
-    assert(eco.status === 200 && /text\/html/.test(eco.headers.get('content-type')) && /\/api\/v3live/.test(t) && /\/api\/fundmom/.test(t), 'ecosystem page served ' + eco.status + ' ' + eco.headers.get('content-type') + ' ' + t.length);
-    const v = await fetch('http://127.0.0.1:' + P1 + '/api/v3live'); assert([200, 401].includes(v.status));
-    ok('/ecosystem page is served, and its data routes exist behind the dashboard sign-in'); }
-  { const noPw = await A.post('/api/v3live/arm', { on: true, confirm: 'ARM' }, {}); assert.strictEqual(noPw.s, 401, 'arm needs the dashboard sign-in');
-    const noWord = await A.post('/api/v3live/arm', { on: true }, DASH); assert.strictEqual(noWord.s, 400, 'arming needs the typed word');
-    const locked = await A.post('/api/v3live/arm', { on: true, confirm: 'arm' }, DASH); assert.strictEqual(locked.s, 409, 'arming is locked without V3_LIVE=on: ' + JSON.stringify(locked)); assert(/V3_LIVE=on/.test(locked.j.message));
-    const off = await A.post('/api/v3live/arm', { on: false }, DASH); assert.strictEqual(off.s, 200); assert.strictEqual(off.j.armed, false);
-    ok('/api/v3live/arm: needs the dashboard sign-in, the typed word ARM, and V3_LIVE=on on the server; disarming is always allowed'); }
-  { const pr = await A.post('/api/bot-shortlist', { bot: 'bot1', kind: 'swing', items: [{ symbol: 'sol<usdt>', side: 'short', score: 4.123456, note: 'x'.repeat(200) }, { symbol: '' }, { symbol: 'ETHUSDT', side: 'long', kind: 'fast' }] }, {});
-    assert(pr.s === 200 && pr.j.count === 2, 'shortlist accepted, junk dropped ' + JSON.stringify(pr));
-    assert((await A.post('/api/bot-shortlist', { bot: 'bot1' }, {})).s === 400, 'malformed shortlist refused');
-    const gl = await A.get('/api/bot-shortlists', DASH); const l0 = gl.j.lists[0];
-    assert(gl.s === 200 && l0.bot === 'bot1' && l0.kind === 'swing' && l0.items[0].symbol === 'SOLUSDT' && l0.items[0].side === 'short' && l0.items[0].score === 4.12 && l0.items[0].note.length === 80 && l0.items[0].kind === 'swing' && l0.items[1].kind === 'fast', JSON.stringify(gl.j));
-    ok('bot shortlists: bots can post what they watch (sanitized, capped), the dashboard reads them; nothing trades on it'); }
 
   // 1. a retried order is processed once
   const r1 = await A.post('/api/order', order('ym-AAA1'));
@@ -418,6 +403,30 @@ const order = (link, extra) => ({ category: 'linear', symbol: 'BTCUSDT', side: '
     assert.strictEqual(fake.creates.find(c => c.orderLinkId === 'ym-PLAN2').qty, '0.5', 'a close is never resized');
     s4.kill(); fake.sizing = false; fake.positions = [];
     ok('master sizing end to end: with MASTER_FOLLOWS_PLAN the master order carries the plan quantity (0.03), a close keeps its own'); }
+
+  // 11c. v2.9.20 loss cap on the manager route: set-leverage then order, the way the manager sends them
+  { const P5 = P1 + 1600; fake.sizing = true; fake.levCalls = [];
+    const s5 = boot(P5); await waitUp(P5); const E5 = mk(P5); await sleep(500);
+    await E5.post('/api/set-leverage', { category: 'linear', symbol: 'BTCUSDT', buyLeverage: 10, sellLeverage: 10 });
+    const rc = await E5.post('/api/order', order('ym-CAP1', { qty: '0.1', stopLoss: '63700', takeProfit: '70000' }));
+    assert.strictEqual(rc.j.retCode, 0); const m1 = fake.creates.find(c => c.orderLinkId === 'ym-CAP1');
+    assert(m1 && m1.qty === '0.06', 'qty scaled with leverage 10x -> 6x: ' + JSON.stringify(m1));
+    assert.strictEqual(fake.levCalls.filter(l => l.symbol === 'BTCUSDT').pop().buyLeverage, '6', 'leverage lowered on the master');
+    assert.strictEqual((await E5.get('/api/trade-log', DASH)).j.trades.find(t => t.orderLinkId === 'ym-CAP1').leverage, 6, 'the trade log shows the leverage really used');
+    const n1 = fake.creates.length;
+    const rw = await E5.post('/api/order', order('ym-CAPW', { qty: '0.1', stopLoss: '50000' }));
+    assert(rw.j.retCode !== 0 && /Skipped on purpose/.test(rw.j.retMsg) && fake.creates.length === n1, 'a stop 23% away is refused with a normal "no": ' + JSON.stringify(rw.j));
+    const nl = fake.levCalls.length;
+    const ru = await E5.post('/api/order', order('ym-CAPU', { symbol: 'ETHUSDT', qty: '0.1', stopLoss: '63700' }));
+    assert.strictEqual(ru.j.retCode, 0); assert.strictEqual(fake.creates.find(c => c.orderLinkId === 'ym-CAPU').qty, '0.1', 'unknown leverage: traded as asked'); assert.strictEqual(fake.levCalls.length, nl);
+    await E5.post('/api/set-leverage', { category: 'linear', symbol: 'BTCUSDT', buyLeverage: 10, sellLeverage: 10 });
+    await E5.post('/api/order', order('ym-CAPC', { qty: '0.1', side: 'Sell', reduceOnly: true, stopLoss: '63700' }));
+    assert.strictEqual(fake.creates.find(c => c.orderLinkId === 'ym-CAPC').qty, '0.1', 'a close is never resized');
+    await E5.post('/api/set-leverage', { category: 'linear', symbol: 'BTCUSDT', buyLeverage: 3, sellLeverage: 3 });
+    await E5.post('/api/order', order('ym-CAPS', { qty: '0.1', stopLoss: '63700' }));
+    assert.strictEqual(fake.creates.find(c => c.orderLinkId === 'ym-CAPS').qty, '0.1', 'already safe at 3x: untouched');
+    s5.kill(); fake.sizing = false; fake.positions = [];
+    ok('manager route loss cap: leverage 10x->6x with the quantity scaled, far stop refused, unknown leverage/close/safe trades untouched, trade log shows the real leverage'); }
 
   s3.kill(); await sleep(400); s3 = boot(P3, dbEnv); await waitUp(P3); C = mk(P3); await sleep(600);
   const info2 = (await C.get('/api/master-key', DASH)).j; assert(info2.source === 'saved' && info2.hint === '••••Y999', 'survives a restart: ' + JSON.stringify(info2));

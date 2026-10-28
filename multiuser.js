@@ -340,6 +340,7 @@ function csvCell(v) {
 }
 
 // ---------- module ----------
+const lossCapLib = require('./losscap');
 function init(deps) {
   const noop = async () => {};
   const off = { enabled: false, canPersist: false, loadControl: async () => ({}), saveControl: async () => false, loadMasterCreds: async () => null, saveMasterCreds: async () => ({ ok: false, reason: 'no database' }), clearMasterCreds: async () => ({ ok: false, reason: 'no database' }), fanOutOrder: noop, fanOutTradingStop: noop, guardClamp: b => b, guardFitClose: async b => b, fanOutLeverage: noop, recordExec: noop, recordBotEvent: async () => ({ status: 200 }), verifyAdminToken: async () => false, sizeMasterOrder: async () => null,
@@ -888,9 +889,6 @@ function init(deps) {
     return { open: list.find(p => parseFloat(p.size) > 0) || null, leverage: lev > 0 ? lev : null };
   }
   async function getOpenPosition(client, symbol) { return (await getPositionState(client, symbol)).open; }
-  // The master positions Profit Guard, Sentinel, the swing manager, the profit controller and the call scanner may manage: everything EXCEPT the server lane's own trades (v3 `trend`/`combo`),
-  // which run on their own exit rules (a trailing stop). The manual close-all and exposure views still see every position.
-  async function listManagedPositions() { const l = await listOpenPositions(restClient); return typeof deps.laneOwned === 'function' ? l.filter(p => { try { return !deps.laneOwned(p.symbol, p.side); } catch { return true; } }) : l; }
   async function listOpenPositions(client) {
     const out = [];
     let cursor;
@@ -1062,7 +1060,7 @@ function init(deps) {
     if (ctx.mode === 'paper') return finish('PAPER', true, 'Paper mode, nothing sent');
     try {
       const client = userClient(u);
-      let qty;
+      let qty, capLev = 0;
       if (ctx.reduceOnly) {
         const pos = await getOpenPosition(client, o.symbol);
         if (!pos) return finish('NOPOS', true, 'No open position to close');
@@ -1108,7 +1106,12 @@ function init(deps) {
           }
         }
         const levCap = minPositive(MAX_USER_LEVERAGE, u.max_lev_ceiling, u.user_max_lev);
-        const lev = pstate.leverage && levCap ? Math.min(pstate.leverage, levCap) : pstate.leverage;
+        let lev = pstate.leverage && levCap ? Math.min(pstate.leverage, levCap) : pstate.leverage;
+        // v2.9.20 loss cap + stop limit on this account too (same rule as the master; missing price/stop/leverage = unchanged)
+        const lc = lossCapLib.settings();
+        const lcEv = lossCapLib.evaluate({ lev, price: ctx.refPrice, stop: o.stopLoss, lossCapPct: lc.lossCapPct, maxStopPct: lc.maxStopPct });
+        if (lcEv.refuse) return finish('FILT', true, 'Skipped: ' + lcEv.note + '. This protects your balance');
+        if (lcEv.capped) { lev = lcEv.lev; base.capNote = lcEv.note; capLev = lcEv.lev; }
         const s = sizeForUser({ mode: u.size_mode, adminQty: o.qty, adminEquity: ctx.adminEquity, userEquity: bal.equity, available: bal.available, mult: u.size_mult,
           sizeUsd: u.size_usd, sizePct: u.size_pct, maxTradeUsd: u.max_trade_usd, leverage: lev, price: ctx.refPrice,
           qtyStep: ctx.inst.qtyStep, minQty: ctx.inst.minQty, maxRatio: MAX_RATIO });
@@ -1126,6 +1129,10 @@ function init(deps) {
         await q('UPDATE users SET last_equity=$2 WHERE id=$1', [u.id, bal.equity]);
         // dry run: everything above ran for real (filters, limits, sizing); stop here and only record what would have been sent
         if (isDry(u)) return finish('DRY', true, 'Dry run: would ' + (o.side === 'Buy' ? 'buy' : 'sell') + ' ' + qty + ' ' + o.symbol.replace('USDT', '') + (lev ? ' at ' + lev + 'x' : '') + (ctx.refPrice ? ' (about $' + (qty * ctx.refPrice / (lev || 1)).toFixed(2) + ' margin)' : ''), { link: 'dry-' + link, qty });
+      }
+      if (capLev > 0) {   // lower this account's leverage to the capped value BEFORE the order; if that fails, the order is not sent bigger than planned
+        let lr; try { lr = await client.setLeverage({ category: 'linear', symbol: o.symbol, buyLeverage: String(capLev), sellLeverage: String(capLev) }); } catch (e) { lr = { retCode: -1, retMsg: e.message }; }
+        if (!(lr.retCode === 0 || lr.retCode === 110043)) return finish('LEV', false, 'Could not lower leverage to ' + capLev + 'x for the loss cap: ' + lr.retMsg);
       }
       // claim the idempotency slot BEFORE sending, so a retransmitted signal can never double-trade this user
       const claimed = await logOrder({ ...base, link, qty, code: 'PENDING', ok: false, detail: 'Sending' });
@@ -1213,7 +1220,15 @@ function init(deps) {
         const client = userClient(u);
         const pos = await getOpenPosition(client, st.symbol);
         if (!pos) return;
-        const res = await client.setTradingStop({ category: 'linear', ...st });
+        // v2.9.20: a copy account never gets a LOOSER stop than the one it already has (the master write already works this way, see stopWrite). The Profit Guard,
+        // the Sentinel and the bot can each fan a stop out a moment apart and the queue could deliver them out of order; the older, looser one must not win.
+        let out = st;
+        const curSl = parseFloat(pos.stopLoss) || 0, newSl = Number(st.stopLoss);
+        if (st.stopLoss !== undefined && curSl > 0 && newSl > 0 && (pos.side === 'Buy' ? newSl < curSl : newSl > curSl)) {
+          out = { ...st }; delete out.stopLoss;
+          if (out.takeProfit === undefined && out.trailingStop === undefined) return logOrder({ ...base, side: pos.side, code: 'OK', ok: true, detail: 'Stop kept: this account already has a tighter stop (' + curSl + ')' });
+        }
+        const res = await client.setTradingStop({ category: 'linear', ...out });
         if (res.retCode === 0 || res.retCode === 34040) return logOrder({ ...base, side: pos.side, code: 'OK', ok: true, detail: 'Stops updated' });
         const f = failFrom({ retCode: res.retCode, message: res.retMsg });
         await logOrder({ ...base, side: pos.side, code: f.code, ok: false, detail: res.retMsg });
@@ -1861,7 +1876,7 @@ function init(deps) {
     pgRun.busy = true;
     try {
       await ready;
-      const positions = await listManagedPositions();
+      const positions = await listOpenPositions(restClient);
       const seen = new Set();
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
@@ -2125,7 +2140,7 @@ function init(deps) {
     swRun.busy = true;
     try {
       await ready;
-      const positions = await listManagedPositions(), seen = new Set(), now = Date.now();
+      const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
         const symbol = p.symbol, side = p.side, key = symbol + '|' + side, long = side === 'Buy'; seen.add(key);
@@ -2337,7 +2352,7 @@ function init(deps) {
       // 1. find new calls the master has just opened (every 10 s)
       if (now - scRun.lastDisc >= 10000) {
         scRun.lastDisc = now;
-        const positions = await listManagedPositions();
+        const positions = await listOpenPositions(restClient);
         for (const p of positions) {
           if (p.side !== 'Buy' && p.side !== 'Sell') continue;
           const entry = parseFloat(p.avgPrice), created = Number(p.createdTime) > 0 ? Number(p.createdTime) : now;
@@ -2422,7 +2437,7 @@ function init(deps) {
     pcRun.busy = true;
     try {
       await ready;
-      const positions = await listManagedPositions(), seen = new Set(), now = Date.now();
+      const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
         const symbol = p.symbol, side = p.side, key = symbol + '|' + side, long = side === 'Buy'; seen.add(key);
@@ -2518,7 +2533,7 @@ function init(deps) {
     const pathRows = [];
     try {
       await ready;
-      const positions = await listManagedPositions(), seen = new Set(), now = Date.now();
+      const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
       let snGone = false;
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;

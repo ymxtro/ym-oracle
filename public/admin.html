@@ -6,13 +6,10 @@
 <meta name="robots" content="noindex, nofollow">
 <meta name="color-scheme" content="dark">
 <title>YM Oracle – Console</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root{--bg:#0a0c10;--panel:#161a22;--inset:#0f1218;--line:#242938;--mist:#8891a3;--paper:#eef1f6;--long:#22c55e;--short:#ef4444;--signal:#8b5cf6;--pending:#f2b134;color-scheme:dark}
   *{box-sizing:border-box}
-  body{background:var(--bg);color:var(--paper);font-family:'IBM Plex Sans',Arial,sans-serif;margin:0;font-size:13px;line-height:1.45}
+  body{background:var(--bg);color:var(--paper);font-family:Arial,Helvetica,sans-serif;margin:0;font-size:13px;line-height:1.45}
   h1{font-size:17px;margin:0;font-weight:700} h2{font-size:11px;color:var(--mist);text-transform:uppercase;letter-spacing:.6px;margin:22px 0 8px;font-weight:400}
   p{margin:0} button,input,select{font-family:inherit}
   .long{color:var(--long)}.short{color:var(--short)}.mist{color:var(--mist)}.warn{color:var(--pending)}.small{font-size:11px}.num{font-variant-numeric:tabular-nums}
@@ -102,11 +99,11 @@
   #nav .navhead{display:flex;align-items:center;gap:10px;padding:2px 8px 16px}
   #nav .navgap{flex:1}
   #nav .navlbl{font-size:10px;letter-spacing:.6px;text-transform:uppercase;color:var(--mist);padding:12px 10px 4px}
-  #nav button,#nav a.nl{text-decoration:none;display:flex;align-items:center;gap:11px;width:100%;border:0;background:transparent;color:var(--mist);padding:9px 10px;border-radius:10px;font-size:13px;cursor:pointer;text-align:left;position:relative}
-  #nav button svg,#nav a.nl svg{width:17px;height:17px;flex:none;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
-  #nav button:hover,#nav a.nl:hover{color:var(--paper);background:rgba(238,241,246,.04)}
-  #nav button[aria-selected="true"],#nav a.nl[aria-current="page"]{background:var(--panel);color:var(--paper)}
-  #nav button[aria-selected="true"]::before,#nav a.nl[aria-current="page"]::before{content:"";position:absolute;left:-12px;top:8px;bottom:8px;width:3px;border-radius:0 3px 3px 0;background:var(--signal)}
+  #nav button{display:flex;align-items:center;gap:11px;width:100%;border:0;background:transparent;color:var(--mist);padding:9px 10px;border-radius:10px;font-size:13px;cursor:pointer;text-align:left;position:relative}
+  #nav button svg{width:17px;height:17px;flex:none;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+  #nav button:hover{color:var(--paper);background:rgba(238,241,246,.04)}
+  #nav button[aria-selected="true"]{background:var(--panel);color:var(--paper)}
+  #nav button[aria-selected="true"]::before{content:"";position:absolute;left:-12px;top:8px;bottom:8px;width:3px;border-radius:0 3px 3px 0;background:var(--signal)}
   #nav .badge{margin-left:auto}
   .main{padding:18px 22px 80px;max-width:1160px;min-width:0}
   .mlogo{display:none}
@@ -118,8 +115,8 @@
     .shell{grid-template-columns:minmax(0,1fr)}
     #nav{position:fixed;left:0;right:0;bottom:0;top:auto;height:auto;flex-direction:row;overflow-x:auto;overflow-y:hidden;border-right:0;border-top:1px solid var(--line);padding:6px 6px calc(6px + env(safe-area-inset-bottom));background:var(--bg);z-index:30;gap:0}
     #nav .navhead,#nav .navgap,#nav .navlbl{display:none}
-    #nav button,#nav a.nl{flex-direction:column;gap:3px;font-size:10px;min-width:62px;width:auto;padding:6px 8px;text-align:center;justify-content:center}
-    #nav button[aria-selected="true"]::before,#nav a.nl[aria-current="page"]::before{left:18%;right:18%;top:-6px;bottom:auto;width:auto;height:3px;border-radius:0 0 3px 3px}
+    #nav button{flex-direction:column;gap:3px;font-size:10px;min-width:62px;width:auto;padding:6px 8px;text-align:center;justify-content:center}
+    #nav button[aria-selected="true"]::before{left:18%;right:18%;top:-6px;bottom:auto;width:auto;height:3px;border-radius:0 0 3px 3px}
     #nav .badge{position:absolute;top:2px;right:10px;margin:0}
     .main{padding:14px 14px 96px}
     .mlogo{display:grid}
@@ -213,7 +210,6 @@
     <button role="tab" data-tab="trading" aria-selected="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17 9 11l4 4 8-9"/><path d="M15 6h6v6"/></svg><span>Trading</span></button>
     <button role="tab" data-tab="guards" aria-selected="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5.5c0 4.2 2.8 7.5 7 9.5 4.2-2 7-5.3 7-9.5V6z"/><path d="m9 12 2.2 2.2L15.5 10"/></svg><span>Guards</span></button>
     <button role="tab" data-tab="bots" aria-selected="false"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="8" width="14" height="10" rx="2.5"/><path d="M12 8V5"/><circle cx="12" cy="4" r="1"/><circle cx="9.5" cy="13" r=".6"/><circle cx="14.5" cy="13" r=".6"/></svg><span>Bots &amp; alerts</span></button>
-    <a class="nl" href="/ecosystem"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="2.4"/><circle cx="5" cy="6" r="1.8"/><circle cx="19" cy="6" r="1.8"/><circle cx="5" cy="18" r="1.8"/><circle cx="19" cy="18" r="1.8"/><path d="m6.4 7.2 3.6 3.2M17.6 7.2l-3.6 3.2M6.4 16.8l3.6-3.2M17.6 16.8l-3.6-3.2"/></svg><span>Ecosystem</span></a>
     <div class="navlbl">Manage</div>
     <button role="tab" data-tab="users" aria-selected="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8.5" r="3.2"/><path d="M3 19c.6-3.3 3-5 6-5s5.4 1.7 6 5"/><path d="M16 5.5a3 3 0 0 1 0 6"/><path d="M18 14.2c1.8.5 2.8 2 3 4.3"/></svg><span>Users</span></button>
     <button role="tab" data-tab="plan" aria-selected="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z"/><path d="M8.5 9h7M8.5 13h7M8.5 17h4"/></svg><span>Plan &amp; risk</span></button>
@@ -934,7 +930,6 @@ function viewSettings(){
       +S.sec.map(function(c){return '<div class="line"><span class="lft '+(c.ok?'':'warn')+'">'+(c.ok?'✓ ':'')+esc(c.label)+(!c.ok&&c.fix?'<br><span class="small mist">'+esc(c.fix)+'</span>':'')+'</span></div>'}).join('')+'</div>';}
   h+='<div class="card"><h2 style="margin:0 0 4px">Pages</h2>'
     +'<div class="line"><span>User app<br><span class="hint2">What your users see</span></span><a class="btn" href="/join" target="_blank" rel="noopener">Open</a></div>'
-    +'<div class="line"><span>Ecosystem<br><span class="hint2">Server lane, watchlists and rule results</span></span><a class="btn" href="/ecosystem" target="_blank" rel="noopener">Open</a></div>'
     +'<div class="line"><span>Home page<br><span class="hint2">The public landing page</span></span><a class="btn" href="/" target="_blank" rel="noopener">Open</a></div>'
     +'<div class="line"><span>Classic dashboard<br><span class="hint2">The old standalone trading page (fallback)</span></span><a class="btn" href="/dashboard/classic" target="_blank" rel="noopener">Open</a></div></div>';
   return h+'</div></div>';

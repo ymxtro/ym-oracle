@@ -31,7 +31,7 @@ function build() {
     SN, PG, snCfg: SN.normalize({ mode: 'shadow' }), pgCfg: PG.defaults(), snState: new Map(), pgState: new Map(), guardsMaster: true, restClient,
     q: async (text, params) => { rec.q.push({ text, params }); return { rows: [], rowCount: 0 }; },
     ready: Promise.resolve(), getMode: () => 'live', breakerIsTripped: () => false,
-    listOpenPositions: async () => st.positions, listManagedPositions: async () => st.positions, getInstrument: async () => ({ tickSize: 0.01 }),
+    listOpenPositions: async () => st.positions, getInstrument: async () => ({ tickSize: 0.01 }),
     pgLookup: async () => ({ bot: 'ORACLE I', sl: 99, eng: 'fast' }), deliverAlert: async t => { rec.alerts.push(t); return { ok: true }; },
     fanOutTradingStop: async b => { rec.fan.push(b); },
     stopWrite: async (side, b) => ({ res: await restClient.setTradingStop(b) }),   // v2.9.14: the real one reads the stop on Bybit first (covered by the integration suite)
