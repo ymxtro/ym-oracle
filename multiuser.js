@@ -434,7 +434,7 @@ function init(deps) {
   pool.on('error', e => console.error('[multiuser] db pool error:', e.message));
   const q = (text, params) => pool.query(text, params);
 
-  const ready = q(`
+  const SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
       username TEXT UNIQUE NOT NULL,
@@ -659,8 +659,23 @@ function init(deps) {
     CREATE INDEX IF NOT EXISTS order_log_created_idx ON order_log(created_at);
     CREATE INDEX IF NOT EXISTS master_log_created_idx ON master_log(created_at);
     CREATE INDEX IF NOT EXISTS audit_log_at_idx ON audit_log(at);
-  `).then(() => console.log('[multiuser] ON. Database schema ready.'))
-    .catch(e => { console.error('[multiuser] schema setup FAILED:', e.message); throw e; });
+  `;
+  // v2.9.21: the schema set-up used to run ONCE; if the database was unreachable at that moment (quota, restart, network) `ready` was rejected for the life of
+  // the process and every login and database route failed with "Server error" until a manual restart. Now it retries (3 s, 6 s ... up to 60 s) until the
+  // database answers, and everything waiting on `ready` (migrations, the sweeps, the routes) continues by itself.
+  let schemaOk = false;
+  const ready = (async () => {
+    for (let attempt = 1; ; attempt++) {
+      try { await q(SCHEMA_SQL); schemaOk = true; console.log('[multiuser] ON. Database schema ready.' + (attempt > 1 ? ' (after ' + attempt + ' tries)' : '')); return; }
+      catch (e) { console.error('[multiuser] schema setup FAILED (try ' + attempt + ', retrying):', e.message); await new Promise(r => setTimeout(r, Math.min(60000, 3000 * attempt))); }
+    }
+  })();
+  // routes and background jobs wait for the schema for a few seconds at most; if the database is still down they fail fast (the routes answer 503 "database not reachable")
+  const readyOrFail = async () => {
+    if (schemaOk) return;
+    await Promise.race([ready, new Promise(r => setTimeout(r, 8000))]);
+    if (!schemaOk) throw new Error('the database is not reachable yet');
+  };
 
   // admin "pause all users": blocks NEW trades for every user (closes still go through). Stored in the meta table so it survives restarts.
   let pausedAll = false;
@@ -813,7 +828,14 @@ function init(deps) {
   // Express 4 does not catch errors thrown in async handlers; this wrapper makes every route fail cleanly instead of hanging.
   const h = fn => async (req, res, next) => {
     try { await fn(req, res, next); }
-    catch (e) { console.error('[multiuser] route error', req.method, req.path, e.message); if (!res.headersSent) res.status(500).json({ success: false, message: 'Server error' }); }
+    catch (e) {
+      console.error('[multiuser] route error', req.method, req.path, e.message);
+      if (!res.headersSent) {
+        // while the database set-up has not succeeded, say so plainly instead of a bare "Server error"
+        if (!schemaOk) res.status(503).json({ success: false, dbDown: true, message: 'The database is not reachable right now. The relay keeps retrying by itself; try again in a minute.' });
+        else res.status(500).json({ success: false, message: 'Server error' });
+      }
+    }
   };
 
   async function audit(actor, action, target, req, detail) {
@@ -917,19 +939,19 @@ function init(deps) {
   // in the meta table and overrides the BYBIT_API_KEY / BYBIT_API_SECRET environment variables until reset.
   const MASTER_META = 'master_creds';
   async function loadMasterCreds() {
-    await ready;
+    await readyOrFail();
     const r = await q(`SELECT v FROM meta WHERE k=$1`, [MASTER_META]);
     if (!r.rows[0]) return null;
     try { const o = JSON.parse(decrypt(r.rows[0].v, KEY)); return o && o.k && o.s ? o : null; } catch { return null; }
   }
   async function saveMasterCreds(o) {
-    await ready;
+    await readyOrFail();
     await q(`INSERT INTO meta(k,v) VALUES($1,$2) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [MASTER_META, encrypt(JSON.stringify({ k: o.k, s: o.s, env: normEnv(o.env) === 'demo' ? 'demo' : 'live', at: Date.now() }), KEY)]);
     adminEq = { at: 0, v: null };
     return { ok: true };
   }
   async function clearMasterCreds() {
-    await ready;
+    await readyOrFail();
     await q(`DELETE FROM meta WHERE k=$1`, [MASTER_META]);
     adminEq = { at: 0, v: null };
     return { ok: true };
@@ -989,7 +1011,7 @@ function init(deps) {
 
   // ---------- logging / alerts ----------
   async function logOrder(row) {
-    await ready;
+    await readyOrFail();
     try {
       const r = await q(
         `INSERT INTO order_log(user_id,kind,order_link_id,symbol,side,qty,code,ok,detail,bybit_order_id,plan_version,signal_key,risk_usd)
@@ -1022,7 +1044,7 @@ function init(deps) {
   // LANES: every existing fan-out (orders, stops, partial closes, leverage) is the CORE lane. Scalp-lane users are a separate
   // group and are never returned unless a caller asks for lane 'scalp' explicitly (only the scalp lane code does).
   async function tradableUsers({ forOpen, lane = 'core' }) {
-    await ready; await globalReady;
+    await readyOrFail(); await globalReady;
     if (forOpen && pausedAll) return [];
     const r = await q(`SELECT * FROM users WHERE active AND key_enc IS NOT NULL AND key_status='ok' AND lane=$1 ${forOpen ? 'AND NOT paused' : ''} ORDER BY id`, [lane === 'scalp' ? 'scalp' : 'core']);
     return r.rows;
@@ -1287,7 +1309,7 @@ function init(deps) {
   // What the manager reported for each signal on the MASTER account. Kept in the database (the relay's own files are wiped
   // by a Render restart), so "why did nothing happen for that trade" can always be answered afterwards.
   async function recordExec(rec) {
-    await ready;
+    await readyOrFail();
     await q(`INSERT INTO master_log(exec_id,bot,kind,symbol,side,ok,code,detail) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
       ON CONFLICT (exec_id, bot) DO UPDATE SET ok=EXCLUDED.ok, code=EXCLUDED.code, detail=EXCLUDED.detail, created_at=now()`,
       [rec.id, rec.bot || '', rec.kind, rec.symbol, rec.side, rec.ok === true, rec.code, rec.detail]);
@@ -1326,11 +1348,11 @@ function init(deps) {
     if (typeof orderLinkId !== 'string') return;
     const rid = orderLinkId.replace(/^ym-/, '');
     if (!rid) return;
-    await ready;
+    await readyOrFail();
     await q(`UPDATE signals SET order_seen_at=now() WHERE rid=$1 AND order_seen_at IS NULL`, [rid]);
   }
   async function recordBotEvent(b) {
-    await ready;
+    await readyOrFail();
     if (!b || typeof b !== 'object' || Number(b.v) !== 1) return { status: 400, message: 'unsupported event' };
     const bot = clip(b.bot, 30);
     if (!bot) return { status: 400, message: 'bot is required' };
@@ -1459,7 +1481,7 @@ function init(deps) {
     : m.priv ? (/zone/i.test(stripTags(m.text)) ? 'zones' : 'ops') : 'updates';
   async function pushBotMsgs() {
     if (!tradeAlertsOn()) return 0;
-    await ready;
+    await readyOrFail();
     let sent = 0;
     const r = await q(`SELECT k FROM bot_msgs WHERE sent_at IS NULL AND tries < 8 AND created_at > now() - interval '2 hours' ORDER BY created_at LIMIT 10`);
     for (const row of r.rows) {
@@ -1476,7 +1498,7 @@ function init(deps) {
   const alertSweep = () => pushBotMsgs().then(() => pushSignalAlerts());   // run every 20 s: retries failed deliveries, sends the short safety-net alerts
   async function pushSignalAlerts() {
     if (!tradeAlertsOn()) return 0;
-    await ready;
+    await readyOrFail();
     let sent = 0;
     for (const [col, kind] of [['alert_open_at', 'open'], ['alert_close_at', 'close']]) {
       const cond = kind === 'open' ? 'relay_flag IS NOT NULL' : 'closed_at IS NOT NULL';
@@ -1507,7 +1529,7 @@ function init(deps) {
   // used to be invisible (the bot's own screen says "relayed", Bybit shows nothing). One alert per signal.
   const ALARM_AFTER_S = Number(process.env.SIGNAL_ALARM_SECONDS) || 60;
   async function checkSignalAlarms() {
-    await ready;
+    await readyOrFail();
     const r = await q(`SELECT k, bot, symbol, side, opened_at FROM signals WHERE relay_flag='SENT' AND order_seen_at IS NULL AND alarm_at IS NULL
         AND opened_at < now() - ($1 || ' seconds')::interval AND opened_at > now() - interval '3 hours' AND closed_at IS NULL ORDER BY opened_at LIMIT 20`, [String(ALARM_AFTER_S)]);
     for (const x of r.rows) {
@@ -1528,7 +1550,7 @@ function init(deps) {
     settling = true;
     let settled = 0;
     try {
-      await ready;
+      await readyOrFail();
       const r = await q(`SELECT id, user_id, order_link_id, symbol, side FROM order_log
         WHERE code='PENDING' AND created_at < now() - interval '60 seconds' AND created_at > now() - interval '2 days' ORDER BY id LIMIT 50`);
       for (const row of r.rows) {
@@ -1633,7 +1655,7 @@ function init(deps) {
     syncing = true;
     let users = 0, added = 0, failed = 0;
     try {
-      await ready;
+      await readyOrFail();
       await q('DELETE FROM sessions WHERE expires_at < now()');
       await q('DELETE FROM admin_sessions WHERE expires_at < now()');
       const r = await q(`SELECT * FROM users WHERE key_enc IS NOT NULL ORDER BY id`);
@@ -1875,7 +1897,7 @@ function init(deps) {
     if (getMode() !== 'live' || breakerIsTripped()) { pgRun.note = 'paused: the relay is not live or trading is halted'; return; }
     pgRun.busy = true;
     try {
-      await ready;
+      await readyOrFail();
       const positions = await listOpenPositions(restClient);
       const seen = new Set();
       for (const p of positions) {
@@ -2139,7 +2161,7 @@ function init(deps) {
     if (getMode() !== 'live' || breakerIsTripped()) { swRun.note = 'paused: the relay is not live or trading is halted'; return; }
     swRun.busy = true;
     try {
-      await ready;
+      await readyOrFail();
       const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
@@ -2347,7 +2369,7 @@ function init(deps) {
     if (getMode() !== 'live') { scRun.note = 'paper mode: nothing is open on Bybit'; return; }
     scRun.busy = true; scRun.tick++;
     try {
-      await ready;
+      await readyOrFail();
       const now = Date.now();
       // 1. find new calls the master has just opened (every 10 s)
       if (now - scRun.lastDisc >= 10000) {
@@ -2436,7 +2458,7 @@ function init(deps) {
     if (getMode() !== 'live') { pcRun.note = 'paper mode: nothing is open on Bybit'; return; }
     pcRun.busy = true;
     try {
-      await ready;
+      await readyOrFail();
       const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
       for (const p of positions) {
         if (p.side !== 'Buy' && p.side !== 'Sell') continue;
@@ -2532,7 +2554,7 @@ function init(deps) {
     snRun.busy = true;
     const pathRows = [];
     try {
-      await ready;
+      await readyOrFail();
       const positions = await listOpenPositions(restClient), seen = new Set(), now = Date.now();
       let snGone = false;
       for (const p of positions) {
@@ -2655,7 +2677,7 @@ function init(deps) {
     Object.assign(snBack, { running: true, at: Date.now(), done: 0, total: 0, used: 0, err: null, note: 'reading the bot signals' });
     (async () => {
       try {
-        await ready;
+        await readyOrFail();
         const rows = (await q(`SELECT symbol, side, eng, opened_at, closed_at, entry, sl FROM signals WHERE relay_ok = true AND closed_at IS NOT NULL AND sl > 0 AND entry > 0 AND opened_at > now() - ($1 || ' days')::interval AND closed_at > opened_at ORDER BY opened_at DESC LIMIT $2`, [String(days), max])).rows;
         snBack.total = rows.length; snBack.note = 'replaying ' + rows.length + ' closed trades';
         const samples = []; let traps = 0, usedTrades = 0;
@@ -2780,7 +2802,7 @@ function init(deps) {
   // what reached Bybit), GUARD and SENTINEL (every stop move or note while a trade was open), the two per-trade summaries, PATH (the price path
   // of each open trade in R), and ALERTS (the messages the bot sent). The logs that carry no bot name are matched to the bot by pair, side and time.
   async function buildExportAll(bot, fromD, toD) {
-    await ready;
+    await readyOrFail();
     const b = bot && bot !== 'all' ? bot : null;
     const cap = 60000;
     const sec = [];
@@ -2839,7 +2861,7 @@ function init(deps) {
     return { csv: lines.join('\n') + '\n', rows: r.rows.length };
   }
   async function runBackupIfDue(force) {
-    await ready;
+    await readyOrFail();
     // The ledger holds every user's trades, so it goes to YOUR private chat only, never the public group. (Without the routing layer: the old single chat.)
     let chat = TG_ADMIN_CHAT;
     if (alertRouter) {
@@ -2867,7 +2889,7 @@ function init(deps) {
   const retentionDays = () => { const v = process.env.RETENTION_DAYS; if (v === undefined || v === '') return 90; const n = Number(v); return n === 0 ? 0 : (Number.isFinite(n) ? Math.max(14, Math.floor(n)) : 90); };
   const auditRetentionDays = () => { const n = Number(process.env.AUDIT_RETENTION_DAYS); return Number.isFinite(n) && n > 0 ? Math.max(30, Math.floor(n)) : 180; };
   async function pruneOldRows() {
-    await ready;
+    await readyOrFail();
     const days = retentionDays(), adays = auditRetentionDays(), out = {};
     const batch = async (table, cond, d) => {
       let total = 0;
@@ -2937,7 +2959,7 @@ function init(deps) {
   }
   const MUST_CHANGE_OK = new Set(['/api/me', '/api/me/password', '/api/auth/logout']);
   const userAuth = h(async (req, res, next) => {
-    await ready;
+    await readyOrFail();
     const m = /^Bearer (.+)$/.exec(req.get('Authorization') || '');
     if (!m) return res.status(401).json({ success: false, message: 'Not signed in' });
     const r = await q(`SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at > now()`, [sha256(m[1])]);
@@ -2961,13 +2983,13 @@ function init(deps) {
 
   // tells the sign-up page which kind of invite this is (core or scalp) so it can show the right step; reveals nothing else
   app.get('/api/auth/invite-info', limited, h(async (req, res) => {
-    await ready;
+    await readyOrFail();
     const r = await q('SELECT used_by, lane FROM invites WHERE code=$1', [String(req.query.code || '').trim().toUpperCase()]);
     if (!r.rows[0] || r.rows[0].used_by !== null) return res.status(400).json({ success: false, message: 'Invalid or already-used invite code.' });
     res.json({ success: true, lane: r.rows[0].lane === 'scalp' ? 'scalp' : 'core' });
   }));
   app.post('/api/auth/signup', limited, h(async (req, res) => {
-    await ready;
+    await readyOrFail();
     const { username, password, inviteCode, apiKey, apiSecret } = req.body || {};
     const env = normEnv(req.body && req.body.env);
     if (env === 'demo' && !DEMO_KEYS_ALLOWED) return res.status(400).json({ success: false, message: 'Demo keys are switched off on this server. Use a live key.' });
@@ -3029,7 +3051,7 @@ function init(deps) {
   }));
 
   app.post('/api/auth/login', limited, h(async (req, res) => {
-    await ready;
+    await readyOrFail();
     const { username, password, totp } = req.body || {};
     const r = await q('SELECT * FROM users WHERE username=$1', [String(username || '').toLowerCase()]);
     const u = r.rows[0];
@@ -3336,7 +3358,7 @@ function init(deps) {
   app.get('/api/share/:token', h(async (req, res) => {
     res.set(publicHeaders);
     if (!pubLimiter.hit(req.ip || 'x')) return res.status(429).json({ success: false, message: 'Slow down.' });
-    await ready;
+    await readyOrFail();
     const t = String(req.params.token || '');
     if (!/^[A-Za-z0-9_-]{20,40}$/.test(t)) return res.status(404).json({ success: false, message: 'Link not found' });
     const ur = await q('SELECT id, username, paused, active, key_status, last_equity, last_synced_at, created_at, share_show_balance, key_env FROM users WHERE share_token=$1', [t]);
@@ -3366,7 +3388,7 @@ function init(deps) {
     const pw = process.env.DASHBOARD_PASSWORD || '';
     if (!pw) return res.status(503).json({ success: false, message: 'Set DASHBOARD_PASSWORD on Render first. Admin is disabled without it.' });
     if (!adminLimiter.hit(req.ip || 'x')) { await audit('admin', 'admin_login_blocked', null, req, 'rate limited'); return res.status(429).json({ success: false, message: 'Too many attempts. Try again in 15 minutes.' }); }
-    await ready;
+    await readyOrFail();
     const { password, totp } = req.body || {};
     const adminTotp = process.env.ADMIN_TOTP_SECRET || '';
     if (!sec.safeEqual(String(password || ''), pw)) { await audit('admin', 'admin_login_failed', null, req, ''); return res.status(401).json({ success: false, message: 'Wrong password or code.' }); }
@@ -3384,13 +3406,13 @@ function init(deps) {
   }));
   async function verifyAdminToken(token) {
     if (!process.env.DASHBOARD_PASSWORD || !token) return false;
-    await ready;
+    await readyOrFail();
     const r = await q('SELECT 1 FROM admin_sessions WHERE token_hash=$1 AND expires_at > now()', [sha256(String(token))]);
     return !!r.rows[0];
   }
   const adminAuth = h(async (req, res, next) => {
     if (!process.env.DASHBOARD_PASSWORD) return res.status(503).json({ success: false, message: 'Admin is disabled until DASHBOARD_PASSWORD is set.' });
-    await ready;
+    await readyOrFail();
     const m = /^Bearer (.+)$/.exec(req.get('Authorization') || '');
     if (!m) return res.status(401).json({ success: false, message: 'Not signed in' });
     const r = await q('SELECT 1 FROM admin_sessions WHERE token_hash=$1 AND expires_at > now()', [sha256(m[1])]);
@@ -3588,7 +3610,7 @@ function init(deps) {
     const out = { scope, symbol: symbol || null, side: side || null, bot: bot || null, matched: [], master: { closed: 0, failed: 0, errors: [] }, users: { accounts: 0, closed: 0, failed: 0 }, note: '' };
     const live = getMode() === 'live';
     let mpos = [];
-    if (live) { await ready; mpos = (await listOpenPositions(restClient)).filter(p => p.side === 'Buy' || p.side === 'Sell'); }
+    if (live) { await readyOrFail(); mpos = (await listOpenPositions(restClient)).filter(p => p.side === 'Buy' || p.side === 'Sell'); }
     else out.note = 'Paper mode: nothing is open on Bybit, so only copy accounts were looked at.';
     const sel = [];
     for (const p of mpos) {
@@ -3828,7 +3850,7 @@ function init(deps) {
   let liveCache = { at: 0, v: null };
   async function liveView() {
     if (liveCache.v && Date.now() - liveCache.at < 4000) return liveCache.v;
-    await ready;
+    await readyOrFail();
     const mode = getMode();
     const out = { mode, at: Date.now(), trades: [], note: '', master: guardsMaster };
     if (mode !== 'live') { out.note = 'Paper mode: nothing is open on Bybit.'; liveCache = { at: Date.now(), v: out }; return out; }

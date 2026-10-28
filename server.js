@@ -619,16 +619,17 @@ async function applyMasterLossCap(body) {
 }
 
 async function processOrder(body, opts) {
+  const masterOnly = !!(opts && opts.masterOnly);   // v2.9.8: a relay-originated re-entry trades the master account only: no copies, no plan sizing
+  // Copy this signal to every active user's account. Fire-and-forget: the ESP32 must never wait on (or be
+  // broken by) other people's accounts, and one user's failure never touches the master order below.
+  if (!masterOnly) multiuser.fanOutOrder(body).catch(e => console.error('[multiuser] fanOutOrder:', e.message));
+  // v2.9.20: the master's loss cap runs AFTER the copies are started, so it can never delay them (each copy account applies the cap itself)
   let capLev = 0;
   if (!body.reduceOnly && !(opts && opts.capDone)) {   // capDone: the server-side trade route already applied the cap
     const cap = await applyMasterLossCap(body);
     if (cap.refused) return cap.refused;
     body = cap.body; capLev = cap.leverage || 0;
   }
-  const masterOnly = !!(opts && opts.masterOnly);   // v2.9.8: a relay-originated re-entry trades the master account only: no copies, no plan sizing
-  // Copy this signal to every active user's account. Fire-and-forget: the ESP32 must never wait on (or be
-  // broken by) other people's accounts, and one user's failure never touches the master order below.
-  if (!masterOnly) multiuser.fanOutOrder(body).catch(e => console.error('[multiuser] fanOutOrder:', e.message));
   // Optional (MASTER_FOLLOWS_PLAN=true): size the master's open with the same rule as every user. Falls back to the manager's own quantity.
   if (!body.reduceOnly && !masterOnly) {
     const sz = await multiuser.sizeMasterOrder(body).catch(() => null);

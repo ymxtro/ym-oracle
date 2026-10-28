@@ -30,7 +30,7 @@ function build() {
     closeUsed, CLOSE_TRIES: 15, claimClose: (w, ids) => { for (const i of ids || []) closeUsed[w].add(i); },
     SN, PG, snCfg: SN.normalize({ mode: 'shadow' }), pgCfg: PG.defaults(), snState: new Map(), pgState: new Map(), guardsMaster: true, restClient,
     q: async (text, params) => { rec.q.push({ text, params }); return { rows: [], rowCount: 0 }; },
-    ready: Promise.resolve(), getMode: () => 'live', breakerIsTripped: () => false,
+    ready: Promise.resolve(), readyOrFail: async () => {}, getMode: () => 'live', breakerIsTripped: () => false,
     listOpenPositions: async () => st.positions, getInstrument: async () => ({ tickSize: 0.01 }),
     pgLookup: async () => ({ bot: 'ORACLE I', sl: 99, eng: 'fast' }), deliverAlert: async t => { rec.alerts.push(t); return { ok: true }; },
     fanOutTradingStop: async b => { rec.fan.push(b); },
